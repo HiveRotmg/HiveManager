@@ -1,4 +1,5 @@
 import {
+  ConditionEffectBits,
   EnemyHitPacket,
   EnemyShootPacket,
   OtherHitPacket,
@@ -6,12 +7,15 @@ import {
   PlayerHitPacket,
   PlayerShootPacket,
   ServerPlayerShootPacket,
+  StatType,
   SquareHitPacket,
 } from 'realmlib';
 
 export interface CombatProjectileDefinition {
   speed: number;
   lifetimeMs: number;
+  /** Unscaled lifetime used by path shapes whose phase is tied to XML lifetime. */
+  trajectoryLifetimeMs?: number;
   multiHit: boolean;
   passesCover: boolean;
   amplitude: number;
@@ -45,6 +49,10 @@ export interface CombatWeaponPatternDefinition {
 
 export interface CombatWeaponSubattackDefinition {
   rateOfFire: number;
+  isDummy: boolean;
+  defaultAngleIncrease: number;
+  minIncrAngleCounter: number;
+  maxIncrAngleCounter: number;
   patterns: readonly CombatWeaponPatternDefinition[];
 }
 
@@ -83,6 +91,12 @@ export interface CombatEntity {
   type: number;
   x: number;
   y: number;
+  player?: {
+    hp: number;
+    condition: number;
+    condition2: number;
+  };
+  rawStats?: Record<string, number | string>;
 }
 
 export interface CombatTile {
@@ -228,6 +242,11 @@ export class CombatTracker {
   }
 
   trackOwnShoot(packet: ServerPlayerShootPacket, startTime: number): void {
+    // ProdMafia keeps its locally-created projectile when the server echoes the
+    // shot. Preserve it here because it has the exact subattack projectile id.
+    if (this.projectiles.has(projectileKey(packet.ownerId, packet.bulletId))) {
+      return;
+    }
     const definition = this.data.getProjectile(packet.containerType, 0);
     if (!definition || definition.lifetimeMs <= 0) {
       return;
@@ -292,7 +311,7 @@ export class CombatTracker {
   }
 
   private add(projectile: ActiveProjectile): void {
-    this.projectiles.set(`${projectile.ownerId}:${projectile.bulletId}`, projectile);
+    this.projectiles.set(projectileKey(projectile.ownerId, projectile.bulletId), projectile);
   }
 
   private prepareWorld(snapshot: CombatWorldSnapshot): PreparedWorld {
@@ -308,10 +327,17 @@ export class CombatTracker {
       if (!definition) {
         continue;
       }
-      if (definition.isEnemy && !definition.invincible) {
+      const hp = entity.player?.hp ?? rawNumber(entity, StatType.HP_STAT);
+      const condition = entity.player?.condition ?? rawNumber(entity, StatType.CONDITION_STAT) ?? 0;
+      const dead = hp !== undefined && hp <= 0;
+      const blocked = ConditionEffectBits.PAUSED
+        | ConditionEffectBits.STASIS
+        | ConditionEffectBits.INVINCIBLE;
+      if (definition.isEnemy && !definition.invincible && !dead && (condition & blocked) === 0) {
         enemies.push(entity);
       }
-      if (definition.isPlayer) {
+      const playerBlocked = ConditionEffectBits.STASIS | ConditionEffectBits.INVINCIBLE;
+      if (definition.isPlayer && !dead && (condition & playerBlocked) === 0) {
         players.push(entity);
       }
       if (definition.occupySquare || definition.enemyOccupySquare) {
@@ -404,7 +430,7 @@ export class CombatTracker {
       return false;
     }
 
-    const enemy = nearestHit(pos, world.enemies, projectile.hitObjects);
+    const enemy = firstHit(pos, world.enemies, projectile.hitObjects);
     if (!enemy) {
       return false;
     }
@@ -451,8 +477,7 @@ function scaleProjectileDefinition(
     ...definition,
     speed: definition.speed * speed,
     lifetimeMs: definition.lifetimeMs * lifetime,
-    acceleration: definition.acceleration * speed,
-    speedClamp: definition.speedClamp < 0 ? definition.speedClamp : definition.speedClamp * speed,
+    trajectoryLifetimeMs: definition.trajectoryLifetimeMs ?? definition.lifetimeMs,
   };
 }
 
@@ -462,6 +487,16 @@ function validMultiplier(value: number): number {
 
 function tileKey(x: number, y: number): string {
   return `${x},${y}`;
+}
+
+function projectileKey(ownerId: number, bulletId: number): string {
+  return `${ownerId}:${bulletId}`;
+}
+
+function rawNumber(entity: CombatEntity, stat: number): number | undefined {
+  const value = entity.rawStats?.[String(stat)];
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function withinHitBox(a: { x: number; y: number }, b: { x: number; y: number }): boolean {
@@ -490,8 +525,17 @@ function nearestHit(
   return nearest;
 }
 
+function firstHit(
+  pos: { x: number; y: number },
+  entities: CombatEntity[],
+  ignored: Set<number>,
+): CombatEntity | undefined {
+  return entities.find((entity) => !ignored.has(entity.objectId) && withinHitBox(pos, entity));
+}
+
 function positionAt(projectile: ActiveProjectile, elapsed: number): { x: number; y: number } {
   const definition = projectile.definition;
+  const trajectoryLifetime = definition.trajectoryLifetimeMs ?? definition.lifetimeMs;
   const baseSpeed = definition.speed / 10000;
   let distance: number;
   if (definition.acceleration === 0 || elapsed < definition.accelerationDelay) {
@@ -522,14 +566,14 @@ function positionAt(projectile: ActiveProjectile, elapsed: number): { x: number;
     x += distance * Math.cos(angle);
     y += distance * Math.sin(angle);
   } else if (definition.parametric) {
-    const t = elapsed / definition.lifetimeMs * 2 * Math.PI;
+    const t = elapsed / trajectoryLifetime * 2 * Math.PI;
     const localX = Math.sin(t) * (projectile.bulletId % 2 ? 1 : -1);
     const localY = Math.sin(2 * t) * (projectile.bulletId % 4 < 2 ? 1 : -1);
     x += (localX * Math.cos(projectile.angle) - localY * Math.sin(projectile.angle)) * definition.magnitude;
     y += (localX * Math.sin(projectile.angle) + localY * Math.cos(projectile.angle)) * definition.magnitude;
   } else {
     if (definition.boomerang) {
-      const halfway = definition.lifetimeMs * baseSpeed * 0.5;
+      const halfway = trajectoryLifetime * baseSpeed * 0.5;
       if (distance > halfway) {
         distance = halfway - (distance - halfway);
       }
@@ -538,7 +582,7 @@ function positionAt(projectile: ActiveProjectile, elapsed: number): { x: number;
     y += distance * Math.sin(projectile.angle);
     if (definition.amplitude !== 0) {
       const deflection = definition.amplitude * Math.sin(
-        phase + elapsed / definition.lifetimeMs * definition.frequency * 2 * Math.PI,
+        phase + elapsed / trajectoryLifetime * definition.frequency * 2 * Math.PI,
       );
       x += deflection * Math.cos(projectile.angle + Math.PI / 2);
       y += deflection * Math.sin(projectile.angle + Math.PI / 2);

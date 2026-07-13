@@ -18,7 +18,7 @@ test('local shots emit their projectile details', () => {
   assert.deepEqual(events[0], {
     bulletId: 1,
     weaponType: 0x1234,
-    attackIndex: 0,
+    attackIndex: -1,
     angle: 0,
   });
 });

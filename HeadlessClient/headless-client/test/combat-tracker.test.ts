@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  ConditionEffectBits,
   EnemyHitPacket,
   EnemyShootPacket,
   OtherHitPacket,
@@ -8,6 +9,7 @@ import {
   PlayerHitPacket,
   PlayerShootPacket,
   ServerPlayerShootPacket,
+  StatType,
   SquareHitPacket,
 } from 'realmlib';
 import {
@@ -99,6 +101,84 @@ test('own projectile ignores permanently invincible enemy-tagged objects', () =>
       { objectId: 31, type: 101, x: 3, y: 1 },
       { objectId: 30, type: 100, x: 5, y: 1 },
     ],
+  }));
+
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0] instanceof EnemyHitPacket);
+  assert.equal(sent[0].targetId, 30);
+});
+
+test('own projectile ignores dead, stasis, and runtime-invincible enemies', () => {
+  const sent: Packet[] = [];
+  const tracker = new CombatTracker(data(), (packet) => sent.push(packet));
+  tracker.trackOwnShoot(ownShot(), 0);
+
+  tracker.update(600, world({
+    entities: [
+      { objectId: 31, type: 100, x: 2, y: 1, rawStats: { [StatType.HP_STAT]: 0 } },
+      { objectId: 32, type: 100, x: 3, y: 1, rawStats: { [StatType.CONDITION_STAT]: ConditionEffectBits.STASIS } },
+      { objectId: 33, type: 100, x: 4, y: 1, rawStats: { [StatType.CONDITION_STAT]: ConditionEffectBits.INVINCIBLE } },
+      { objectId: 30, type: 100, x: 5, y: 1, rawStats: { [StatType.HP_STAT]: 100 } },
+    ],
+  }));
+
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0] instanceof EnemyHitPacket);
+  assert.equal(sent[0].targetId, 30);
+});
+
+test('server shot echo does not replace the locally tracked subattack projectile', () => {
+  const sent: Packet[] = [];
+  const localProjectile = { ...projectile, speed: 100 };
+  const echoedProjectile = { ...projectile, speed: 10 };
+  const base = data();
+  const tracker = new CombatTracker({
+    getObject: base.getObject,
+    getProjectile: (type, id) => type === 500
+      ? id === 1 ? localProjectile : id === 0 ? echoedProjectile : undefined
+      : undefined,
+  }, (packet) => sent.push(packet));
+  const localShot = new PlayerShootPacket();
+  localShot.bulletId = 8;
+  localShot.containerType = 500;
+  localShot.startingPos.x = 0;
+  localShot.startingPos.y = 1;
+  localShot.angle = 0;
+
+  tracker.trackPlayerShoot(10, localShot, 0, 1);
+  tracker.trackOwnShoot(ownShot(), 0);
+  tracker.update(600, world({
+    entities: [{ objectId: 30, type: 100, x: 5, y: 1 }],
+  }));
+
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0] instanceof EnemyHitPacket);
+  assert.equal(sent[0].targetId, 30);
+});
+
+test('lifetime multipliers do not stretch a parametric projectile path', () => {
+  const sent: Packet[] = [];
+  const parametricProjectile = {
+    ...projectile,
+    speed: 0,
+    parametric: true,
+    magnitude: 3,
+  };
+  const base = data();
+  const tracker = new CombatTracker({
+    getObject: base.getObject,
+    getProjectile: (type, id) => type === 500 && id === 0 ? parametricProjectile : undefined,
+  }, (packet) => sent.push(packet));
+  const shot = new PlayerShootPacket();
+  shot.bulletId = 8;
+  shot.containerType = 500;
+  shot.startingPos.x = 10;
+  shot.startingPos.y = 10;
+  shot.angle = 0;
+
+  tracker.trackPlayerShoot(10, shot, 0, 0, 1, 2);
+  tracker.update(300, world({
+    entities: [{ objectId: 30, type: 100, x: 7, y: 10 }],
   }));
 
   assert.equal(sent.length, 1);

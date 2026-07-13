@@ -34,6 +34,10 @@ export interface WeaponFirePatternInfo {
 
 export interface WeaponSubattackInfo {
   rateOfFire: number;
+  isDummy: boolean;
+  defaultAngleIncrease: number;
+  minIncrAngleCounter: number;
+  maxIncrAngleCounter: number;
   patterns: readonly WeaponFirePatternInfo[];
 }
 
@@ -156,7 +160,8 @@ export class CommandSender {
     if (![state.pos.x, state.pos.y, target.x, target.y].every(Number.isFinite)) {
       return false;
     }
-    if ((state.player.condition & ConditionEffectBits.STUNNED) !== 0) {
+    if ((state.player.condition & ConditionEffectBits.STUNNED) !== 0
+      || (state.player.condition2 & ConditionEffectBits2.PETRIFIED) !== 0) {
       return false;
     }
     const weaponType = state.player.inventory?.[weaponSlot] ?? -1;
@@ -179,7 +184,9 @@ export class CommandSender {
     }
     this.attackStart = state.time;
 
-    const aimAngle = Math.atan2(target.y - state.pos.y, target.x - state.pos.x);
+    const aimAngle = (state.player.condition & ConditionEffectBits.UNSTABLE) !== 0
+      ? Math.random() * Math.PI * 2
+      : Math.atan2(target.y - state.pos.y, target.x - state.pos.x);
     const fireStates = this.fireStates(weaponType, subattacks.length);
     let sent = false;
     for (let attackIndex = 0; attackIndex < subattacks.length; attackIndex++) {
@@ -188,7 +195,8 @@ export class CommandSender {
       if (state.time < fireState.lastFire) {
         fireState.lastFire = -Infinity;
       }
-      if (state.time < fireState.lastFire + this.attackPeriod(state.player, subattack.rateOfFire)) {
+      const subattackPeriod = Math.max(0, this.attackPeriod(state.player, subattack.rateOfFire) - 2);
+      if (state.time < fireState.lastFire + subattackPeriod) {
         continue;
       }
       fireState.lastFire = state.time;
@@ -204,14 +212,25 @@ export class CommandSender {
       const sin = Math.sin(aimAngle);
       const spawnX = state.pos.x + spawnDistance * cos - offsetX * sin;
       const spawnY = state.pos.y + spawnDistance * sin + offsetX * cos;
-      let angle = aimAngle - arcGap * (count - 1) / 2 + defaultAngle;
+      let angleIncrease = 0;
+      const angleIncrement = finiteNumber(subattack.defaultAngleIncrease, 0);
+      if (angleIncrement !== 0) {
+        angleIncrease = angleIncrement * Math.PI / 180 * fireState.incrCounter;
+        fireState.incrCounter += fireState.incrDirection;
+        const minCounter = Math.trunc(finiteNumber(subattack.minIncrAngleCounter, 0));
+        const maxCounter = Math.trunc(finiteNumber(subattack.maxIncrAngleCounter, 0));
+        if (fireState.incrCounter > maxCounter || fireState.incrCounter < minCounter) {
+          fireState.incrDirection *= -1;
+        }
+      }
+      let angle = aimAngle - arcGap * (count - 1) / 2 + defaultAngle + angleIncrease;
 
       for (let projectileIndex = 0; projectileIndex < count; projectileIndex++) {
         const shot = new PlayerShootPacket();
         shot.time = state.time;
         shot.bulletId = state.nextBulletId();
         shot.containerType = weaponType;
-        shot.attackIndex = attackIndex;
+        shot.attackIndex = subattack.isDummy ? -1 : attackIndex;
         shot.startingPos.x = spawnX;
         shot.startingPos.y = spawnY;
         shot.angle = angle;
@@ -267,7 +286,12 @@ export class CommandSender {
   private fireStates(weaponType: number, count: number): SubattackFireState[] {
     let states = this.subattackStates.get(weaponType);
     if (!states || states.length !== count) {
-      states = Array.from({ length: count }, () => ({ lastFire: -Infinity, patternIndex: 0 }));
+      states = Array.from({ length: count }, () => ({
+        lastFire: -Infinity,
+        patternIndex: 0,
+        incrCounter: 0,
+        incrDirection: 1,
+      }));
       this.subattackStates.set(weaponType, states);
     }
     return states;
@@ -293,6 +317,8 @@ export class CommandSender {
 interface SubattackFireState {
   lastFire: number;
   patternIndex: number;
+  incrCounter: number;
+  incrDirection: number;
 }
 
 function normalizeSubattacks(info: WeaponFireInfo): readonly WeaponSubattackInfo[] {
@@ -302,6 +328,10 @@ function normalizeSubattacks(info: WeaponFireInfo): readonly WeaponSubattackInfo
   }
   return [{
     rateOfFire: validRate(info.rateOfFire),
+    isDummy: true,
+    defaultAngleIncrease: 0,
+    minIncrAngleCounter: 0,
+    maxIncrAngleCounter: 0,
     patterns: [{
       projectileId: 0,
       patternIndex: -1,

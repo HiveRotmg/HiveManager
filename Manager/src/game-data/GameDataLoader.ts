@@ -39,6 +39,12 @@ export interface WeaponPatternDef {
 
 export interface WeaponSubattackDef {
   rateOfFire: number;
+  /** Basic projectile weapons without `<Subattack>` use the protocol's -1 attack index. */
+  isDummy: boolean;
+  /** Per-volley oscillating angle increment, in degrees. */
+  defaultAngleIncrease: number;
+  minIncrAngleCounter: number;
+  maxIncrAngleCounter: number;
   patterns: WeaponPatternDef[];
 }
 
@@ -222,6 +228,14 @@ function finiteOr(value: unknown, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function xmlNumber(value: unknown, fallback: number): number {
+  if (Array.isArray(value)) return xmlNumber(value[0], fallback);
+  if (value && typeof value === 'object') {
+    return finiteOr((value as Record<string, unknown>)['#text'], fallback);
+  }
+  return finiteOr(value, fallback);
+}
+
 function positiveIntOr(value: unknown, fallback: number): number {
   const parsed = finiteOr(value, fallback);
   return parsed > 0 ? Math.max(1, Math.trunc(parsed)) : fallback;
@@ -243,7 +257,28 @@ function readWeaponSubattacks(
   const rootDefaultAngle = finiteOr(root.DefaultAngle, 0);
   const rootOffset = readPosOffset(root.PosOffset, [0, 0]);
 
-  return asObjectArray(node).map((subattack) => {
+  const subattacks = asObjectArray(node);
+  if (subattacks.length === 0) {
+    if (asObjectArray(root.Projectile).length === 0) return [];
+    return [{
+      rateOfFire: rootRate,
+      isDummy: true,
+      defaultAngleIncrease: 0,
+      minIncrAngleCounter: 0,
+      maxIncrAngleCounter: 0,
+      patterns: [{
+        projectileId: 0,
+        patternIndex: -1,
+        numProjectiles: rootNumProjectiles,
+        arcGap: rootArcGap,
+        defaultAngle: rootDefaultAngle,
+        posOffsetX: rootOffset[0],
+        posOffsetY: rootOffset[1],
+      }],
+    }];
+  }
+
+  return subattacks.map((subattack) => {
     const rateOfFire = finiteOr(subattack.RateOfFire, rootRate);
     const inheritedNumProjectiles = positiveIntOr(subattack.NumProjectiles, rootNumProjectiles);
     const inheritedArcGap = finiteOr(subattack.ArcGap, rootArcGap);
@@ -254,9 +289,15 @@ function readWeaponSubattacks(
     const patternNodes = explicitPatterns.length > 0 ? explicitPatterns : [subattack];
 
     const patterns = patternNodes.map((pattern, patternIndex): WeaponPatternDef => {
-      const [posOffsetX, posOffsetY] = readPosOffset(pattern.PosOffset, inheritedOffset);
+      let [posOffsetX, posOffsetY] = readPosOffset(pattern.PosOffset, inheritedOffset);
+      if (explicitPatterns.length > 0 && posOffsetX === 0 && posOffsetY === 0) {
+        [posOffsetX, posOffsetY] = inheritedOffset;
+      }
       return {
-        projectileId: Math.max(0, Math.trunc(finiteOr(pattern['@_projectileId'], inheritedProjectileId))),
+        projectileId: Math.max(0, Math.trunc(finiteOr(
+          pattern['@_projectileId'],
+          explicitPatterns.length > 0 ? 0 : inheritedProjectileId,
+        ))),
         patternIndex: explicitPatterns.length > 0 ? patternIndex : -1,
         numProjectiles: positiveIntOr(pattern.NumProjectiles, inheritedNumProjectiles),
         arcGap: finiteOr(pattern.ArcGap, inheritedArcGap),
@@ -265,7 +306,24 @@ function readWeaponSubattacks(
         posOffsetY,
       };
     });
-    return { rateOfFire, patterns };
+    const angleIncreaseNode = subattack.DefaultAngleIncr;
+    const defaultAngleIncrease = Math.trunc(xmlNumber(angleIncreaseNode, 0));
+    const increment = Math.abs(defaultAngleIncrease);
+    const angleIncreaseAttributes = angleIncreaseNode && typeof angleIncreaseNode === 'object'
+      ? angleIncreaseNode as Record<string, unknown>
+      : undefined;
+    return {
+      rateOfFire,
+      isDummy: false,
+      defaultAngleIncrease,
+      minIncrAngleCounter: increment > 0
+        ? Math.trunc(finiteOr(angleIncreaseAttributes?.['@_minAngle'], 0) / increment)
+        : 0,
+      maxIncrAngleCounter: increment > 0
+        ? Math.trunc(finiteOr(angleIncreaseAttributes?.['@_maxAngle'], 0) / increment)
+        : 0,
+      patterns,
+    };
   });
 }
 
