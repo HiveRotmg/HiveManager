@@ -93,6 +93,19 @@ export class BridgeWalking {
       }
     };
 
+    Walking.enableAutoDodge = () => {
+      warnUnimplemented('Walking.enableAutoDodge');
+      return false;
+    };
+
+    Walking.disableAutoDodge = () => {
+      warnUnimplemented('Walking.disableAutoDodge');
+    };
+
+    Walking.isAutoDodgeEnabled = () => false;
+
+    Walking.getAutoDodgeState = () => null;
+
     Walking.getDodgePosition = (): Position | null => {
       warnUnimplemented('Walking.getDodgePosition');
       return null;

@@ -1,10 +1,13 @@
 import { config } from './config';
+import { ConditionEffectBits } from 'realmlib';
 
 export interface MovementSnapshot {
   playerSpeed: number;
   playerSpeedBoost: number;
   localPos: { x: number; y: number };
   serverPos?: { x: number; y: number };
+  condition?: number;
+  tileSpeed?: number;
 }
 
 export interface MoveTarget {
@@ -17,6 +20,18 @@ export interface MovementUpdate {
   pos: { x: number; y: number };
   reached?: { x: number; y: number };
   stalled?: { distance: number };
+}
+
+export interface MovementVelocity {
+  x: number;
+  y: number;
+}
+
+export interface MovementUpdateOptions {
+  /** Integrate from locally predicted movement instead of the last server position. */
+  integrateFromLocal?: boolean;
+  /** Temporarily replaces navigation velocity without changing its target. */
+  velocityOverride?: MovementVelocity;
 }
 
 const SPEED_MIN = 0.004;
@@ -52,12 +67,15 @@ export class MovementController {
     return this.target ? { ...this.target } : undefined;
   }
 
-  update(snapshot: MovementSnapshot, dt: number): MovementUpdate {
-    if (!this.target) {
+  update(snapshot: MovementSnapshot, dt: number, options: MovementUpdateOptions = {}): MovementUpdate {
+    if (!this.target && !options.velocityOverride) {
       return { pos: snapshot.localPos };
     }
-    const pos = this.stepToward(snapshot, dt);
-    const stalled = this.detectStall(snapshot.serverPos, dt);
+    const pos = options.velocityOverride
+      ? this.stepWithVelocity(snapshot, dt, options.velocityOverride, !!options.integrateFromLocal)
+      : this.stepToward(snapshot, dt, !!options.integrateFromLocal);
+    if (!this.target) return { pos };
+    const stalled = options.velocityOverride ? undefined : this.detectStall(snapshot.serverPos, dt);
     const confirmedPos = snapshot.serverPos ?? pos;
     if (Math.hypot(this.target.x - confirmedPos.x, this.target.y - confirmedPos.y) < this.target.threshold) {
       const reached = { x: this.target.x, y: this.target.y };
@@ -67,11 +85,25 @@ export class MovementController {
     return { pos, stalled };
   }
 
-  private stepToward(snapshot: MovementSnapshot, dt: number): { x: number; y: number } {
+  getIntendedVelocity(snapshot: MovementSnapshot, integrateFromLocal = false): MovementVelocity {
+    if (!this.target) return { x: 0, y: 0 };
+    const base = integrateFromLocal ? snapshot.localPos : snapshot.serverPos ?? snapshot.localPos;
+    const dx = this.target.x - base.x;
+    const dy = this.target.y - base.y;
+    const distance = Math.hypot(dx, dy);
+    if (distance === 0) return { x: 0, y: 0 };
+    const speed = movementSpeed(snapshot);
+    return { x: dx / distance * speed, y: dy / distance * speed };
+  }
+
+  private stepToward(
+    snapshot: MovementSnapshot,
+    dt: number,
+    integrateFromLocal: boolean,
+  ): { x: number; y: number } {
     const target = this.target!;
-    const base = snapshot.serverPos ?? snapshot.localPos;
-    const speed = snapshot.playerSpeed + snapshot.playerSpeedBoost;
-    const step = (SPEED_MIN + (speed / 75) * (SPEED_MAX - SPEED_MIN)) * dt;
+    const base = integrateFromLocal ? snapshot.localPos : snapshot.serverPos ?? snapshot.localPos;
+    const step = movementSpeed(snapshot) * dt;
     const dx = target.x - base.x;
     const dy = target.y - base.y;
     const dist = Math.hypot(dx, dy);
@@ -79,6 +111,16 @@ export class MovementController {
       return { x: target.x, y: target.y };
     }
     return { x: base.x + (dx / dist) * step, y: base.y + (dy / dist) * step };
+  }
+
+  private stepWithVelocity(
+    snapshot: MovementSnapshot,
+    dt: number,
+    velocity: MovementVelocity,
+    integrateFromLocal: boolean,
+  ): { x: number; y: number } {
+    const base = integrateFromLocal ? snapshot.localPos : snapshot.serverPos ?? snapshot.localPos;
+    return { x: base.x + velocity.x * dt, y: base.y + velocity.y * dt };
   }
 
   private detectStall(serverPos: { x: number; y: number } | undefined, dt: number): { distance: number } | undefined {
@@ -99,4 +141,17 @@ export class MovementController {
     }
     return undefined;
   }
+}
+
+export function movementSpeed(snapshot: MovementSnapshot): number {
+  const tileMultiplier = Math.min(1, Math.max(0, snapshot.tileSpeed ?? 1));
+  if (((snapshot.condition ?? 0) & ConditionEffectBits.SLOWED) !== 0) {
+    return SPEED_MIN * tileMultiplier;
+  }
+  const speedStat = snapshot.playerSpeed + snapshot.playerSpeedBoost;
+  let speed = SPEED_MIN + (speedStat / 75) * (SPEED_MAX - SPEED_MIN);
+  if (((snapshot.condition ?? 0) & (ConditionEffectBits.SPEEDY | ConditionEffectBits.NINJA_SPEEDY)) !== 0) {
+    speed *= 1.5;
+  }
+  return speed * tileMultiplier;
 }

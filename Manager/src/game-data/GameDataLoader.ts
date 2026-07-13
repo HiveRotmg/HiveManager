@@ -91,6 +91,8 @@ export interface ObjectDef {
   isPet: boolean;
   isPlayer: boolean;
   isContainer: boolean;
+  /** True when the object XML contains `<Loot />` (dropped bags/stashes). */
+  isLoot: boolean;
   /** Raw `<Tier>` text from objects.xml (numeric tier, UT, ST, …). */
   tierStr: string;
   /** `<DungeonName>` from portal objects — the dungeon this portal leads to. */
@@ -204,6 +206,15 @@ export interface TilePushVector {
   dy: number;
 }
 
+export interface EnchantmentDef {
+  type: number;
+  id: string;
+  displayId: string;
+  description: string;
+  labels: string[];
+  compatibleLabels: string[];
+}
+
 function readActivateEffects(node: unknown): string[] {
   if (node == null) return [];
   if (Array.isArray(node)) return node.flatMap(readActivateEffects);
@@ -226,6 +237,13 @@ function asObjectArray(node: unknown): Record<string, unknown>[] {
 function finiteOr(value: unknown, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function csvValues(value: unknown): string[] {
+  return String(value ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 function xmlNumber(value: unknown, fallback: number): number {
@@ -354,6 +372,7 @@ export interface GameWikiObjectSummary {
   isPet: boolean;
   isPlayer: boolean;
   isContainer: boolean;
+  isLoot: boolean;
   /** `<DungeonName>` from portal objects — the dungeon this portal leads to. */
   dungeonName: string;
   /** Parsed 8/8 class caps (Player category in Game Wiki) when present. */
@@ -390,6 +409,7 @@ export interface GameWikiTileRow {
  */
 export class GameDataLoader {
   private objects = new Map<number, ObjectDef>();
+  private enchantments = new Map<number, EnchantmentDef>();
   private tileSpeedMap = new Map<number, number>();
   private tileNameMap = new Map<number, string>();
   private tileTextureMap = new Map<number, TileTextureDef>();
@@ -457,6 +477,7 @@ export class GameDataLoader {
         isPet: obj.Pet !== undefined,
         isPlayer: obj.Player !== undefined,
         isContainer: obj.Container !== undefined,
+        isLoot: obj.Loot !== undefined,
         tierStr: String(obj.Tier ?? '').trim(),
         bagType: (() => {
           const v = Number(obj.BagType);
@@ -555,6 +576,37 @@ export class GameDataLoader {
 
   getObject(type: number): ObjectDef | undefined {
     return this.objects.get(type);
+  }
+
+  loadEnchantments(xmlPath: string): void {
+    const xml = readFileSync(xmlPath, 'utf8');
+    const parser = new XMLParser({
+      ignoreAttributes: false,
+      attributeNamePrefix: '@_',
+      isArray: (name) => name === 'Enchantment',
+    });
+    const parsed = parser.parse(xml);
+    const enchantments = parsed.Enchantments?.Enchantment ?? [];
+    this.enchantments.clear();
+    for (const enchantment of enchantments) {
+      const typeRaw = String(enchantment['@_type'] ?? '').trim();
+      if (!typeRaw) continue;
+      const type = Number(typeRaw);
+      if (!Number.isFinite(type)) continue;
+      const id = String(enchantment['@_id'] ?? '').trim();
+      this.enchantments.set(type, {
+        type,
+        id,
+        displayId: String(enchantment.DisplayId ?? id).trim(),
+        description: String(enchantment.Description ?? '').trim(),
+        labels: csvValues(enchantment.EnchantmentLabels),
+        compatibleLabels: csvValues(enchantment.CompatibleWithItemLabels),
+      });
+    }
+  }
+
+  getEnchantment(type: number): EnchantmentDef | undefined {
+    return this.enchantments.get(type);
   }
 
   /**
@@ -986,6 +1038,7 @@ export class GameDataLoader {
         isPet: o.isPet,
         isPlayer: o.isPlayer,
         isContainer: o.isContainer,
+        isLoot: o.isLoot,
         dungeonName,
         ...(o.playerStatMaxes ? { playerStatMaxes: o.playerStatMaxes } : {}),
       });

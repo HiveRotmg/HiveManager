@@ -1,10 +1,36 @@
 export type LootRarity =
+  | 'brown'
+  | 'pink'
   | 'white'
   | 'purple'
+  | 'egg'
+  | 'cyan'
   | 'blue'
+  | 'orange'
+  | 'red'
+  // Legacy aliases retained for existing scripts.
   | 'green'
   | 'common'
   | 'unknown';
+
+export interface LootEnchantment {
+  type: number;
+  id?: string;
+  name?: string;
+  description?: string;
+  labels: string[];
+}
+
+export interface LootItemEnchantments {
+  /** Original base64url value supplied by stat 80 for this slot. */
+  raw: string;
+  isEmpty: boolean;
+  slotCount: number;
+  typeIds: number[];
+  entries: LootEnchantment[];
+  /** Unparsed bytes following the declared enchantment slots. */
+  suffixHex: string;
+}
 
 export interface LootBag {
   objectId: number;
@@ -14,12 +40,15 @@ export interface LootBag {
   items: LootItem[];
   droppedAt: number;
   ownerName?: string;
+  ownerAccountId?: string;
 }
 
 export interface LootItem {
   objectType: number;
   slotIndex: number;
   itemName?: string;
+  /** Undefined when the server did not publish stat 80 for this container. */
+  enchantments?: LootItemEnchantments;
 }
 
 export interface LootDropEvent {

@@ -1,0 +1,146 @@
+import type { CombatDataProvider, CombatProjectileSnapshot } from './combat-tracker';
+
+interface DodgeObjectRecord {
+  key: string;
+  occupySquare: boolean;
+  fullOccupy: boolean;
+  enemyOccupySquare: boolean;
+}
+
+const INVALID_TILE_TYPE = 0xffff;
+
+/** Incrementally maintained collision view used by predictive auto-dodge. */
+export class DodgeCollisionWorld {
+  private width = 0;
+  private height = 0;
+  private readonly tiles = new Map<string, number>();
+  private readonly objects = new Map<number, DodgeObjectRecord>();
+  private readonly occupyCounts = new Map<string, number>();
+  private readonly fullOccupyCounts = new Map<string, number>();
+  private readonly enemyOccupyCounts = new Map<string, number>();
+
+  constructor(private readonly data: CombatDataProvider) {}
+
+  reset(): void {
+    this.width = 0;
+    this.height = 0;
+    this.tiles.clear();
+    this.objects.clear();
+    this.occupyCounts.clear();
+    this.fullOccupyCounts.clear();
+    this.enemyOccupyCounts.clear();
+  }
+
+  setMapBounds(width: number, height: number): void {
+    this.width = Number.isFinite(width) ? Math.max(0, Math.trunc(width)) : 0;
+    this.height = Number.isFinite(height) ? Math.max(0, Math.trunc(height)) : 0;
+  }
+
+  observeTile(x: number, y: number, type: number): void {
+    this.tiles.set(tileKey(Math.trunc(x), Math.trunc(y)), Math.trunc(type));
+  }
+
+  upsertObject(objectId: number, objectType: number, x: number, y: number): void {
+    this.removeObject(objectId);
+    const definition = this.data.getObject(objectType);
+    if (!definition) return;
+    const record: DodgeObjectRecord = {
+      key: tileKey(Math.floor(x), Math.floor(y)),
+      occupySquare: !!definition.occupySquare,
+      fullOccupy: !!definition.fullOccupy,
+      enemyOccupySquare: !!definition.enemyOccupySquare,
+    };
+    if (!record.occupySquare && !record.fullOccupy && !record.enemyOccupySquare) return;
+    this.objects.set(objectId, record);
+    this.adjust(this.occupyCounts, record.key, record.occupySquare ? 1 : 0);
+    this.adjust(this.fullOccupyCounts, record.key, record.fullOccupy ? 1 : 0);
+    this.adjust(this.enemyOccupyCounts, record.key, record.enemyOccupySquare ? 1 : 0);
+  }
+
+  removeObject(objectId: number): void {
+    const record = this.objects.get(objectId);
+    if (!record) return;
+    this.objects.delete(objectId);
+    this.adjust(this.occupyCounts, record.key, record.occupySquare ? -1 : 0);
+    this.adjust(this.fullOccupyCounts, record.key, record.fullOccupy ? -1 : 0);
+    this.adjust(this.enemyOccupyCounts, record.key, record.enemyOccupySquare ? -1 : 0);
+  }
+
+  canOccupy(x: number, y: number, safeWalk: boolean): boolean {
+    const tileX = Math.floor(x);
+    const tileY = Math.floor(y);
+    const type = this.tiles.get(tileKey(tileX, tileY));
+    if (type === undefined || type === INVALID_TILE_TYPE || !this.inBounds(tileX, tileY)
+      || this.data.tileIsBlockingWalk?.(type)
+      || safeWalk && (this.data.getTileDamage?.(type) ?? 0) > 0
+      || (this.occupyCounts.get(tileKey(tileX, tileY)) ?? 0) > 0) {
+      return false;
+    }
+
+    const fracX = x - tileX;
+    const fracY = y - tileY;
+    const minX = fracX < 0.5 ? tileX - 1 : tileX;
+    const maxX = fracX > 0.5 ? tileX + 1 : tileX;
+    const minY = fracY < 0.5 ? tileY - 1 : tileY;
+    const maxY = fracY > 0.5 ? tileY + 1 : tileY;
+    for (let neighborX = minX; neighborX <= maxX; neighborX++) {
+      for (let neighborY = minY; neighborY <= maxY; neighborY++) {
+        if (neighborX === tileX && neighborY === tileY) continue;
+        const key = tileKey(neighborX, neighborY);
+        const neighborType = this.tiles.get(key);
+        if (neighborType === undefined || neighborType === INVALID_TILE_TYPE
+          || !this.inBounds(neighborX, neighborY)
+          || (this.fullOccupyCounts.get(key) ?? 0) > 0) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  isProjectileSegmentOpen(
+    fromX: number,
+    fromY: number,
+    toX: number,
+    toY: number,
+    projectile: CombatProjectileSnapshot,
+  ): boolean {
+    const dx = toX - fromX;
+    const dy = toY - fromY;
+    const steps = Math.max(1, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)) / 0.25));
+    for (let step = 1; step <= steps; step++) {
+      const ratio = step / steps;
+      if (!this.isProjectilePathOpen(fromX + dx * ratio, fromY + dy * ratio, projectile)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private isProjectilePathOpen(x: number, y: number, projectile: CombatProjectileSnapshot): boolean {
+    const tileX = Math.floor(x);
+    const tileY = Math.floor(y);
+    const key = tileKey(tileX, tileY);
+    const type = this.tiles.get(key);
+    if (type === undefined || type === INVALID_TILE_TYPE || !this.inBounds(tileX, tileY)) return false;
+    if ((this.enemyOccupyCounts.get(key) ?? 0) > 0) return false;
+    return projectile.definition.passesCover || (this.occupyCounts.get(key) ?? 0) === 0;
+  }
+
+  private inBounds(x: number, y: number): boolean {
+    return x >= 0 && y >= 0
+      && (this.width === 0 || x < this.width)
+      && (this.height === 0 || y < this.height);
+  }
+
+  private adjust(counts: Map<string, number>, key: string, delta: number): void {
+    if (delta === 0) return;
+    const count = (counts.get(key) ?? 0) + delta;
+    if (count > 0) counts.set(key, count);
+    else counts.delete(key);
+  }
+}
+
+function tileKey(x: number, y: number): string {
+  return `${x},${y}`;
+}

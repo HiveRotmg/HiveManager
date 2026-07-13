@@ -23,6 +23,7 @@ import {
 } from 'headless-client';
 import { StatType } from '../../../constants/StatType.js';
 import type { BridgeDeps } from '../BridgeDeps.js';
+import { buildContainerItems, lootRarityForType } from '../loot/model.js';
 
 const questIds = new WeakMap<Client, number>();
 const questHooks = new WeakSet<Client>();
@@ -113,8 +114,26 @@ function portalEntity(object: TrackedObject, client: Client, deps: BridgeDeps): 
   };
 }
 
-function containerEntity(object: TrackedObject, deps: BridgeDeps): Container {
-  return baseObject(object, deps);
+function containerEntity(object: TrackedObject, client: Client, deps: BridgeDeps): Container {
+  const def = deps.gameData.getObject(object.type);
+  const stats = { ...(object.rawStats ?? {}) };
+  for (const slot of client.getWorldContainerSlots(object.objectId)) {
+    if (slot.slotId >= 0 && slot.slotId < 8) {
+      stats[String(StatType.Inventory0 + slot.slotId)] = slot.objectType;
+    }
+  }
+  const ownerName = stats[String(StatType.NameStat)];
+  const ownerAccountId = stats[String(StatType.OwnerAccountId)];
+  const base = baseObject(object, deps);
+  return {
+    ...base,
+    name: def?.displayId || def?.id || base.name,
+    isLoot: def?.isLoot === true,
+    items: buildContainerItems(stats, deps),
+    ...(def?.isLoot ? { rarity: lootRarityForType(object.type, deps) } : {}),
+    ...(typeof ownerName === 'string' && ownerName ? { ownerName } : {}),
+    ...(typeof ownerAccountId === 'string' && ownerAccountId ? { ownerAccountId } : {}),
+  };
 }
 
 function sdkObject(object: TrackedObject, client: Client, deps: BridgeDeps): GameObject {
@@ -122,7 +141,7 @@ function sdkObject(object: TrackedObject, client: Client, deps: BridgeDeps): Gam
     case 'Player': return playerEntity(object, deps);
     case 'Enemy': return enemyEntity(object, deps);
     case 'Portal': return portalEntity(object, client, deps);
-    case 'Container': return containerEntity(object, deps);
+    case 'Container': return containerEntity(object, client, deps);
     default: return baseObject(object, deps);
   }
 }

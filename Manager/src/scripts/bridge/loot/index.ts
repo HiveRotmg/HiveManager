@@ -1,43 +1,11 @@
 import { loot } from '@hive/sdk';
-import type { LootBag, LootItem, LootRarity, PickupOptions } from '@hive/sdk';
+import type { LootBag, LootItem, PickupOptions } from '@hive/sdk';
 import type { BridgeDeps } from '../BridgeDeps.js';
 import type { ClientConnection } from '../../../proxy/ClientConnection.js';
 import type { Packet } from '../../../packets/Packet.js';
 import { StatType } from '../../../constants/StatType.js';
 import { Logger } from '../../../util/Logger.js';
-
-// ─── Bag type constants ───────────────────────────────────────────────────────
-
-const BAG_TYPES = new Set<number>([
-  1280, 1281, 1283, 1286, 1287, 1288, 1289, 1291, 1292, 1294, 1295, 1296,
-  1708, 1709, 1710, 1722, 1723, 1724, 1725, 1726, 1727, 1728, 8239,
-]);
-
-const BAG_RARITY: Readonly<Record<number, LootRarity>> = {
-  1280: 'common',  // Brown Bag (public)
-  1281: 'common',  // Brown Bag (alt)
-  1283: 'green',   // Cyan Bag (public)
-  1286: 'purple',  // Purple Bag (public)
-  1287: 'purple',  // Purple Bag (soulbound)
-  1288: 'blue',    // Blue Bag (public)
-  1289: 'blue',    // Blue Bag (soulbound)
-  1291: 'white',   // White Bag (public)
-  1292: 'white',   // White Bag (soulbound)
-  1294: 'purple',  // Orange/ST Bag (public) — no 'orange' in LootRarity
-  1295: 'purple',  // Orange/ST Bag (soulbound)
-  1296: 'purple',  // Orange Bag (alt)
-  1708: 'common',
-  1709: 'common',
-  1710: 'blue',
-  1722: 'purple',
-  1723: 'purple',
-  1724: 'white',
-  1725: 'white',
-  1726: 'purple',
-  1727: 'purple',
-  1728: 'purple',
-  8239: 'common',
-};
+import { buildLootBag, LOOT_RARITY_RANK } from './model.js';
 
 // ─── Item classification sets (mirrors auto-loot) ────────────────────────────
 
@@ -114,23 +82,29 @@ function buildCatalog(deps: BridgeDeps): void {
 
 // ─── Rarity ranking ──────────────────────────────────────────────────────────
 
-const RARITY_RANK: Record<LootRarity, number> = {
-  unknown: -1,
-  common: 0,
-  green: 1,
-  blue: 2,
-  purple: 3,
-  white: 4,
-};
+const RARITY_RANK = LOOT_RARITY_RANK;
 
 // ─── Active bag tracking ─────────────────────────────────────────────────────
 
-const activeBags: Map<number, LootBag> = new Map();
-
 type AnyHandler = (e: any) => void;
-const listeners: Map<string, AnyHandler[]> = new Map();
+interface LegacyLootState {
+  activeBags: Map<number, LootBag>;
+  listeners: Map<string, AnyHandler[]>;
+}
 
-function register(key: string, handler: AnyHandler): () => void {
+const legacyStates = new WeakMap<ClientConnection, LegacyLootState>();
+
+function stateFor(client: ClientConnection): LegacyLootState {
+  const current = legacyStates.get(client);
+  if (current) return current;
+  const state = { activeBags: new Map<number, LootBag>(), listeners: new Map<string, AnyHandler[]>() };
+  legacyStates.set(client, state);
+  return state;
+}
+
+function register(client: ClientConnection | undefined, key: string, handler: AnyHandler): () => void {
+  if (!client) return () => {};
+  const { listeners } = stateFor(client);
   if (!listeners.has(key)) listeners.set(key, []);
   listeners.get(key)!.push(handler);
   return () => {
@@ -139,8 +113,8 @@ function register(key: string, handler: AnyHandler): () => void {
   };
 }
 
-function fireSafe(key: string, event: any): void {
-  for (const h of listeners.get(key) ?? []) {
+function fireSafe(client: ClientConnection, key: string, event: any): void {
+  for (const h of stateFor(client).listeners.get(key) ?? []) {
     try {
       h(event);
     } catch (err) {
@@ -151,7 +125,6 @@ function fireSafe(key: string, event: any): void {
 
 function buildBagFromObj(obj: any, deps: BridgeDeps): LootBag | null {
   const objectType = Number(obj.objectType);
-  if (!BAG_TYPES.has(objectType)) return null;
   const status = obj.status;
   if (!status) return null;
 
@@ -160,33 +133,24 @@ function buildBagFromObj(obj: any, deps: BridgeDeps): LootBag | null {
     ? { x: Number(status.position.x), y: Number(status.position.y) }
     : { x: 0, y: 0 };
 
-  const stats: Record<string, number> = {};
+  const stats: Record<string, number | string> = {};
   if (status.data && Array.isArray(status.data)) {
     for (const s of status.data) {
-      if (s && s.id != null) stats[String(s.id)] = Number(s.value);
+      if (s && s.id != null) stats[String(s.id)] = s.value;
     }
   }
-
-  const items: LootItem[] = [];
-  for (let slot = 0; slot < 8; slot++) {
-    const itemType = stats[String(StatType.Inventory0 + slot)];
-    if (!Number.isFinite(itemType) || itemType <= 0) continue;
-    const itemDef = deps.gameData.getObject(itemType);
-    items.push({ objectType: itemType, slotIndex: slot, itemName: itemDef?.id });
-  }
-
-  const rarity: LootRarity = BAG_RARITY[objectType] ?? 'unknown';
-  return { objectId, bagType: objectType, rarity, position: pos, items, droppedAt: Date.now() };
+  return buildLootBag({ objectId, objectType, x: pos.x, y: pos.y, stats }, Date.now(), deps);
 }
 
-function onUpdate(_client: ClientConnection, packet: Packet, deps: BridgeDeps): void {
+function onUpdate(client: ClientConnection, packet: Packet, deps: BridgeDeps): void {
   if (!packet.isDefined) return;
+  const { activeBags } = stateFor(client);
   if (packet.data.newObjs) {
     for (const obj of packet.data.newObjs as any[]) {
       const bag = buildBagFromObj(obj, deps);
       if (!bag) continue;
       activeBags.set(bag.objectId, bag);
-      fireSafe('bagDropped', { bag });
+      fireSafe(client, 'bagDropped', { bag });
     }
   }
   if (packet.data.drops) {
@@ -194,9 +158,33 @@ function onUpdate(_client: ClientConnection, packet: Packet, deps: BridgeDeps): 
       const bag = activeBags.get(Number(id));
       if (!bag) continue;
       activeBags.delete(Number(id));
-      fireSafe('bagRemoved', { bag });
+      fireSafe(client, 'bagRemoved', { bag });
     }
   }
+}
+
+function currentLegacyBags(deps: BridgeDeps): LootBag[] {
+  const client = deps.clientRef.current;
+  if (!client) return [];
+  const state = stateFor(client);
+  const worldState = deps.getWorldStateForClient?.(client) ?? deps.worldState;
+  const result: LootBag[] = [];
+  for (const [objectId, cached] of state.activeBags) {
+    const entity = worldState.getEntity(objectId);
+    const refreshed = entity
+      ? buildLootBag({
+          objectId,
+          objectType: cached.bagType,
+          x: entity.pos.x,
+          y: entity.pos.y,
+          stats: { ...(entity.stats ?? {}) },
+        }, cached.droppedAt, deps)
+      : cached;
+    if (!refreshed) continue;
+    state.activeBags.set(objectId, refreshed);
+    result.push(refreshed);
+  }
+  return result;
 }
 
 // ─── Packet helpers ───────────────────────────────────────────────────────────
@@ -204,8 +192,14 @@ function onUpdate(_client: ClientConnection, packet: Packet, deps: BridgeDeps): 
 const QUICKSLOT_PACKET_BASE = 1000000;
 const QUICK_SLOT_COUNT = 3;
 
-function getCurrentBagSlotItem(deps: BridgeDeps, bagObjectId: number, slotIndex: number): number {
-  const entity = deps.worldState.getEntity(bagObjectId);
+function getCurrentBagSlotItem(
+  deps: BridgeDeps,
+  client: ClientConnection,
+  bagObjectId: number,
+  slotIndex: number,
+): number {
+  const worldState = deps.getWorldStateForClient?.(client) ?? deps.worldState;
+  const entity = worldState.getEntity(bagObjectId);
   if (!entity) return -1;
   const raw = entity.stats?.[String(StatType.Inventory0 + slotIndex)];
   const itemId = Number(raw);
@@ -347,31 +341,31 @@ export function install(deps: BridgeDeps): void {
       }
     });
 
-    deps.proxy.hookPacket('MAPINFO', () => {
-      activeBags.clear();
+    deps.proxy.hookPacket('MAPINFO', (client) => {
+      stateFor(client).activeBags.clear();
     });
   }
 
   // ─── Bag queries ────────────────────────────────────────────────────────────
-  loot.getBags = () => Array.from(activeBags.values());
+  loot.getBags = () => currentLegacyBags(deps);
 
   loot.getNearbyBags = (radius = 5) => {
     const pd = deps.clientRef.current?.playerData;
-    if (!pd) return Array.from(activeBags.values());
+    if (!pd) return currentLegacyBags(deps);
     const { x: px, y: py } = pd.pos;
-    return Array.from(activeBags.values()).filter(
+    return currentLegacyBags(deps).filter(
       (b) => Math.hypot(b.position.x - px, b.position.y - py) <= radius,
     );
   };
 
   loot.getBagsByRarity = (rarity) =>
-    Array.from(activeBags.values()).filter((b) => b.rarity === rarity);
+    currentLegacyBags(deps).filter((b) => b.rarity === rarity);
 
   loot.getBagsContaining = (objectType) =>
-    Array.from(activeBags.values()).filter((b) => b.items.some((i) => i.objectType === objectType));
+    currentLegacyBags(deps).filter((b) => b.items.some((i) => i.objectType === objectType));
 
   // ─── Events ─────────────────────────────────────────────────────────────────
-  loot.onBagDropped = (handler) => register('bagDropped', handler);
+  loot.onBagDropped = (handler) => register(deps.clientRef.current, 'bagDropped', handler);
 
   loot.onRareBagDropped = (minRarity, handler) =>
     loot.onBagDropped((e) => {
@@ -384,7 +378,7 @@ export function install(deps: BridgeDeps): void {
       if (match) handler({ bag: e.bag, item: match });
     });
 
-  loot.onBagRemoved = (handler) => register('bagRemoved', handler);
+  loot.onBagRemoved = (handler) => register(deps.clientRef.current, 'bagRemoved', handler);
 
   // ─── Pickup ──────────────────────────────────────────────────────────────────
 
@@ -392,7 +386,7 @@ export function install(deps: BridgeDeps): void {
     const c = deps.clientRef.current;
     if (!c?.connected || !c.objectId) return false;
 
-    const itemId = getCurrentBagSlotItem(deps, bag.objectId, slotIndex);
+    const itemId = getCurrentBagSlotItem(deps, c, bag.objectId, slotIndex);
     if (itemId <= 0) return false;
 
     const useBackpack = opts?.useBackpack ?? true;
@@ -413,8 +407,9 @@ export function install(deps: BridgeDeps): void {
     if (!c?.connected || !c.objectId) return -1;
 
     // Look up bag — check activeBags first, fall back to worldState entity
-    const bag = activeBags.get(bagObjectId);
-    const entity = deps.worldState.getEntity(bagObjectId);
+    const bag = stateFor(c).activeBags.get(bagObjectId);
+    const worldState = deps.getWorldStateForClient?.(c) ?? deps.worldState;
+    const entity = worldState.getEntity(bagObjectId);
     if (!entity) return -1;
 
     // Use most up-to-date position from worldState
@@ -430,7 +425,7 @@ export function install(deps: BridgeDeps): void {
     let sent = 0;
 
     for (let slot = 0; slot < 8; slot++) {
-      const itemId = getCurrentBagSlotItem(deps, bagObjectId, slot);
+      const itemId = getCurrentBagSlotItem(deps, c, bagObjectId, slot);
       if (itemId <= 0) continue;
 
       const destination = findQuickslotForItem(c, itemId, claimedSlots)
@@ -453,7 +448,7 @@ export function install(deps: BridgeDeps): void {
     const c = deps.clientRef.current;
     if (!c?.connected) return false;
 
-    const itemId = getCurrentBagSlotItem(deps, bag.objectId, slotIndex);
+    const itemId = getCurrentBagSlotItem(deps, c, bag.objectId, slotIndex);
     if (itemId <= 0) return false;
 
     try {

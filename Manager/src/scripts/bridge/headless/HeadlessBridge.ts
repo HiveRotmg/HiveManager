@@ -15,6 +15,7 @@ import type { BridgeDeps } from '../BridgeDeps.js';
 import { installHeadlessChatBridge } from './HeadlessChatBridge.js';
 import { installHeadlessCombatBridge } from './HeadlessCombatBridge.js';
 import { installHeadlessEventsBridge } from './HeadlessEventsBridge.js';
+import { installHeadlessLootBridge } from './HeadlessLootBridge.js';
 import { installHeadlessSocialBridge } from './HeadlessSocialBridge.js';
 import { installHeadlessWorldBridge } from './HeadlessWorldBridge.js';
 
@@ -172,6 +173,16 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
   Walking.stopMoving = () => active(deps).stopMoving();
   Walking.isMoving = () => optional(deps)?.isMoving() ?? false;
   Walking.hasReached = (position: Position, tolerance = 0.5) => (optional(deps)?.distanceTo(position) ?? Infinity) <= tolerance;
+  Walking.enableAutoDodge = (options = {}) => active(deps).enableAutoDodge(options);
+  Walking.disableAutoDodge = () => active(deps).disableAutoDodge();
+  Walking.isAutoDodgeEnabled = () => optional(deps)?.isAutoDodgeEnabled() ?? false;
+  Walking.getAutoDodgeState = () => optional(deps)?.getAutoDodgeState() ?? null;
+  Walking.getDodgePosition = () => {
+    const target = optional(deps)?.getAutoDodgeState()?.target;
+    return target ? new Position(target.x, target.y) : null;
+  };
+  Walking.dodge = () => active(deps).enableAutoDodge();
+  Walking.dodgeFrom = () => active(deps).enableAutoDodge();
 
   chat.say = (message: string) => active(deps).say(message);
   chat.send = (message: string) => active(deps).say(message);
@@ -250,5 +261,6 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
   installHeadlessChatBridge(deps);
   installHeadlessSocialBridge(deps);
   installHeadlessEventsBridge(deps);
+  installHeadlessLootBridge(deps);
 
 }

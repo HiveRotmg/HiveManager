@@ -23,6 +23,7 @@ import {
   ServerPlayerShootPacket,
   PlayerShootPacket,
   EnemyShootPacket,
+  ShowEffectPacket,
   AoePacket,
   AoeAckPacket,
   GroundDamagePacket,
@@ -32,6 +33,7 @@ import {
   ChangeAllyShootPacket,
   VaultContentPacket,
   EscapePacket,
+  UseItemPacket,
   InvResultPacket,
   StatData,
   ObjectData,
@@ -54,6 +56,7 @@ import {
   inventorySlotIndex,
   ConditionEffectBits,
   ConditionEffectBits2,
+  VisualEffect,
 } from 'realmlib';
 import { deleteCharacter as deleteCharacterRequest } from './account-service';
 import {
@@ -79,7 +82,14 @@ import { BUILD_VERSION, GAME_ID, GAME_PORT, HELLO_TOKEN } from './constants';
 import { config } from './config';
 import { ClientEvent } from './events';
 import { ExplorativePathfinder } from './explorative-pathfinder';
-import { MovementController } from './movement-controller';
+import { DodgeCollisionWorld } from './dodge-collision-world';
+import { MovementController, movementSpeed, type MovementSnapshot } from './movement-controller';
+import {
+  PredictiveAutoDodgeController,
+  ThrownAoeTracker,
+  type AutoDodgeOptions,
+  type AutoDodgeState,
+} from './predictive-auto-dodge';
 import { RealmPortal, ClientOptions, ClientServer, TrackedObject, TrackedTile } from './models';
 import { PortalTracker } from './portal-tracker';
 import { connectThroughProxy, proxyConfigToUrl } from './proxy';
@@ -183,6 +193,8 @@ export interface ClientEventMap {
   [ClientEvent.VaultContents]: [packet: VaultContentPacket];
   [ClientEvent.InventoryResult]: [packet: InvResultPacket];
   [ClientEvent.RealmPortal]: [portal: RealmPortal];
+  [ClientEvent.ObjectAdded]: [object: TrackedObject];
+  [ClientEvent.ObjectRemoved]: [object: TrackedObject];
   [ClientEvent.Tick]: [player: PlayerData | undefined];
   [ClientEvent.Death]: [packet: DeathPacket];
   [ClientEvent.Failure]: [packet: FailurePacket];
@@ -225,6 +237,9 @@ export class Client extends EventEmitter {
   private readonly timers = new TimerBag();
   private readonly movement = new MovementController();
   private readonly pathfinder: ExplorativePathfinder;
+  private readonly dodgeWorld: DodgeCollisionWorld | undefined;
+  private readonly autoDodge: PredictiveAutoDodgeController | undefined;
+  private readonly thrownAoes: ThrownAoeTracker | undefined;
   private readonly portalTracker = new PortalTracker();
   private readonly autoNexus: AutoNexusMonitor;
   private readonly combat: CombatTracker | undefined;
@@ -306,6 +321,7 @@ export class Client extends EventEmitter {
   /** Gameplay-clock epoch. It intentionally survives every socket/map reconnect. */
   private connectStart = Date.now();
   private lastFrameTime = 0;
+  private lastLocalMovementAt = 0;
   private lastGroundDamageAt = 0;
   private tickCount = 0;
   /** Tick id from the most recent NewTick, and the server-reported ms between the last two ticks. */
@@ -376,6 +392,9 @@ export class Client extends EventEmitter {
     this.clientToken = opts.clientToken;
     this.wantVault = opts.autoEnterVault ?? config.autoEnterVault;
     this.pathfinder = new ExplorativePathfinder(opts.combatData);
+    this.dodgeWorld = opts.combatData ? new DodgeCollisionWorld(opts.combatData) : undefined;
+    this.autoDodge = opts.combatData ? new PredictiveAutoDodgeController() : undefined;
+    this.thrownAoes = opts.combatData ? new ThrownAoeTracker() : undefined;
     this.autoNexus = new AutoNexusMonitor((trigger) => {
       console.warn(
         `${this.tag} autonexus at ${trigger.hp}/${trigger.maxHp} HP ` +
@@ -515,6 +534,27 @@ export class Client extends EventEmitter {
 
   getNavigationPath(): Array<{ x: number; y: number }> {
     return this.pathfinder.getRemainingPath();
+  }
+
+  /** Enables ProdMafia-style predictive projectile and thrown-AOE dodging. */
+  enableAutoDodge(options: AutoDodgeOptions = {}): boolean {
+    if (!this.autoDodge) return false;
+    this.autoDodge.setEnabled(true, options);
+    this.lastLocalMovementAt = this.time();
+    return true;
+  }
+
+  disableAutoDodge(): void {
+    this.autoDodge?.setEnabled(false);
+    this.lastLocalMovementAt = 0;
+  }
+
+  isAutoDodgeEnabled(): boolean {
+    return this.autoDodge?.isEnabled() ?? false;
+  }
+
+  getAutoDodgeState(): AutoDodgeState | null {
+    return this.autoDodge?.getState() ?? null;
   }
 
   /** Short account label used in logs and console commands. */
@@ -993,6 +1033,58 @@ export class Client extends EventEmitter {
       return false;
     }
     return this.invSwapNear(slotRef(source), slotRef(destination));
+  }
+
+  /** Current authoritative slots retained for an arbitrary visible world container. */
+  getWorldContainerSlots(objectId: number): SlotObjectData[] {
+    const slots = this.containerSlotItems.get(objectId);
+    if (!slots) return [];
+    return [...slots.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([slotId, itemType]) => SlotObjectData.from(objectId, slotId, itemType));
+  }
+
+  getWorldContainerSlot(objectId: number, slotId: number): SlotObjectData | null {
+    if (!Number.isInteger(slotId) || slotId < 0) return null;
+    const itemType = this.containerSlotItems.get(objectId)?.get(slotId);
+    return itemType === undefined ? null : SlotObjectData.from(objectId, slotId, itemType);
+  }
+
+  /** Sends USEITEM for any known slot, including a slot in a dropped loot bag. */
+  useItem(slot: SlotObjectData, useType = 0, target = this.serverPos ?? this.pos): boolean {
+    if (!this.isInWorld() || !this.io || slot.objectType <= 0) return false;
+    const packet = new UseItemPacket();
+    packet.time = this.time();
+    packet.slotObject = slot.clone();
+    packet.itemUsePos.x = target.x;
+    packet.itemUsePos.y = target.y;
+    packet.useType = useType;
+    packet.useItemFlag = 0;
+    this.io.send(packet);
+    return true;
+  }
+
+  /** Walks into range of a world-container slot, then sends USEITEM. */
+  useItemNear(slot: SlotObjectData, arriveThreshold = Math.max(config.arriveThreshold, 1)): boolean {
+    if (slot.objectId === this.objectId) return this.useItem(slot);
+    const object = this.objects.get(slot.objectId);
+    if (!object) return false;
+    const target = { x: object.x, y: object.y };
+    if (distance(this.serverPos ?? this.pos, target) <= arriveThreshold) return this.useItem(slot);
+
+    const cancel = (): void => {
+      this.off(ClientEvent.ReachedTarget, onReached);
+    };
+    const onReached = (reached: { x: number; y: number }): void => {
+      if (distance(reached, target) > arriveThreshold) return;
+      this.off(ClientEvent.MapChange, cancel);
+      const current = this.getWorldContainerSlot(slot.objectId, slot.slotId);
+      if (current && current.objectType > 0) this.useItem(current);
+    };
+    this.once(ClientEvent.ReachedTarget, onReached);
+    this.once(ClientEvent.MapChange, cancel);
+    this.moveTo(target, arriveThreshold);
+    return true;
   }
 
   /** Swaps a player inventory slot with a pet-bag slot (empty pet slot by default). */
@@ -1962,10 +2054,14 @@ export class Client extends EventEmitter {
     this.serverPos = undefined;
     this.player = undefined;
     this.lastFrameTime = 0;
+    this.lastLocalMovementAt = 0;
     this.lastGroundDamageAt = 0;
     this.objects.clear();
     this.tiles.clear();
     this.pathfinder.resetMap();
+    this.dodgeWorld?.reset();
+    this.autoDodge?.reset();
+    this.thrownAoes?.clear();
     this.recentObjectTypes.clear();
     this.predictedPlayerDamage.clear();
     this.nextBulletId = 1;
@@ -2150,7 +2246,7 @@ export class Client extends EventEmitter {
     this.registerHandlers();
     this.setupDebug();
     if (this.combat) {
-      this.combatTimer = this.timers.setInterval(() => this.updateCombat(this.time()), 16);
+      this.combatTimer = this.timers.setInterval(() => this.updateLocalFrame(this.time()), 16);
     }
 
     this.socket.on('close', () => {
@@ -2390,6 +2486,7 @@ export class Client extends EventEmitter {
     this.io.on(PacketType.PING, (p: PingPacket)                           => this.handlePing(p));
     this.io.on(PacketType.SERVERPLAYERSHOOT, (p: ServerPlayerShootPacket) => this.handleServerPlayerShoot(p));
     this.io.on(PacketType.ENEMYSHOOT, (p: EnemyShootPacket)               => this.handleEnemyShoot(p));
+    this.io.on(PacketType.SHOWEFFECT, (p: ShowEffectPacket)               => this.handleShowEffect(p));
     this.io.on(PacketType.AOE, (p: AoePacket)                             => this.handleAoe(p));
     this.io.on(PacketType.DAMAGE, (p: DamagePacket)                       => this.handleDamage(p));
     this.io.on(PacketType.GOTO, (p: GotoPacket)                           => this.handleGoto(p));
@@ -2413,6 +2510,7 @@ export class Client extends EventEmitter {
     this.mapWidth = p.width;
     this.mapHeight = p.height;
     this.pathfinder.setMapBounds(p.width, p.height);
+    this.dodgeWorld?.setMapBounds(p.width, p.height);
     this.enteringVault = false;
     this.inVault = /vault/i.test(p.name);
     this.autoNexus.reset();
@@ -2476,6 +2574,7 @@ export class Client extends EventEmitter {
     for (const tile of p.tiles) {
       this.tiles.set(`${tile.x},${tile.y}`, { x: tile.x, y: tile.y, type: tile.type });
       this.pathfinder.observeTile(tile.x, tile.y, tile.type);
+      this.dodgeWorld?.observeTile(tile.x, tile.y, tile.type);
     }
     for (const obj of p.newObjects) {
       if (obj.status.objectId === this.objectId) {
@@ -2487,7 +2586,7 @@ export class Client extends EventEmitter {
         this.captureContainerSlots(obj.status.objectId, obj.status.stats);
       } else {
         this.captureContainerSlots(obj.status.objectId, obj.status.stats);
-        this.objects.set(obj.status.objectId, {
+        const tracked: TrackedObject = {
           objectId: obj.status.objectId,
           type: obj.objectType,
           x: obj.status.pos.x,
@@ -2495,8 +2594,15 @@ export class Client extends EventEmitter {
           name: this.objectName(obj),
           player: processObject(obj),
           rawStats: this.rawStats(obj.status.stats),
-        });
+        };
+        this.objects.set(obj.status.objectId, tracked);
         this.pathfinder.upsertObject(
+          obj.status.objectId,
+          obj.objectType,
+          obj.status.pos.x,
+          obj.status.pos.y,
+        );
+        this.dodgeWorld?.upsertObject(
           obj.status.objectId,
           obj.objectType,
           obj.status.pos.x,
@@ -2506,12 +2612,25 @@ export class Client extends EventEmitter {
         if (obj.objectType === PortalType.RealmPortal) {
           this.trackRealmPortal(obj.status);
         }
+        this.emit(ClientEvent.ObjectAdded, {
+          ...tracked,
+          rawStats: tracked.rawStats ? { ...tracked.rawStats } : undefined,
+        });
       }
     }
     for (const id of p.drops) {
+      const removed = this.objects.get(id);
       this.objects.delete(id);
       this.pathfinder.removeObject(id);
+      this.dodgeWorld?.removeObject(id);
       this.portalTracker.delete(id);
+      if (removed) {
+        this.emit(ClientEvent.ObjectRemoved, {
+          ...removed,
+          rawStats: removed.rawStats ? { ...removed.rawStats } : undefined,
+        });
+      }
+      this.containerSlotItems.delete(id);
     }
     this.maybeDumpObjects();
     this.findVaultPortal();
@@ -2526,7 +2645,7 @@ export class Client extends EventEmitter {
     this.lastTickId = p.tickId;
     this.lastTickTime = p.tickTime;
     this.tickCount++;
-    this.updateTarget(dt);
+    if (!this.autoDodge?.isEnabled()) this.updateTarget(dt, false, now);
     this.sendMove(p, now);
     this.updateStatuses(p);
     this.updateCombat(now);
@@ -2536,11 +2655,25 @@ export class Client extends EventEmitter {
     this.emit(ClientEvent.Tick, this.player);
   }
 
+  /** Runs high-frequency local movement before projectile collision resolution. */
+  private updateLocalFrame(now: number): void {
+    if (this.autoDodge?.isEnabled() && this.posKnown && this.player) {
+      const dt = this.lastLocalMovementAt > 0
+        ? Math.min(34, Math.max(0, now - this.lastLocalMovementAt))
+        : 0;
+      this.lastLocalMovementAt = now;
+      if (dt > 0) this.updateTarget(dt, true, now);
+    } else {
+      this.lastLocalMovementAt = 0;
+    }
+    this.updateCombat(now);
+  }
+
   /** Advances locally simulated projectiles against the latest world snapshot. */
   private updateCombat(now: number): void {
     this.combat?.update(now, {
       playerId: this.objectId,
-      playerPos: this.serverPos ?? this.pos,
+      playerPos: this.autoDodge?.isEnabled() ? this.pos : this.serverPos ?? this.pos,
       mapWidth: this.mapWidth,
       mapHeight: this.mapHeight,
       entities: this.objects.values(),
@@ -2601,77 +2734,98 @@ export class Client extends EventEmitter {
     this.io.send(ground);
   }
 
-  /** Advances the local position toward a requested movement target. */
-  private updateTarget(dt: number): void {
-    if (!this.pathfinder.hasTarget()) {
-      if (!this.movement.hasTarget()) {
-        return;
+  /** Advances navigation intent, with predictive dodge optionally replacing only its velocity. */
+  private updateTarget(dt: number, integrateFromLocal = false, now = this.time()): void {
+    const usingPathfinding = this.pathfinder.hasTarget();
+    if (usingPathfinding) {
+      const authoritativePos = this.serverPos ?? this.pos;
+      const navigation = this.pathfinder.next(authoritativePos);
+      if (navigation.reached) {
+        this.movement.clear();
+        console.log(`${this.tag} reached move target`);
+        this.emit(ClientEvent.ReachedTarget, navigation.reached);
+      } else if (!navigation.waypoint || navigation.waypointThreshold === undefined) {
+        this.movement.clear();
+        if (navigation.noPath && navigation.replanned) {
+          const target = this.pathfinder.getTarget();
+          console.warn(
+            `${this.tag} no path to (${target?.x.toFixed(2)},${target?.y.toFixed(2)}) with current map knowledge`,
+          );
+        }
+      } else {
+        const activeWaypoint = this.movement.getTarget();
+        if (!activeWaypoint
+          || activeWaypoint.x !== navigation.waypoint.x
+          || activeWaypoint.y !== navigation.waypoint.y
+          || activeWaypoint.threshold !== navigation.waypointThreshold) {
+          this.movement.setTarget(navigation.waypoint, navigation.waypointThreshold);
+        }
       }
-      const direct = this.movement.update(
-        {
-          localPos: this.pos,
-          serverPos: this.serverPos,
-          playerSpeed: this.player?.spd ?? 0,
-          playerSpeedBoost: this.player?.spdBoost ?? 0,
-        },
-        dt,
-      );
-      this.pos = direct.pos;
-      if (direct.stalled && this.serverPos) {
+    }
+
+    const snapshot = this.movementSnapshot();
+    const movementLocked = this.isMovementLocked();
+    const intentVelocity = movementLocked
+      ? { x: 0, y: 0 }
+      : this.movement.getIntendedVelocity(snapshot, integrateFromLocal);
+    const dodgeState = this.autoDodge?.isEnabled() && this.combat && this.dodgeWorld && this.thrownAoes
+      ? this.autoDodge.evaluate({
+          time: now,
+          playerId: this.objectId,
+          position: this.pos,
+          moveSpeed: movementSpeed(snapshot),
+          intentVelocity,
+          movementLeadMs: dt,
+          movementLocked,
+          projectiles: this.combat.getActiveProjectiles(),
+          aoes: this.thrownAoes.getActive(now),
+          environment: this.dodgeWorld,
+        })
+      : undefined;
+    const velocityOverride = dodgeState?.overrideActive ? dodgeState.velocity : undefined;
+    if (movementLocked) return;
+    if (!this.movement.hasTarget() && !velocityOverride) return;
+
+    const update = this.movement.update(snapshot, dt, { integrateFromLocal, velocityOverride });
+    this.pos = update.pos;
+    if (update.stalled && this.serverPos) {
+      if (usingPathfinding) {
+        this.pathfinder.reportStall(this.serverPos);
+        this.movement.clear();
         console.warn(
-          `${this.tag} direct movement stalled - server stuck ${direct.stalled.distance.toFixed(1)} tiles from target ` +
+          `${this.tag} movement stalled ${update.stalled.distance.toFixed(1)} tiles from waypoint at ` +
+            `(${this.serverPos.x.toFixed(2)},${this.serverPos.y.toFixed(2)}); marking the next tile blocked and replanning`,
+        );
+      } else {
+        console.warn(
+          `${this.tag} direct movement stalled - server stuck ${update.stalled.distance.toFixed(1)} tiles from target ` +
             `at (${this.serverPos.x.toFixed(2)},${this.serverPos.y.toFixed(2)})`,
         );
       }
-      if (direct.reached) {
-        console.log(`${this.tag} reached move target`);
-        this.emit(ClientEvent.ReachedTarget, direct.reached);
-      }
-      return;
     }
-    const authoritativePos = this.serverPos ?? this.pos;
-    const navigation = this.pathfinder.next(authoritativePos);
-    if (navigation.reached) {
-      this.movement.clear();
+    if (update.reached && !usingPathfinding) {
       console.log(`${this.tag} reached move target`);
-      this.emit(ClientEvent.ReachedTarget, navigation.reached);
-      return;
+      this.emit(ClientEvent.ReachedTarget, update.reached);
     }
-    if (!navigation.waypoint || navigation.waypointThreshold === undefined) {
-      this.movement.clear();
-      if (navigation.noPath && navigation.replanned) {
-        const target = this.pathfinder.getTarget();
-        console.warn(
-          `${this.tag} no path to (${target?.x.toFixed(2)},${target?.y.toFixed(2)}) with current map knowledge`,
-        );
-      }
-      return;
-    }
-    const activeWaypoint = this.movement.getTarget();
-    if (!activeWaypoint
-      || activeWaypoint.x !== navigation.waypoint.x
-      || activeWaypoint.y !== navigation.waypoint.y
-      || activeWaypoint.threshold !== navigation.waypointThreshold) {
-      this.movement.setTarget(navigation.waypoint, navigation.waypointThreshold);
-    }
-    const update = this.movement.update(
-      {
-        localPos: this.pos,
-        serverPos: this.serverPos,
-        playerSpeed: this.player?.spd ?? 0,
-        playerSpeedBoost: this.player?.spdBoost ?? 0,
-      },
-      dt,
-    );
-    this.pos = update.pos;
-    if (update.stalled && this.serverPos) {
-      this.pathfinder.reportStall(this.serverPos);
-      this.movement.clear();
-      console.warn(
-        `${this.tag} movement stalled ${update.stalled.distance.toFixed(1)} tiles from waypoint at ` +
-          `(${this.serverPos.x.toFixed(2)},${this.serverPos.y.toFixed(2)}); marking the next tile blocked and replanning`,
-      );
-    }
+  }
+
+  private movementSnapshot(): MovementSnapshot {
+    const tile = this.tiles.get(`${Math.floor(this.pos.x)},${Math.floor(this.pos.y)}`);
+    return {
+      localPos: this.pos,
+      serverPos: this.serverPos,
+      playerSpeed: this.player?.spd ?? 0,
+      playerSpeedBoost: this.player?.spdBoost ?? 0,
+      condition: this.player?.condition ?? 0,
+      tileSpeed: tile ? this.opts.combatData?.getTileSpeed?.(tile.type) ?? 1 : 1,
+    };
+  }
+
+  private isMovementLocked(): boolean {
+    const condition = this.player?.condition ?? 0;
+    const condition2 = this.player?.condition2 ?? 0;
+    return (condition & ConditionEffectBits.PARALYZED) !== 0
+      || (condition2 & ConditionEffectBits2.PETRIFIED) !== 0;
   }
 
   /** Sends the MOVE packet required every tick to keep the client alive. */
@@ -2704,6 +2858,7 @@ export class Client extends EventEmitter {
           tracked.x = status.pos.x;
           tracked.y = status.pos.y;
           this.pathfinder.upsertObject(status.objectId, tracked.type, tracked.x, tracked.y);
+          this.dodgeWorld?.upsertObject(status.objectId, tracked.type, tracked.x, tracked.y);
           tracked.player = processObjectStatus(status, tracked.player);
           Object.assign(tracked.rawStats ??= {}, this.rawStats(status.stats));
         }
@@ -2864,9 +3019,16 @@ export class Client extends EventEmitter {
     this.combat?.trackEnemyShoot(p, ownerType, this.time());
   }
 
+  /** Tracks announced thrown-projectile endpoints before their AOE packet arrives. */
+  private handleShowEffect(p: ShowEffectPacket): void {
+    if (p.effectType !== VisualEffect.THROW_PROJECTILE) return;
+    this.thrownAoes?.track(p.color, p.pos1, p.duration, this.time());
+  }
+
   /** Processes and acknowledges an area attack using the current local frame state. */
   private handleAoe(p: AoePacket): void {
     const ackTime = this.time();
+    this.thrownAoes?.recordAoe(p.pos, p.radius, ackTime);
     const ack = new AoeAckPacket();
     ack.time = ackTime;
 

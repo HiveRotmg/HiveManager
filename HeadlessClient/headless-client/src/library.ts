@@ -54,10 +54,21 @@ export type {
   CombatEntity,
   CombatObjectDefinition,
   CombatPlayerHit,
+  CombatProjectileSide,
+  CombatProjectileSnapshot,
   CombatProjectileDefinition,
   CombatTile,
   CombatWorldSnapshot,
 } from './combat-tracker';
+export { DodgeCollisionWorld } from './dodge-collision-world';
+export { PredictiveAutoDodgeController, ThrownAoeTracker } from './predictive-auto-dodge';
+export type {
+  AutoDodgeAoeThreat,
+  AutoDodgeEnvironment,
+  AutoDodgeOptions,
+  AutoDodgeSnapshot,
+  AutoDodgeState,
+} from './predictive-auto-dodge';
 export { ExplorativePathfinder } from './explorative-pathfinder';
 export type {
   PathfindingDataProvider,
@@ -88,10 +99,11 @@ export {
   PartyMemberAddedPacket,
   QuestObjectIdPacket,
   RequestTradePacket,
+  parseEnchantments,
   TextPacket,
   TradeAcceptedPacket,
   TradeChangedPacket,
   TradeDonePacket,
   TradeStartPacket,
 } from 'realmlib';
-export type { PartyInfoData, PartyPlayerData, TradeItem } from 'realmlib';
+export type { PartyInfoData, PartyPlayerData, SlotEnchantments, TradeItem } from 'realmlib';

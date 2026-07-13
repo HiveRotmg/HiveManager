@@ -65,3 +65,38 @@ test('MovementController waits for authoritative position before confirming a wa
   assert.deepEqual(confirmed.reached, { x: 1, y: 0 });
   assert.equal(movement.hasTarget(), false);
 });
+
+test('MovementController applies a local dodge velocity without clearing navigation intent', () => {
+  const movement = new MovementController();
+  movement.setTarget({ x: 10, y: 0 }, 0.1);
+  const update = movement.update(
+    {
+      localPos: { x: 2, y: 2 },
+      serverPos: { x: 1, y: 1 },
+      playerSpeed: 75,
+      playerSpeedBoost: 0,
+    },
+    100,
+    { integrateFromLocal: true, velocityOverride: { x: 0, y: 0.005 } },
+  );
+
+  assert.deepEqual(update.pos, { x: 2, y: 2.5 });
+  assert.equal(movement.hasTarget(), true);
+  assert.deepEqual(movement.getTarget(), { x: 10, y: 0, threshold: 0.1 });
+});
+
+test('MovementController can dodge from standstill without creating a walk target', () => {
+  const movement = new MovementController();
+  const update = movement.update(
+    {
+      localPos: { x: 2, y: 2 },
+      playerSpeed: 75,
+      playerSpeedBoost: 0,
+    },
+    100,
+    { integrateFromLocal: true, velocityOverride: { x: -0.005, y: 0 } },
+  );
+
+  assert.deepEqual(update.pos, { x: 1.5, y: 2 });
+  assert.equal(movement.hasTarget(), false);
+});

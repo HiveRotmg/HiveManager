@@ -61,6 +61,7 @@ export interface CombatObjectDefinition {
   invincible?: boolean;
   isPlayer?: boolean;
   occupySquare: boolean;
+  fullOccupy?: boolean;
   enemyOccupySquare?: boolean;
   protectFromGroundDamage?: boolean;
   /** Weapon RateOfFire (1 = full speed); used to derive the shot cooldown. */
@@ -84,6 +85,7 @@ export interface CombatDataProvider {
   getObject(type: number): CombatObjectDefinition | undefined;
   getProjectile(objectType: number, projectileId: number): CombatProjectileDefinition | undefined;
   getTileDamage?(tileType: number): number | undefined;
+  getTileSpeed?(tileType: number): number;
   tileIsBlockingWalk?(tileType: number): boolean;
 }
 
@@ -115,10 +117,11 @@ export interface CombatWorldSnapshot {
   tiles: Iterable<CombatTile>;
 }
 
-type ProjectileSide = 'enemy' | 'own';
+export type CombatProjectileSide = 'enemy' | 'own';
 
-interface ActiveProjectile {
-  side: ProjectileSide;
+/** Read-only combat state consumed by predictive systems such as auto-dodge. */
+export interface CombatProjectileSnapshot {
+  side: CombatProjectileSide;
   bulletId: number;
   bulletType: number;
   ownerId: number;
@@ -127,9 +130,13 @@ interface ActiveProjectile {
   startY: number;
   angle: number;
   startTime: number;
-  simulatedElapsed: number;
   definition: CombatProjectileDefinition;
   damage: number;
+  hitObjects: ReadonlySet<number>;
+}
+
+interface ActiveProjectile extends CombatProjectileSnapshot {
+  simulatedElapsed: number;
   hitObjects: Set<number>;
 }
 
@@ -292,6 +299,11 @@ export class CombatTracker {
 
   get size(): number {
     return this.projectiles.size;
+  }
+
+  /** Live projectile snapshots. Callers must not mutate values yielded here. */
+  getActiveProjectiles(): Iterable<CombatProjectileSnapshot> {
+    return this.projectiles.values();
   }
 
   accuracy(): number {
@@ -548,7 +560,25 @@ function firstHit(
   return entities.find((entity) => !ignored.has(entity.objectId) && withinHitBox(pos, entity));
 }
 
-function positionAt(projectile: ActiveProjectile, elapsed: number): { x: number; y: number } {
+/** Predicts a projectile's analytic world position at an absolute client time. */
+export function predictProjectilePosition(
+  projectile: CombatProjectileSnapshot,
+  time: number,
+  out: { x: number; y: number } = { x: 0, y: 0 },
+): { x: number; y: number } {
+  return positionAt(projectile, time - projectile.startTime, out);
+}
+
+export function isProjectileAliveAt(projectile: CombatProjectileSnapshot, time: number): boolean {
+  const elapsed = time - projectile.startTime;
+  return elapsed >= 0 && elapsed <= projectile.definition.lifetimeMs;
+}
+
+function positionAt(
+  projectile: CombatProjectileSnapshot,
+  elapsed: number,
+  out: { x: number; y: number } = { x: 0, y: 0 },
+): { x: number; y: number } {
   const definition = projectile.definition;
   const trajectoryLifetime = definition.trajectoryLifetimeMs ?? definition.lifetimeMs;
   const baseSpeed = definition.speed / 10000;
@@ -603,5 +633,7 @@ function positionAt(projectile: ActiveProjectile, elapsed: number): { x: number;
       y += deflection * Math.sin(projectile.angle + Math.PI / 2);
     }
   }
-  return { x, y };
+  out.x = x;
+  out.y = y;
+  return out;
 }

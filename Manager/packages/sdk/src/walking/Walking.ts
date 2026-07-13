@@ -1,6 +1,23 @@
 import { Position } from '../types/world/Position';
 import { Enemy } from '../types/entities/Enemy';
 
+export interface AutoDodgeOptions {
+    /** Avoid tiles that deal ground damage. Defaults to true. */
+    safeWalk?: boolean;
+}
+
+export interface AutoDodgeState {
+    enabled: boolean;
+    overrideActive: boolean;
+    velocity: { x: number; y: number };
+    target: { x: number; y: number } | null;
+    threatCount: number;
+    earliestImpactMs: number | null;
+    selectedCandidate: number;
+    speedScale: number;
+    decision: string;
+}
+
 export class Walking {
     /**
      * Walk directly toward a tile without pathfinding. Pass world **X** and **Y** as two separate numbers
@@ -80,6 +97,23 @@ export class Walking {
     }
 
     static nexus(): void {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Enable predictive projectile and thrown-AOE dodging without clearing the current walk target. */
+    static enableAutoDodge(options?: AutoDodgeOptions): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static disableAutoDodge(): void {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static isAutoDodgeEnabled(): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static getAutoDodgeState(): AutoDodgeState | null {
         throw new Error('Must be run inside Hive client');
     }
 

@@ -62,6 +62,8 @@ export type { InventoryItem, InventoryBackpackTier } from './types/inventory';
 export type {
   LootBag,
   LootItem,
+  LootEnchantment,
+  LootItemEnchantments,
   LootRarity,
   LootDropEvent,
   LootItemEvent,
@@ -104,6 +106,7 @@ export type {
   AutoNexusTriggerSource,
 } from './autoNexus/AutoNexus';
 export { Walking } from './walking/Walking';
+export type { AutoDodgeOptions, AutoDodgeState } from './walking/Walking';
 export { Combat } from './combat/Combat';
 export type {
   AutoAbilityOptions,

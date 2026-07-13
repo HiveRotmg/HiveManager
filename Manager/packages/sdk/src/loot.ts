@@ -111,4 +111,13 @@ export const loot = {
   isLifeManaPot(_objectType: number): boolean { return false; },
 };
 
-export type { LootBag, LootItem, LootRarity, LootDropEvent, LootItemEvent, PickupOptions } from './types/loot';
+export type {
+  LootBag,
+  LootItem,
+  LootEnchantment,
+  LootItemEnchantments,
+  LootRarity,
+  LootDropEvent,
+  LootItemEvent,
+  PickupOptions,
+} from './types/loot';

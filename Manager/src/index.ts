@@ -105,11 +105,17 @@ async function main() {
 
   const objectsPath = resolve(ROOT, 'data', 'objects.xml');
   const tilesPath = resolve(ROOT, 'data', 'tiles.xml');
+  const enchantmentsPath = resolve(ROOT, 'data', 'enchantments.xml');
   const gameData = new GameDataLoader();
   try {
     gameData.load(objectsPath);
   } catch (err) {
     Logger.warn('Main', `Failed to load objects.xml: ${(err as Error).message}`);
+  }
+  try {
+    gameData.loadEnchantments(enchantmentsPath);
+  } catch (err) {
+    Logger.warn('Main', `Failed to load enchantments.xml: ${(err as Error).message}`);
   }
   gameData.loadTiles(tilesPath);
 

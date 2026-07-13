@@ -24,6 +24,10 @@ export enum ClientEvent {
   InventoryResult = 'inventoryResult',
   /** A realm portal was seen/updated. Payload: RealmPortal. */
   RealmPortal = 'realmPortal',
+  /** A non-self world object was added by UPDATE. Payload: TrackedObject. */
+  ObjectAdded = 'objectAdded',
+  /** A tracked world object was removed by UPDATE. Payload: its last TrackedObject snapshot. */
+  ObjectRemoved = 'objectRemoved',
   /** A game tick was processed. Payload: PlayerData | undefined. */
   Tick = 'tick',
   /** The character died. Payload: DeathPacket. */

@@ -64,6 +64,8 @@ export const StatType = {
   HasBackpack: 75,
   Skin: 76,
   PetInstanceId: 77,
+  /** Per-slot base64url enchantment blobs, comma-separated. */
+  Enchantments: 80,
   Effects2: 95,
   /**
    * Player Status: exaltation-only slice folded into combined bonuses (see PlayerData gear split).
