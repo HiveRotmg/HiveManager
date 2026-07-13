@@ -1743,6 +1743,8 @@ export class DevServer {
    * Populated locally from RotMGAssetExtractor output; see docs/game-wiki-extractor.md.
    */
   private resolveBundledExtractorGameDataDir(): string | null {
+    const autoExtracted = join(this.publicDir, '..', '..', '..', 'data');
+    if (existsSync(join(autoExtracted, 'spritesheet.xml')) && existsSync(join(autoExtracted, 'images'))) return autoExtracted;
     const nested = join(this.publicDir, '..', '..', '..', 'data', 'rotmg-extractor-game', 'GameData');
     if (existsSync(join(nested, 'spritesheet.xml')) && existsSync(join(nested, 'images'))) return nested;
     // Auto-extracted data written by rotmgAssetExtractor at startup
@@ -2602,6 +2604,43 @@ export class DevServer {
       radius: r,
       groups: Array.from(groups, ([tileType, tiles]) => ({ tileType, name: this.gameData?.getTileName(tileType) ?? `0x${tileType.toString(16)}`, tiles }))
         .sort((a, b) => a.tileType - b.tileType),
+    };
+  }
+
+  private getHeadlessViewerPayload(accountId: string | null | undefined, radius: number) {
+    const client = this.headlessFleet?.get(accountId);
+    if (!client || !this.gameData) return null;
+    const center = client.getPosition();
+    const player = client.getPlayer();
+    const r = Math.max(6, Math.min(24, Math.trunc(radius)));
+    const tiles = client.visibleTiles()
+      .filter((tile) => Math.abs(tile.x - center.x) <= r && Math.abs(tile.y - center.y) <= r)
+      .map((tile) => {
+        const texture = this.gameData?.getTileTexture(tile.type);
+        return {
+          x: tile.x,
+          y: tile.y,
+          type: tile.type,
+          name: this.gameData?.getTileName(tile.type) ?? `0x${tile.type.toString(16)}`,
+          textureFile: texture?.file ?? '',
+          textureIndex: texture?.index ?? -1,
+        };
+      });
+    return {
+      mapName: client.getMapName(),
+      center,
+      radius: r,
+      tiles,
+      player: {
+        objectId: client.getObjectId(),
+        name: player?.name || client.alias,
+        classType: Number(player?.class ?? 0),
+        skin: Number(player?.texture ?? 0),
+        hp: Number(player?.hp ?? 0),
+        maxHp: Number(player?.maxHP ?? 0),
+        x: center.x,
+        y: center.y,
+      },
     };
   }
 
@@ -4465,6 +4504,16 @@ export class DevServer {
             accountId: accountId || this.headlessFleet?.list()[0]?.accountId || '',
             live: snapshot?.live ?? null,
             history: snapshot?.history ?? [],
+          }));
+        } else if (msg.type === 'requestViewer') {
+          const accountId = String(msg.accountId || '') || null;
+          const radiusRaw = Number(msg.radius ?? 15);
+          const radius = Number.isFinite(radiusRaw) ? radiusRaw : 15;
+          const payload = this.getHeadlessViewerPayload(accountId, radius);
+          ws.send(JSON.stringify({
+            type: 'viewerData',
+            accountId: accountId || this.headlessFleet?.list()[0]?.accountId || '',
+            ...(payload ?? { mapName: '', center: { x: 0, y: 0 }, radius: 15, tiles: [], player: null }),
           }));
         } else if (msg.type === 'requestGameWikiCatalog') {
           if (msg.force === true) {

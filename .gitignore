@@ -6,6 +6,13 @@
 **/*.tsbuildinfo
 **/*.log
 
+# Locally extracted RotMG atlases and generated metadata
+Manager/data/.local-build-hash
+Manager/data/enchanterSettings.xml
+Manager/data/enchantmentLists.xml
+Manager/data/images/
+Manager/data/spritesheet.xml
+
 # Local authentication and account data
 **/.env
 **/.env.*
@@ -22,4 +29,3 @@
 
 # Preserved histories from repositories imported into this monorepo
 **/.git.upstream/
-

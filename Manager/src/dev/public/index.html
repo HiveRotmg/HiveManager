@@ -233,6 +233,7 @@
         <button class="content-tab" data-tab="objects" data-icon="O" data-label="Objects" data-i18n="tab.objects">Objects</button>
         <button class="content-tab" data-tab="nearby" data-icon="P" data-label="Nearby Players" data-i18n="tab.nearby">Nearby Players</button>
         <button class="content-tab" data-tab="tilemap" data-icon="T" data-label="Tilemap" data-i18n="tab.tilemap">Tilemap</button>
+        <button class="content-tab" data-tab="viewer" data-icon="V" data-label="Viewer">Viewer</button>
         <button class="content-tab" data-tab="damage" data-icon="D" data-label="Damage Sniffer" data-i18n="tab.damage">Damage Sniffer</button>
         <button class="content-tab" data-tab="scripts" data-icon="S" data-label="Scripts" data-i18n="tab.scripts">Scripts</button>
       </div>
@@ -867,6 +868,19 @@
         </div>
         <div id="tilemap-tree" class="objects-tree"></div>
         <div id="tilemap-empty" class="empty-state" data-i18n="tilemap.empty">No tile data. Click Refresh after connecting to a server and entering a map.</div>
+      </div>
+
+      <div id="tab-viewer" class="tab-panel" style="display:none;">
+        <div class="objects-toolbar viewer-toolbar">
+          <label class="nearby-toolbar-label" for="viewer-account-select">Account</label>
+          <select id="viewer-account-select" class="nearby-select"></select>
+          <button id="viewer-refresh-btn" class="setting-btn" type="button">Refresh</button>
+          <div id="viewer-status" class="viewer-status">Waiting for a connected account</div>
+        </div>
+        <div id="viewer-stage" class="viewer-stage">
+          <canvas id="viewer-canvas" aria-label="Read-only nearby game view"></canvas>
+          <div id="viewer-empty" class="empty-state viewer-empty">Connect an account to view nearby tiles.</div>
+        </div>
       </div>
 
       <div id="tab-game-wiki" class="tab-panel" style="display:none;">

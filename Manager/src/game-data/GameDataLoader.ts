@@ -175,6 +175,11 @@ export interface TilePushVector {
   dy: number;
 }
 
+export interface TileTextureDef {
+  file: string;
+  index: number;
+}
+
 /** Slim object row for the dev dashboard Game Wiki (no projectiles on the wire). */
 export interface GameWikiObjectSummary {
   type: number;
@@ -235,6 +240,7 @@ export class GameDataLoader {
   private objects = new Map<number, ObjectDef>();
   private tileSpeedMap = new Map<number, number>();
   private tileNameMap = new Map<number, string>();
+  private tileTextureMap = new Map<number, TileTextureDef>();
   private tileTypeByNameMap = new Map<string, number>();
   private tilePushTypes = new Set<number>();
   private objectRawXmlMap = new Map<number, string>();
@@ -540,6 +546,7 @@ export class GameDataLoader {
     const sinkTiles    = new Set<number>();
     this.tileSpeedMap = new Map<number, number>();
     this.tileNameMap = new Map<number, string>();
+    this.tileTextureMap = new Map<number, TileTextureDef>();
     this.tileTypeByNameMap = new Map<string, number>();
     this.tilePushTypes = new Set<number>();
     this.tileDamageMap = new Map<number, number>();
@@ -574,6 +581,12 @@ export class GameDataLoader {
           this.tileTypeByNameMap.set(id.toLowerCase(), type);
         }
         if (displayId) this.tileTypeByNameMap.set(displayId.toLowerCase(), type);
+        const tileTexture = ground.Texture ?? ground.RandomTexture?.Texture;
+        const textureFile = readFirstTextureFile(tileTexture);
+        const textureIndex = readFirstTextureIndex(tileTexture);
+        if (textureFile && textureIndex >= 0) {
+          this.tileTextureMap.set(type, { file: textureFile, index: textureIndex });
+        }
         if (ground.Push !== undefined) {
           this.tilePushTypes.add(type);
           const pushVector = this.extractPushVectorFromGround(ground, id);
@@ -660,6 +673,10 @@ export class GameDataLoader {
   /** Returns the display/id name for a tile type, or a hex fallback if unknown. */
   getTileName(tileType: number): string {
     return this.tileNameMap.get(tileType) ?? `0x${tileType.toString(16)}`;
+  }
+
+  getTileTexture(tileType: number): TileTextureDef | undefined {
+    return this.tileTextureMap.get(tileType);
   }
 
   /** Resolve a ground type by its XML id/name, case-insensitive. */

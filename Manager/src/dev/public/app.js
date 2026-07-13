@@ -2241,6 +2241,10 @@
   ];
   let _objectsTreeHash = null;
   let _tilemapTreeHash = null;
+  let lastViewerData = null;
+  let viewerPollTimer = null;
+  const viewerTileImages = new Map();
+  const viewerPlayerImages = new Map();
   let lastNearbyPlayers = [];
   let selectedNearbyPlayerId = null;
   let lastNearbyPlayerDebug = null;
@@ -2283,7 +2287,7 @@
   var connectedClients = new Map(); // clientId → compact data from clientList message
   var headlessSessions = new Map(); // accountId -> live headless session summary
   function refreshHeadlessAccountSelectors() {
-    ['objects-account-select', 'nearby-account-select', 'tilemap-account-select', 'damage-account-select'].forEach(function (id) {
+    ['objects-account-select', 'nearby-account-select', 'tilemap-account-select', 'damage-account-select', 'viewer-account-select'].forEach(function (id) {
       var select = document.getElementById(id);
       if (!select) return;
       var previous = String(select.value || '');
@@ -2577,6 +2581,12 @@
   const nearbyDebugTreeEl = document.getElementById('nearby-debug-tree');
   const nearbyDebugEmptyEl = document.getElementById('nearby-debug-empty');
   const nearbyDebugSubtitleEl = document.getElementById('nearby-debug-subtitle');
+  const viewerAccountSelect = document.getElementById('viewer-account-select');
+  const viewerRefreshBtn = document.getElementById('viewer-refresh-btn');
+  const viewerCanvas = document.getElementById('viewer-canvas');
+  const viewerStage = document.getElementById('viewer-stage');
+  const viewerEmpty = document.getElementById('viewer-empty');
+  const viewerStatus = document.getElementById('viewer-status');
   const overlayLoginError = document.getElementById('overlay-login-error');
   const overlayEmailInput = document.getElementById('overlay-email');
   const overlayPasswordInput = document.getElementById('overlay-password');
@@ -6193,6 +6203,7 @@
           break;
         case 'headlessSessions':
           var previousDamageAccountId = damageAccountSelect ? String(damageAccountSelect.value || '') : '';
+          var previousViewerAccountId = viewerAccountSelect ? String(viewerAccountSelect.value || '') : '';
           headlessSessions.clear();
           (msg.sessions || []).forEach(function (session) {
             headlessSessions.set(String(session.accountId), session);
@@ -6200,6 +6211,9 @@
           refreshHeadlessAccountSelectors();
           if (activeTab === 'damage' && damageAccountSelect && String(damageAccountSelect.value || '') !== previousDamageAccountId) {
             selectDamageAccount();
+          }
+          if (activeTab === 'viewer' && viewerAccountSelect && String(viewerAccountSelect.value || '') !== previousViewerAccountId) {
+            selectViewerAccount();
           }
           break;
         case 'clientList': {
@@ -6262,6 +6276,12 @@
             groups: msg.groups || []
           };
           if (activeTab === 'tilemap') renderTilemapTree(lastTilesData);
+          break;
+        case 'viewerData':
+          if (!viewerAccountSelect || !viewerAccountSelect.value || String(msg.accountId || '') === String(viewerAccountSelect.value)) {
+            lastViewerData = msg;
+            if (activeTab === 'viewer') renderViewer();
+          }
           break;
         case 'gameWikiCatalog':
           handleGameWikiCatalog(msg);
@@ -9641,6 +9661,157 @@
     treeEl.appendChild(root);
   }
 
+  function viewerTileColor(type) {
+    var n = Number(type) || 0;
+    var hue = Math.abs(Math.imul(n ^ (n >>> 4), 47)) % 360;
+    return 'hsl(' + hue + ' 28% 28%)';
+  }
+
+  function getViewerTileImage(tile) {
+    if (!tile || !tile.textureFile || Number(tile.textureIndex) < 0) return null;
+    var key = String(tile.textureFile) + ':' + String(tile.textureIndex);
+    var cached = viewerTileImages.get(key);
+    if (cached) return cached;
+    var img = new Image();
+    var entry = { img: img, loaded: false, failed: false };
+    viewerTileImages.set(key, entry);
+    img.onload = function () {
+      entry.loaded = true;
+      if (activeTab === 'viewer') renderViewer();
+    };
+    img.onerror = function () {
+      entry.failed = true;
+      setTimeout(function () {
+        if (viewerTileImages.get(key) === entry) viewerTileImages.delete(key);
+        if (activeTab === 'viewer') renderViewer();
+      }, 3000);
+    };
+    img.src = '/api/wiki-texture-file?file=' + encodeURIComponent(String(tile.textureFile)) + '&index=' + encodeURIComponent(String(tile.textureIndex));
+    return entry;
+  }
+
+  function getViewerPlayerImage(classType) {
+    var key = String(Number(classType) || 0);
+    var cached = viewerPlayerImages.get(key);
+    if (cached) return cached;
+    var img = new Image();
+    var entry = { img: img, loaded: false };
+    viewerPlayerImages.set(key, entry);
+    img.onload = function () {
+      entry.loaded = true;
+      if (activeTab === 'viewer') renderViewer();
+    };
+    img.src = renderClassSprite(Number(classType) || 0);
+    return entry;
+  }
+
+  function renderViewer() {
+    if (!viewerCanvas || !viewerStage || !viewerEmpty) return;
+    var data = lastViewerData;
+    var player = data && data.player;
+    if (!data || !player) {
+      viewerCanvas.style.display = 'none';
+      viewerEmpty.style.display = 'flex';
+      if (viewerStatus) viewerStatus.textContent = 'Waiting for a connected account';
+      return;
+    }
+
+    viewerCanvas.style.display = 'block';
+    viewerEmpty.style.display = 'none';
+    var rect = viewerStage.getBoundingClientRect();
+    var width = Math.max(320, Math.floor(rect.width));
+    var height = Math.max(320, Math.floor(rect.height));
+    var dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    var pixelWidth = Math.floor(width * dpr);
+    var pixelHeight = Math.floor(height * dpr);
+    if (viewerCanvas.width !== pixelWidth || viewerCanvas.height !== pixelHeight) {
+      viewerCanvas.width = pixelWidth;
+      viewerCanvas.height = pixelHeight;
+    }
+    var ctx = viewerCanvas.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.fillStyle = '#080d12';
+    ctx.fillRect(0, 0, width, height);
+
+    var radius = Math.max(6, Number(data.radius) || 15);
+    var count = radius * 2 + 1;
+    var tileSize = Math.max(8, Math.min(36, Math.floor(Math.min(width / count, height / count))));
+    var fieldWidth = count * tileSize;
+    var fieldHeight = count * tileSize;
+    var originX = Math.floor((width - fieldWidth) / 2);
+    var originY = Math.floor((height - fieldHeight) / 2);
+    var centerX = Number(data.center && data.center.x) || Number(player.x) || 0;
+    var centerY = Number(data.center && data.center.y) || Number(player.y) || 0;
+    var minX = Math.floor(centerX) - radius;
+    var minY = Math.floor(centerY) - radius;
+
+    (Array.isArray(data.tiles) ? data.tiles : []).forEach(function (tile) {
+      var tx = Number(tile.x) - minX;
+      var ty = Number(tile.y) - minY;
+      if (tx < 0 || ty < 0 || tx >= count || ty >= count) return;
+      var x = originX + tx * tileSize;
+      var y = originY + ty * tileSize;
+      ctx.fillStyle = viewerTileColor(tile.type);
+      ctx.fillRect(x, y, tileSize, tileSize);
+      var image = getViewerTileImage(tile);
+      if (image && image.loaded && !image.failed) ctx.drawImage(image.img, x, y, tileSize, tileSize);
+    });
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.055)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (var i = 0; i <= count; i += 1) {
+      var gx = originX + i * tileSize + 0.5;
+      var gy = originY + i * tileSize + 0.5;
+      ctx.moveTo(gx, originY);
+      ctx.lineTo(gx, originY + fieldHeight);
+      ctx.moveTo(originX, gy);
+      ctx.lineTo(originX + fieldWidth, gy);
+    }
+    ctx.stroke();
+
+    var px = originX + (Number(player.x) - minX) * tileSize;
+    var py = originY + (Number(player.y) - minY) * tileSize;
+    var spriteSize = Math.max(18, Math.round(tileSize * 1.35));
+    var playerImage = getViewerPlayerImage(player.classType);
+    ctx.fillStyle = 'rgba(34,197,94,0.24)';
+    ctx.beginPath();
+    ctx.arc(px, py, Math.max(8, tileSize * 0.55), 0, Math.PI * 2);
+    ctx.fill();
+    if (playerImage.loaded) {
+      ctx.drawImage(playerImage.img, Math.round(px - spriteSize / 2), Math.round(py - spriteSize / 2), spriteSize, spriteSize);
+    }
+
+    var hp = Math.max(0, Number(player.hp) || 0);
+    var maxHp = Math.max(0, Number(player.maxHp) || 0);
+    var barWidth = Math.max(30, tileSize * 2.2);
+    var barY = py + spriteSize / 2 + 5;
+    ctx.fillStyle = 'rgba(0,0,0,0.78)';
+    ctx.fillRect(px - barWidth / 2, barY, barWidth, 5);
+    ctx.fillStyle = '#35c66b';
+    ctx.fillRect(px - barWidth / 2, barY, barWidth * (maxHp > 0 ? Math.min(1, hp / maxHp) : 0), 5);
+    ctx.font = '600 12px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillStyle = '#f4f7fb';
+    ctx.shadowColor = '#000';
+    ctx.shadowBlur = 3;
+    ctx.fillText(String(player.name || 'Player'), px, py - spriteSize / 2 - 4);
+    ctx.shadowBlur = 0;
+
+    if (viewerStatus) {
+      viewerStatus.textContent = String(data.mapName || 'Unknown') + '  |  ' + Number(player.x).toFixed(2) + ', ' + Number(player.y).toFixed(2) + '  |  ' + (data.tiles || []).length + ' tiles';
+    }
+  }
+
+  if (viewerStage && typeof ResizeObserver === 'function') {
+    new ResizeObserver(function () {
+      if (activeTab === 'viewer') renderViewer();
+    }).observe(viewerStage);
+  }
+
   // One-time expand/collapse delegation on the tree container
   (function () {
     const treeEl = document.getElementById('objects-tree');
@@ -10364,6 +10535,7 @@
 
     const prevTab = activeTab;
     if (prevTab === 'nearby') stopNearbyPolling();
+    if (prevTab === 'viewer') stopViewerPolling();
     if (prevTab === 'damage' && tabName !== 'damage') closeDamagePlayerModal();
     closeSettingsPopout();
 
@@ -10409,6 +10581,7 @@
       renderTilemapTree(lastTilesData);
       requestTilemap();
     }
+    if (tabName === 'viewer') startViewerPolling();
     if (tabName === 'game-wiki') {
       openGameWikiTab();
     }
@@ -11633,6 +11806,35 @@
     }
   }
 
+  function requestViewer() {
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({
+        type: 'requestViewer',
+        accountId: viewerAccountSelect && viewerAccountSelect.value || null,
+        radius: 15,
+      }));
+    }
+  }
+
+  function stopViewerPolling() {
+    if (viewerPollTimer) {
+      clearInterval(viewerPollTimer);
+      viewerPollTimer = null;
+    }
+  }
+
+  function startViewerPolling() {
+    stopViewerPolling();
+    requestViewer();
+    viewerPollTimer = setInterval(requestViewer, 750);
+  }
+
+  function selectViewerAccount() {
+    lastViewerData = null;
+    renderViewer();
+    requestViewer();
+  }
+
   function selectDamageAccount() {
     damageHistory = [];
     damageLive = null;
@@ -11651,6 +11853,8 @@
   if (tilemapAccountSelect) tilemapAccountSelect.addEventListener('change', requestTilemap);
   if (damageRefreshBtn) damageRefreshBtn.addEventListener('click', requestHeadlessDamage);
   if (damageAccountSelect) damageAccountSelect.addEventListener('change', selectDamageAccount);
+  if (viewerRefreshBtn) viewerRefreshBtn.addEventListener('click', requestViewer);
+  if (viewerAccountSelect) viewerAccountSelect.addEventListener('change', selectViewerAccount);
 
   if (objectsAutoRefreshCheck) {
     objectsAutoRefreshCheck.addEventListener('change', function () {
@@ -11689,6 +11893,7 @@
     }
     if (objectsAutoRefreshCheck) objectsAutoRefreshCheck.checked = false;
     if (tilemapAutoRefreshCheck) tilemapAutoRefreshCheck.checked = false;
+    stopViewerPolling();
   }
 
   // ─── Game Wiki tab (objects.xml / tiles.xml catalog) ─────
