@@ -60,6 +60,7 @@ import { Logger } from './util/Logger.js';
 import { ensureRotmgMetadataXml } from './util/ensureRotmgMetadataXml.js';
 import { ensureSdkDeployed } from './util/ensureSdkDeployed.js';
 import { HeadlessFleet } from './headless/HeadlessFleet.js';
+import { HiveMcpServer } from './mcp/HiveMcpServer.js';
 import { AntiTamper } from './security/AntiTamper.js';
 import { getBakedPacketDefinitions, getBakedServers, getBakedStatTypes } from './config/BakedData.js';
 import {
@@ -79,6 +80,10 @@ const DATA_CONFIG_PATH = resolve(ROOT, 'data', 'config.json');
 
 async function main() {
   const devMode = process.argv.includes('--dev') || true;
+  const requestedDevPort = Number(process.env.HIVE_DEV_PORT ?? 4440);
+  const devDashboardPort = Number.isInteger(requestedDevPort) && requestedDevPort > 0 && requestedDevPort <= 65535
+    ? requestedDevPort
+    : 4440;
 
   Logger.log('Main', 'Hive Manager starting...');
 
@@ -158,6 +163,7 @@ async function main() {
 
   let devServer: DevServer | undefined;
   let scriptHost: ScriptHost | undefined;
+  let mcpServer: HiveMcpServer | undefined;
   if (devMode) {
     const inspector = new PacketInspector();
     inspector.attach(proxy);
@@ -186,6 +192,7 @@ async function main() {
       scriptSession,
       emitScriptLog: (scriptId, line, level) => {
         devServer?.broadcastScriptLog(scriptId, line, level);
+        mcpServer?.captureScriptLog(scriptId, line, level, getScriptExecutionSession()?.accountId);
       },
       emitScriptPanelMessage: (msg) => {
         devServer?.broadcastScriptPanelMessage(msg);
@@ -195,7 +202,21 @@ async function main() {
     scriptHost.setScriptsStateNotify(() => {
       devServer?.broadcastScriptsState();
     });
-    devServer.start(4440);
+    devServer.start(devDashboardPort);
+
+    const requestedMcpPort = Number(process.env.HIVE_MCP_PORT ?? 4451);
+    mcpServer = new HiveMcpServer({
+      fleet: headlessFleet,
+      gameData,
+      scriptHost,
+      preferredPort: requestedMcpPort,
+      configDir: process.env.HIVE_MCP_CONFIG_DIR,
+    });
+    try {
+      await mcpServer.start();
+    } catch (error) {
+      Logger.error('MCP', 'Failed to start the built-in Hive MCP server', error as Error);
+    }
   }
 
   const [metadataResult] = await Promise.all([
@@ -218,7 +239,7 @@ async function main() {
   // MITM TCP listener (:2050) removed — headless clients will feed the SDK directly.
   Logger.log('Main', 'MITM game proxy disabled (no :2050 listener)');
   if (devMode) {
-    Logger.log('Main', 'Dev dashboard: http://localhost:4440');
+    Logger.log('Main', `Dev dashboard: http://localhost:${devDashboardPort}`);
   }
 
   AntiTamper.startMonitoring(30_000);
@@ -227,6 +248,7 @@ async function main() {
     Logger.log('Main', 'Shutting down...');
     AntiTamper.stopMonitoring();
     scriptHost?.stopAll();
+    await mcpServer?.stop();
     process.exit(0);
   };
 

@@ -64,3 +64,40 @@ test('socket reconnects do not reset the gameplay clock', async () => {
   assert.ok(beforeReconnect >= 4_900);
   assert.ok(afterReconnect >= beforeReconnect);
 });
+
+test('emergency nexus forces a fresh connection to the Nexus game id', () => {
+  const client = new Client({
+    alias: 'emergency-nexus-test',
+    accessToken: '',
+    clientToken: '',
+    charId: 1,
+    needsNewChar: false,
+    host: 'realm.example',
+  });
+  const state = client as unknown as {
+    socket: { destroyed: boolean };
+    host: string;
+    nexusHost: string;
+    gameId: number;
+    key: number[];
+    keyTime: number;
+    connect(): void;
+  };
+  let connects = 0;
+  Object.assign(state, {
+    socket: { destroyed: false },
+    host: 'realm.example',
+    nexusHost: 'nexus.example',
+    gameId: 1234,
+    key: [1, 2, 3],
+    keyTime: 99,
+    connect: () => { connects++; },
+  });
+
+  assert.equal(client.nexusImmediately('test autonexus'), true);
+  assert.equal(connects, 1);
+  assert.equal(state.host, 'nexus.example');
+  assert.equal(state.gameId, -2);
+  assert.deepEqual(state.key, []);
+  assert.equal(state.keyTime, -1);
+});

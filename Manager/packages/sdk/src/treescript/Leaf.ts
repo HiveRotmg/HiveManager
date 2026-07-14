@@ -12,7 +12,7 @@
  *     return Hive.self.getHP() / Hive.self.getMaxHP() < 0.3;
  *   }
  *   onLoop() {
- *     Hive.self.escape();
+ *     Hive.walking.nexus();
  *     return 1000; // sleep 1s before the tree re-evaluates
  *   }
  * }
@@ -77,7 +77,7 @@ export abstract class Leaf {
      * Leaf.of({
      *   name: 'Escape',
      *   isValid: () => Hive.self.getHPPercent() < 0.3,
-     *   onLoop: () => { Hive.self.escape(); return 2000; },
+     *   onLoop: () => { Hive.walking.nexus(); return 2000; },
      * });
      * ```
      */

@@ -279,7 +279,7 @@
   text-decoration: none;
 }
 
-/* Directory-tree blocks shown in the Getting Started / Unity Basics guides.
+/* Directory-tree blocks shown in the Getting Started / SDK Concepts guides.
    Styled like .api-docs-lifecycle so folder layouts read as structured
    diagrams rather than raw comments. */
 .api-docs-folder-tree {
@@ -310,7 +310,7 @@
   font-style: italic;
 }
 
-/* Cross-tab link from Getting Started / Unity Basics into the API Reference.
+/* Cross-tab link from Getting Started / SDK Concepts into the API Reference.
    Keep it looking like the surrounding <code> text but hint at its clickability. */
 .api-ref-link {
   color: inherit;

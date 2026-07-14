@@ -18,7 +18,7 @@
  *       Panel.slider({ id: 'hpPct', label: 'Heal at HP %', value: 40, min: 0, max: 100,
  *         onChange: (v) => settings.healHpPct = v }),
  *       Panel.button({ id: 'nexus', label: 'Nexus now', variant: 'danger',
- *         onClick: () => Hive.self.nexus() }),
+ *         onClick: () => Hive.walking.nexus() }),
  *       Panel.log({ id: 'feed', maxLines: 200 }),
  *     ],
  *   });
@@ -31,13 +31,57 @@
 
 export type PanelButtonVariant = 'primary' | 'secondary' | 'danger';
 export type PanelHeadingLevel = 1 | 2 | 3;
+export type PanelTone = 'neutral' | 'info' | 'success' | 'warning' | 'danger';
+export type PanelDensity = 'compact' | 'comfortable';
+export type PanelConfigScope = 'script' | 'account';
+export type PanelAlign = 'start' | 'center' | 'end' | 'stretch';
+export type PanelJustify = 'start' | 'center' | 'end' | 'between';
+export type PanelTextAlign = 'left' | 'center' | 'right';
+export type PanelFontWeight = 400 | 500 | 600 | 700;
 
-interface BaseWidget {
+export interface PanelTheme {
+  /** Primary interactive color used by focus rings, toggles, tabs, and progress. */
+  accentColor?: string;
+  textColor?: string;
+  mutedTextColor?: string;
+  backgroundColor?: string;
+  /** Optional surface color for groups, metrics, and search results. */
+  surfaceColor?: string;
+  borderColor?: string;
+}
+
+export interface PanelWidgetStyle {
+  /** Overrides text within this widget, including its children. */
+  textColor?: string;
+  mutedTextColor?: string;
+  backgroundColor?: string;
+  /** Recolors an existing border; it does not add a border. */
+  borderColor?: string;
+  /** Overrides interactive accents within this widget. */
+  accentColor?: string;
+  fontSize?: number;
+  fontWeight?: PanelFontWeight;
+  textAlign?: PanelTextAlign;
+  padding?: number;
+  borderRadius?: number;
+  opacity?: number;
+}
+
+export interface BaseWidget {
   /** Required for widgets that emit events or are targeted by `setValue`/`setText`/etc. */
   id?: string;
   visible?: boolean;
   enabled?: boolean;
   tooltip?: string;
+  /** Fixed preferred width in pixels, or a responsive sizing mode. */
+  width?: number | 'auto' | 'full';
+  minWidth?: number;
+  /** Allow this widget to consume remaining room when placed in a row. */
+  grow?: boolean;
+  /** Include or exclude this widget from saved panel configurations. */
+  persist?: boolean;
+  /** Optional visual overrides. Invalid CSS colors are ignored by the dashboard. */
+  style?: PanelWidgetStyle;
 }
 
 export interface GroupWidget extends BaseWidget {
@@ -45,6 +89,7 @@ export interface GroupWidget extends BaseWidget {
   title?: string;
   collapsible?: boolean;
   collapsed?: boolean;
+  appearance?: 'subtle' | 'outlined' | 'plain';
   children: PanelWidget[];
 }
 
@@ -52,6 +97,9 @@ export interface RowWidget extends BaseWidget {
   type: 'row';
   /** Optional column gap in pixels. */
   gap?: number;
+  wrap?: boolean;
+  align?: PanelAlign;
+  justify?: PanelJustify;
   children: PanelWidget[];
 }
 
@@ -186,6 +234,58 @@ export interface SelectWidget extends BaseWidget {
   onChange?: (value: string) => void;
 }
 
+export interface SearchOption {
+  value: string;
+  label: string;
+  description?: string;
+  keywords?: string[];
+}
+
+export interface SearchWidget extends BaseWidget {
+  type: 'search';
+  id: string;
+  label?: string;
+  value?: string;
+  placeholder?: string;
+  options?: SearchOption[];
+  /** Maximum visible matches. Defaults to 8. */
+  maxResults?: number;
+  /** Delay before onChange runs. Defaults to 120ms. */
+  debounceMs?: number;
+  emptyText?: string;
+  showResultCount?: boolean;
+  clearable?: boolean;
+  onChange?: (query: string) => void;
+  onSubmit?: (query: string) => void;
+  onSelect?: (value: string) => void;
+}
+
+export interface BadgeWidget extends BaseWidget {
+  type: 'badge';
+  text: string;
+  tone?: PanelTone;
+}
+
+export interface MetricWidget extends BaseWidget {
+  type: 'metric';
+  label: string;
+  value: string | number;
+  detail?: string;
+  tone?: PanelTone;
+}
+
+export interface DividerWidget extends BaseWidget {
+  type: 'divider';
+  label?: string;
+}
+
+export interface CodeWidget extends BaseWidget {
+  type: 'code';
+  code: string;
+  label?: string;
+  wrap?: boolean;
+}
+
 export interface ProgressWidget extends BaseWidget {
   type: 'progress';
   id: string;
@@ -224,6 +324,11 @@ export type PanelWidget =
   | NumberWidget
   | TextWidget
   | SelectWidget
+  | SearchWidget
+  | BadgeWidget
+  | MetricWidget
+  | DividerWidget
+  | CodeWidget
   | ProgressWidget
   | LogWidget
   | SpacerWidget;
@@ -235,9 +340,33 @@ export interface PanelDefinition {
   subtitle?: string;
   /** Preferred popout width in pixels. Clamped by the dashboard. */
   width?: number;
+  /** Preferred maximum popout height in pixels. Clamped by the dashboard. */
+  maxHeight?: number;
+  /** Compact reduces panel spacing without changing the visual language. */
+  density?: PanelDensity;
+  /** Optional panel-wide color theme. Unspecified values retain Hive defaults. */
+  theme?: PanelTheme;
   /** If true, the popout opens automatically when the script starts. */
   autoOpen?: boolean;
+  /** Optional persistence for input widget values. No settings are stored when omitted. */
+  persistence?: PanelPersistenceOptions;
   widgets: PanelWidget[];
+}
+
+export interface PanelPersistenceOptions {
+  /** Save input changes automatically. Defaults to false. */
+  autoSave?: boolean;
+  /** Restore `config` when the panel is defined. Defaults to true. */
+  autoLoad?: boolean;
+  /** Initial named configuration. Defaults to `default`. */
+  config?: string;
+  /** Share settings across accounts or keep one set per account. Defaults to `script`. */
+  scope?: PanelConfigScope;
+}
+
+export interface PanelConfigInfo {
+  name: string;
+  updatedAt: number;
 }
 
 /** Handle returned by `Hive.ui.panel.define(...)`. */
@@ -250,6 +379,12 @@ export interface PanelHandle {
   update(def: Partial<PanelDefinition>): void;
   /** Update a single widget's `value`. */
   setValue(id: string, value: unknown): void;
+  /** Read the bridge's latest cached value for a widget. */
+  getValue<T = unknown>(id: string): T | undefined;
+  /** Replace options for a search or select widget. */
+  setOptions(id: string, options: SearchOption[] | { label: string; value: string }[]): void;
+  /** Merge serializable properties into one widget without replacing the panel tree. */
+  setProps(id: string, props: Record<string, unknown>): void;
   /** Update a single image widget's `src`. */
   setImage(id: string, src: string): void;
   /** Update a single widget's text (`label` / `text` / `caption`). */
@@ -262,6 +397,16 @@ export interface PanelHandle {
   appendLog(id: string, line: string): void;
   /** Replace the lines on a `log` widget. */
   setLog(id: string, lines: string[]): void;
+  /** Save the current input widget values as a named configuration. */
+  saveConfig(name?: string): PanelConfigInfo;
+  /** Load a named configuration and run the affected widgets' change handlers. */
+  loadConfig(name?: string): boolean;
+  /** Delete a named configuration. */
+  deleteConfig(name: string): boolean;
+  /** List configurations available to this script and persistence scope. */
+  listConfigs(): PanelConfigInfo[];
+  /** Configuration currently targeted by autosave. */
+  readonly activeConfig: string;
   /** True while the popout is rendered for this script. */
   readonly isOpen: boolean;
 }
@@ -309,6 +454,21 @@ export const Panel = {
   },
   select(opts: Omit<SelectWidget, 'type'>): SelectWidget {
     return { type: 'select', ...opts };
+  },
+  search(opts: Omit<SearchWidget, 'type'>): SearchWidget {
+    return { type: 'search', ...opts };
+  },
+  badge(text: string, opts: Omit<BadgeWidget, 'type' | 'text'> = {}): BadgeWidget {
+    return { type: 'badge', text, ...opts };
+  },
+  metric(opts: Omit<MetricWidget, 'type'>): MetricWidget {
+    return { type: 'metric', ...opts };
+  },
+  divider(label?: string): DividerWidget {
+    return { type: 'divider', ...(label ? { label } : {}) };
+  },
+  code(code: string, opts: Omit<CodeWidget, 'type' | 'code'> = {}): CodeWidget {
+    return { type: 'code', code, ...opts };
   },
   progress(opts: Omit<ProgressWidget, 'type'>): ProgressWidget {
     return { type: 'progress', ...opts };

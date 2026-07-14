@@ -8,7 +8,7 @@ export interface MapTile {
     isBlocking: boolean;
     /** True if a world entity currently occupies this tile cell. */
     isOccupied: boolean;
-    /** Reserved; currently false unless the host defines safe zones. */
+    /** True when known ground is walkable, non-damaging, and has no condition effect. */
     isSafe: boolean;
     /** `<Speed>` multiplier from tiles.xml; `1` if default. */
     speedMultiplier: number;

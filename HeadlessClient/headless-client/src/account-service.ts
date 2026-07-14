@@ -1,4 +1,4 @@
-import { Classes } from 'realmlib';
+import { Classes, parseCharacterListXml } from 'realmlib';
 import axios from 'axios';
 import { createHash } from 'crypto';
 import { ENDPOINTS, UNITY_HEADERS } from './constants';
@@ -64,6 +64,16 @@ export interface CharInfo {
   needsNewChar: boolean;
   /** Seasonal flag from the character-list XML, when present. */
   seasonal?: boolean;
+  /** Player class object type from `<ObjectType>`. */
+  classType?: number;
+  /** Current character level. */
+  level?: number;
+  /** Total character experience. */
+  exp?: number;
+  /** Alive fame earned by this character. */
+  currentFame?: number;
+  /** Equipped and carried item object types, with `-1` for empty slots. */
+  equipment?: number[];
 }
 
 export interface ServerInfo {
@@ -311,10 +321,15 @@ export async function getCharAndServers(
   }
 
   const nextCharId = Number(/<Chars nextCharId="(\d+)"/.exec(xml)?.[1] ?? '1');
-  const characters = [...xml.matchAll(/<Char id="(\d+)">([\s\S]*?)<\/Char>/g)].map((match) => ({
-    charId: Number(match[1]),
+  const characters = parseCharacterListXml(xml).map((entry) => ({
+    charId: entry.id,
     needsNewChar: false,
-    seasonal: /<Seasonal>\s*true\s*<\/Seasonal>/i.test(match[2]),
+    seasonal: entry.seasonal,
+    classType: entry.classType,
+    level: entry.level,
+    exp: entry.exp,
+    currentFame: entry.currentFame,
+    equipment: [...entry.equipment],
   }));
   const maxNumChars = Number(/maxNumChars="(\d+)"/.exec(xml)?.[1] ?? String(characters.length));
   const char: CharInfo =

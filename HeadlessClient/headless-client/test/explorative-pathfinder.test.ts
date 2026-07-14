@@ -37,6 +37,20 @@ test('unknown cells are traversable at the same cost as observed walkable cells'
   assert.equal(hasTile(pathfinder, 5, 5), false);
 });
 
+test('refreshing an unchanged target preserves the active plan', () => {
+  const pathfinder = createPathfinder(30, 30);
+  const target = { x: 20.5, y: 20.5 };
+  pathfinder.setTarget(target, 0.2);
+
+  const initial = pathfinder.next({ x: 0.5, y: 0.5 });
+  assert.equal(initial.replanned, true);
+  assert.equal(pathfinder.setTarget(target, 0.2), true);
+
+  const refreshed = pathfinder.next({ x: 0.5, y: 0.5 });
+  assert.equal(refreshed.replanned, false);
+  assert.deepEqual(refreshed.waypoint, initial.waypoint);
+});
+
 test('known blocking ground is routed around without diagonal corner cutting', () => {
   const pathfinder = createPathfinder(8, 8);
   const blocked = new Set<string>();
@@ -163,6 +177,67 @@ test('Client keeps direct walking separate from pathfinding walking', () => {
 
   client.stopMoving();
   assert.equal(client.isMoving(), false);
+});
+
+test('Client pathfinding refresh preserves the active waypoint stall state', () => {
+  const client = new Client({
+    alias: 'pathfinding-refresh-test',
+    accessToken: '',
+    clientToken: '',
+    charId: 1,
+    needsNewChar: false,
+    host: 'localhost',
+  });
+  const state = client as unknown as {
+    movement: MovementController;
+    pathfinder: ExplorativePathfinder;
+  };
+  const target = { x: 8.5, y: 2.5 };
+  const waypoint = { x: 4.5, y: 2.5 };
+
+  assert.equal(client.pathfindingWalkTo(target), true);
+  state.movement.setTarget(waypoint, 0.25);
+  assert.equal(client.pathfindingWalkTo(target), true);
+  assert.deepEqual(state.movement.getTarget(), { ...waypoint, threshold: 0.25 });
+
+  assert.equal(client.pathfindingWalkTo({ x: 8.75, y: 2.5 }), true);
+  assert.deepEqual(state.movement.getTarget(), { ...waypoint, threshold: 0.25 });
+});
+
+test('repeated script refreshes still allow an authoritative stall to replan', () => {
+  const client = new Client({
+    alias: 'pathfinding-stall-test',
+    accessToken: '',
+    clientToken: '',
+    charId: 1,
+    needsNewChar: false,
+    host: 'localhost',
+  });
+  const state = client as unknown as {
+    pos: { x: number; y: number };
+    serverPos: { x: number; y: number };
+    player: { spd: number; spdBoost: number; condition: number; condition2: number };
+    pathfinder: ExplorativePathfinder;
+    updateTarget(dt: number, integrateFromLocal?: boolean, now?: number): void;
+  };
+  const start = { x: 0.5, y: 1.5 };
+  const target = { x: 8.5, y: 1.5 };
+  Object.assign(state, {
+    pos: { ...start },
+    serverPos: { ...start },
+    player: { spd: 75, spdBoost: 0, condition: 0, condition2: 0 },
+  });
+  state.pathfinder.setMapBounds(10, 3);
+
+  for (let refresh = 0; refresh < 5; refresh++) {
+    assert.equal(client.pathfindingWalkTo(target, 0.2), true);
+    state.updateTarget(1000, false, 1000 + refresh * 1000);
+  }
+
+  const replanned = state.pathfinder.next(start);
+  assert.equal(replanned.replanned, true);
+  assert.equal(hasTile(state.pathfinder, 1, 1), false);
+  assert.ok(state.pathfinder.getPlannedTiles().some((tile) => tile.y !== 1));
 });
 
 function createPathfinder(width: number, height: number): ExplorativePathfinder {

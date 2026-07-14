@@ -368,37 +368,18 @@
         </div>
         <div id="home-multibox-placeholder" class="home-layout home-multibox-placeholder hidden" aria-hidden="true"></div>
         <div id="home-multi-layout" class="home-layout home-multi-layout hidden">
-          <section class="home-card home-multi-hero home-card--span-2">
-            <div class="home-multi-hero-head">
-              <div class="home-multi-hero-title-wrap">
+          <section class="home-card home-launch-groups-card home-card--span-2">
+            <div class="home-launch-groups-head">
+              <div>
                 <div class="home-card-title">Multi Account Command</div>
-                <h2 class="home-multi-hero-title">Operations Overview</h2>
+                <h2 class="home-launch-groups-title" data-i18n="mac.launch.groupsTitle">Launch groups</h2>
               </div>
-              <div class="home-multi-hero-status">
-                <span id="home-multi-live-status" class="home-status-pill">No live sessions</span>
-                <span id="home-multi-primary-server" class="home-multi-primary-server">Primary server: --</span>
-              </div>
+              <button type="button" id="home-launch-group-add" class="setting-btn home-launch-group-add-btn">
+                <span aria-hidden="true">+</span>
+                <span data-i18n="mac.launch.groupsModal.newTitle">New launch group</span>
+              </button>
             </div>
-
-            <div class="home-multi-metric-grid">
-              <div class="home-multi-metric-card">
-                <span class="home-multi-metric-label">Live Sessions</span>
-                <span id="home-multi-connected-count" class="home-multi-metric-value">0</span>
-              </div>
-              <div class="home-multi-metric-card">
-                <span class="home-multi-metric-label">Total Fame Gained</span>
-                <span id="home-multi-fame-gained" class="home-multi-metric-value">0</span>
-              </div>
-              <div class="home-multi-metric-card">
-                <span class="home-multi-metric-label">Average FPM</span>
-                <span id="home-multi-average-fpm" class="home-multi-metric-value">0</span>
-              </div>
-              <div class="home-multi-metric-card">
-                <span class="home-multi-metric-label">Runtime</span>
-                <span id="home-multi-runtime" class="home-multi-metric-value">0s</span>
-              </div>
-            </div>
-
+            <div id="home-launch-groups-list" class="home-launch-groups-list" role="list"></div>
           </section>
 
           <div id="home-multi-connected-cards-grid" class="home-multi-connected-cards-grid home-card--span-3"></div>
@@ -984,11 +965,30 @@
           <label class="nearby-toolbar-label" for="viewer-account-select">Account</label>
           <select id="viewer-account-select" class="nearby-select"></select>
           <button id="viewer-refresh-btn" class="setting-btn" type="button">Refresh</button>
+          <select id="viewer-script-select" class="nearby-select viewer-script-select" disabled aria-label="Script">
+            <option value="">No scripts loaded</option>
+          </select>
+          <button id="viewer-script-run" class="setting-btn" type="button" disabled>Run</button>
+          <button id="viewer-script-stop" class="setting-btn setting-btn-secondary" type="button" disabled>Stop</button>
+          <label class="objects-auto-refresh">
+            <input type="checkbox" id="viewer-auto-refresh" class="objects-auto-refresh-input" />
+            <span class="objects-auto-refresh-switch" aria-hidden="true"></span>
+            <span class="objects-auto-refresh-label">Auto-refresh</span>
+          </label>
+          <button id="viewer-open-script-gui-btn" class="setting-btn setting-btn-secondary" type="button" disabled>Open Script GUI</button>
           <div id="viewer-status" class="viewer-status">Waiting for a connected account</div>
         </div>
-        <div id="viewer-stage" class="viewer-stage">
-          <canvas id="viewer-canvas" aria-label="Read-only nearby game view"></canvas>
-          <div id="viewer-empty" class="empty-state viewer-empty">Connect an account to view nearby tiles.</div>
+        <div class="viewer-workspace">
+          <div id="viewer-stage" class="viewer-stage">
+            <canvas id="viewer-canvas" aria-label="Read-only nearby game view"></canvas>
+            <div id="viewer-hover-tile-highlight" class="viewer-tile-highlight viewer-tile-highlight-hover" aria-hidden="true" hidden></div>
+            <div id="viewer-hover-object-highlight" class="viewer-object-highlight viewer-object-highlight-hover" aria-hidden="true" hidden></div>
+            <div id="viewer-hover-tooltip" class="viewer-hover-tooltip" role="tooltip" hidden></div>
+            <div id="viewer-empty" class="empty-state viewer-empty">Connect an account to view nearby tiles.</div>
+          </div>
+          <aside id="viewer-account-panel" class="viewer-account-panel" aria-live="polite">
+            <div class="viewer-account-empty">Select a connected account to view its character.</div>
+          </aside>
         </div>
       </div>
 
@@ -1296,23 +1296,40 @@
       <div id="mac-launch-group-modal-heading" class="accounts-modal-title" data-i18n="mac.launch.groupsModal.newTitle">New launch group</div>
       <label class="mac-launch-group-field-label" for="mac-launch-group-name-input" data-i18n="mac.launch.groupsModal.name">Group name</label>
       <input type="text" id="mac-launch-group-name-input" class="mac-launch-group-name-input" maxlength="64" autocomplete="off" />
-      <div class="mac-launch-group-field-label" data-i18n="mac.launch.groupsModal.accounts">Accounts in group</div>
-      <div id="mac-launch-group-accounts-scroll" class="mac-launch-group-accounts-scroll"></div>
-      <div class="mac-launch-group-field-label" data-i18n="mac.launch.groupsModal.layoutRef">Virtual desktop (pixels)</div>
-      <div class="mac-launch-group-layout-ref-row">
-        <label class="mac-launch-group-ref-label"><span data-i18n="mac.launch.groupsLayoutW">W</span>
-          <input type="number" id="mac-launch-group-ref-w" class="mac-launch-group-ref-num" min="800" max="7680" step="1" value="1920" />
+      <div class="mac-launch-group-field-heading">
+        <div class="mac-launch-group-field-label" data-i18n="mac.launch.groupsModal.accounts">Accounts in group</div>
+        <span id="mac-launch-group-selected-count" class="mac-launch-group-selected-count"></span>
+      </div>
+      <input type="search" id="mac-launch-group-account-search" class="mac-launch-group-account-search" autocomplete="off" placeholder="Search accounts by name or email" data-i18n-placeholder="mac.launch.groupsModal.searchPlaceholder" />
+      <div class="mac-launch-group-account-controls">
+        <label class="mac-launch-group-control-label">
+          <span data-i18n="mac.launch.groupsModal.filter">Filter</span>
+          <select id="mac-launch-group-account-filter" class="mac-launch-group-control-select">
+            <option value="all" data-i18n="mac.launch.groupsModal.filterAll">All accounts</option>
+            <option value="selected" data-i18n="mac.launch.groupsModal.filterSelected">Selected</option>
+            <option value="unselected" data-i18n="mac.launch.groupsModal.filterUnselected">Unselected</option>
+            <option value="connected" data-i18n="mac.launch.groupsModal.filterConnected">Connected</option>
+            <option value="disconnected" data-i18n="mac.launch.groupsModal.filterDisconnected">Disconnected</option>
+            <option value="ready" data-i18n="mac.launch.groupsModal.filterReady">Ready to launch</option>
+            <option value="missing" data-i18n="mac.launch.groupsModal.filterMissing">Missing credentials</option>
+          </select>
         </label>
-        <label class="mac-launch-group-ref-label"><span data-i18n="mac.launch.groupsLayoutH">H</span>
-          <input type="number" id="mac-launch-group-ref-h" class="mac-launch-group-ref-num" min="600" max="4320" step="1" value="1080" />
+        <label class="mac-launch-group-control-label">
+          <span data-i18n="mac.launch.groupsModal.sort">Sort</span>
+          <select id="mac-launch-group-account-sort" class="mac-launch-group-control-select">
+            <option value="name_asc" data-i18n="mac.launch.groupsModal.sortNameAsc">Name A-Z</option>
+            <option value="name_desc" data-i18n="mac.launch.groupsModal.sortNameDesc">Name Z-A</option>
+            <option value="server" data-i18n="mac.launch.groupsModal.sortServer">Server</option>
+            <option value="status" data-i18n="mac.launch.groupsModal.sortStatus">Connection status</option>
+          </select>
         </label>
       </div>
-      <label class="mac-launch-group-no-overlap-row" for="mac-launch-group-no-overlap">
-        <input type="checkbox" id="mac-launch-group-no-overlap" />
-        <span data-i18n="mac.launch.groupsModal.noOverlap">Prevent overlapping tiles</span>
-      </label>
-      <p class="mac-launch-group-layout-hint" data-i18n="mac.launch.groupsModal.layoutHint">Drag and resize tiles like the Multibox tab. On Windows, Hive moves each game window after launch so positions match this layout.</p>
-      <div id="mac-launch-group-layout-stage" class="mac-launch-group-layout-stage" aria-label="Per-account launch positions"></div>
+      <div id="mac-launch-group-accounts-scroll" class="mac-launch-group-accounts-scroll"></div>
+      <div class="mac-launch-group-selection-actions">
+        <span id="mac-launch-group-visible-count" class="mac-launch-group-visible-count"></span>
+        <button type="button" id="mac-launch-group-select-visible" class="setting-btn setting-btn-secondary" data-i18n="mac.launch.groupsModal.selectVisible">Select visible</button>
+        <button type="button" id="mac-launch-group-clear-selection" class="setting-btn setting-btn-secondary" data-i18n="mac.launch.groupsModal.clearSelection">Clear selection</button>
+      </div>
       <div class="accounts-modal-actions mac-launch-group-modal-actions">
         <button type="button" id="mac-launch-group-delete-btn" class="setting-btn accounts-modal-danger-btn" style="display:none" data-i18n="mac.launch.groupsModal.delete">Delete group</button>
         <span class="mac-launch-group-modal-actions-spacer"></span>
@@ -1330,13 +1347,14 @@
         <button id="settings-close">&times;</button>
       </div>
       <div id="settings-body">
-        <div class="settings-tabs" id="settings-tabs">
-          <button type="button" class="settings-tab active" data-settings-tab="visual" data-i18n="settings.tab.visual">Visual</button>
-          <button type="button" class="settings-tab hidden" data-settings-tab="developer" id="settings-tab-developer" data-i18n="settings.tab.developer">Developer</button>
-          <button type="button" class="settings-tab hidden" data-settings-tab="admin" id="settings-tab-admin" data-i18n="settings.tab.admin">Admin</button>
+        <div class="settings-tabs" id="settings-tabs" role="tablist" aria-label="Settings categories">
+          <button type="button" class="settings-tab active" data-settings-tab="visual" id="settings-tab-visual" role="tab" aria-selected="true" aria-controls="settings-panel-visual" data-i18n="settings.tab.visual">Visual</button>
+          <button type="button" class="settings-tab" data-settings-tab="viewer" id="settings-tab-viewer" role="tab" aria-selected="false" aria-controls="settings-panel-viewer" tabindex="-1" data-i18n="settings.tab.viewer">Viewer</button>
+          <button type="button" class="settings-tab hidden" data-settings-tab="developer" id="settings-tab-developer" role="tab" aria-selected="false" aria-controls="settings-panel-developer" tabindex="-1" data-i18n="settings.tab.developer">Developer</button>
+          <button type="button" class="settings-tab hidden" data-settings-tab="admin" id="settings-tab-admin" role="tab" aria-selected="false" aria-controls="settings-panel-admin" tabindex="-1" data-i18n="settings.tab.admin">Admin</button>
         </div>
         <div class="settings-tab-panels">
-          <div class="settings-tab-panel active" data-settings-panel="visual">
+          <div class="settings-tab-panel active" data-settings-panel="visual" id="settings-panel-visual" role="tabpanel" aria-labelledby="settings-tab-visual">
             <div class="settings-group">
               <h3 data-i18n="settings.appearance">Appearance</h3>
               <div class="settings-row">
@@ -1404,7 +1422,76 @@
             </div>
           </div>
 
-          <div class="settings-tab-panel" data-settings-panel="developer">
+          <div class="settings-tab-panel" data-settings-panel="viewer" id="settings-panel-viewer" role="tabpanel" aria-labelledby="settings-tab-viewer" hidden>
+            <div class="settings-group">
+              <h3 data-i18n="settings.viewer.rendering">Rendering</h3>
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <span class="settings-label" data-i18n="settings.viewer.interpolation">Smooth movement</span>
+                  <span class="settings-desc" data-i18n="settings.viewer.interpolationDesc">Interpolate entities over the server-reported tick duration, matching the original client.</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="setting-viewer-interpolation" checked>
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <span class="settings-label" data-i18n="settings.viewer.frameRate">Animation frame rate</span>
+                  <span class="settings-desc" data-i18n="settings.viewer.frameRateDesc">Caps viewer-only animation work. This does not affect headless clients.</span>
+                </div>
+                <select id="setting-viewer-frame-rate" class="settings-select">
+                  <option value="30">30 FPS</option>
+                  <option value="60">60 FPS</option>
+                </select>
+              </div>
+            </div>
+            <div class="settings-group">
+              <h3 data-i18n="settings.viewer.layers">Loaded layers</h3>
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <span class="settings-label" data-i18n="settings.viewer.tiles">Tiles</span>
+                  <span class="settings-desc" data-i18n="settings.viewer.tilesDesc">Load and draw nearby ground tiles.</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="setting-viewer-tiles" checked>
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <span class="settings-label" data-i18n="settings.viewer.objects">Objects</span>
+                  <span class="settings-desc" data-i18n="settings.viewer.objectsDesc">Load and draw nearby players, enemies, portals, containers, and decorations.</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="setting-viewer-objects" checked>
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <span class="settings-label" data-i18n="settings.viewer.selfProjectiles">Self projectiles</span>
+                  <span class="settings-desc" data-i18n="settings.viewer.selfProjectilesDesc">Load projectiles fired by the selected account.</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="setting-viewer-self-projectiles" checked>
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <span class="settings-label" data-i18n="settings.viewer.otherProjectiles">Other projectiles</span>
+                  <span class="settings-desc" data-i18n="settings.viewer.otherProjectilesDesc">Load enemy and other-player projectiles. Extra visual tracking stops when disabled.</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="setting-viewer-other-projectiles" checked>
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-tab-panel" data-settings-panel="developer" id="settings-panel-developer" role="tabpanel" aria-labelledby="settings-tab-developer">
             <div class="settings-group">
               <h3>Developer Options</h3>
               <div class="settings-row">
@@ -1420,7 +1507,7 @@
             </div>
           </div>
 
-          <div class="settings-tab-panel" data-settings-panel="admin">
+          <div class="settings-tab-panel" data-settings-panel="admin" id="settings-panel-admin" role="tabpanel" aria-labelledby="settings-tab-admin">
             <div class="settings-group">
               <h3>Admin Tools</h3>
               <div class="settings-row">

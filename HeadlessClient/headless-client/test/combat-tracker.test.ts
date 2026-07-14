@@ -210,7 +210,13 @@ test('projectile noclip lets a local projectile pass cover and hit an enemy', ()
   tracker.setProjectileNoclip(true);
   tracker.clear();
   assert.equal(tracker.isProjectileNoclipEnabled(), true);
-  tracker.trackOwnShoot(ownShot(), 0);
+  const shot = new PlayerShootPacket();
+  shot.bulletId = 8;
+  shot.containerType = 500;
+  shot.startingPos.x = 0;
+  shot.startingPos.y = 1;
+  shot.angle = 0;
+  tracker.trackPlayerShoot(10, shot, 0, 0);
 
   tracker.update(600, world({
     entities: [

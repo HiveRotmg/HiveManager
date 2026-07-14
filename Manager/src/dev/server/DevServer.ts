@@ -412,6 +412,20 @@ interface HeadlessPacketRecord {
   payloadTruncated: boolean;
 }
 
+interface HeadlessViewerOptions {
+  includeTiles: boolean;
+  includeObjects: boolean;
+  includeSelfProjectiles: boolean;
+  includeOtherProjectiles: boolean;
+}
+
+interface HeadlessViewerSubscription extends HeadlessViewerOptions {
+  accountId: string;
+  radius: number;
+  mapName: string;
+  tileKeys: Set<string>;
+}
+
 /**
  * Dev dashboard HTTP + WebSocket server.
  * Serves the packet inspector UI on localhost:3000.
@@ -470,6 +484,9 @@ export class DevServer {
   private readonly headlessChatHistory = new Map<string, HeadlessChatMessage[]>();
   private readonly headlessPacketHistory = new Map<string, HeadlessPacketRecord[]>();
   private readonly headlessPacketSubscriptions = new Map<WebSocket, string>();
+  private readonly headlessViewerSubscriptions = new Map<WebSocket, HeadlessViewerSubscription>();
+  private readonly pendingHeadlessViewerTicks = new Set<string>();
+  private headlessViewerTickScheduled = false;
   private headlessPacketSequence = 0;
 
   private getConfigsDir(): string {
@@ -1389,10 +1406,14 @@ export class DevServer {
 
     // Packet Lab — captures undefined packets for live analysis
     this.lab = new PacketLab();
-    this.headlessFleet?.on('changed', (sessions) => this.broadcastHeadlessSessions(sessions));
+    this.headlessFleet?.on('changed', (sessions) => {
+      this.broadcastHeadlessSessions(sessions);
+      this.syncViewerOtherProjectileTracking();
+    });
     this.headlessFleet?.on('damage', (accountId, snapshot) => this.broadcastHeadlessDamage(accountId, snapshot));
     this.headlessFleet?.on('chat', (accountId, message) => this.broadcastHeadlessChat(accountId, message));
     this.headlessFleet?.on('packet', (accountId, traffic) => this.captureHeadlessPacket(accountId, traffic));
+    this.headlessFleet?.on('viewerTick', (accountId) => this.queueHeadlessViewerTick(accountId));
     this.inspector.subscribe((pkt) => {
       if (pkt.captureMode === 'full') this.lab.capture(pkt);
       this.observeTradePacket(pkt);
@@ -2876,51 +2897,170 @@ export class DevServer {
     };
   }
 
-  private getHeadlessViewerPayload(accountId: string | null | undefined, radius: number) {
+  private getHeadlessViewerPayload(
+    accountId: string | null | undefined,
+    radius: number,
+    options: HeadlessViewerOptions,
+    knownTileKeys?: Set<string>,
+  ) {
     const client = this.headlessFleet?.get(accountId);
     if (!client || !this.gameData) return null;
     const center = client.getPosition();
     const player = client.getPlayer();
     const playerDef = player ? this.gameData.getObject(Number(player.class)) : undefined;
     const r = Math.max(6, Math.min(24, Math.trunc(radius)));
-    const tiles = client.visibleTiles()
-      .filter((tile) => Math.abs(tile.x - center.x) <= r && Math.abs(tile.y - center.y) <= r)
-      .map((tile) => {
-        const texture = this.gameData?.getTileTexture(tile.type);
-        return {
-          x: tile.x,
-          y: tile.y,
-          type: tile.type,
-          name: this.gameData?.getTileName(tile.type) ?? `0x${tile.type.toString(16)}`,
-          textureFile: texture?.file ?? '',
-          textureIndex: texture?.index ?? -1,
-        };
-      });
-    const objects = client.visibleObjects()
-      .filter((object) => Math.abs(object.x - center.x) <= r && Math.abs(object.y - center.y) <= r)
-      .map((object) => {
-        const def = this.gameData?.getObject(object.type);
-        const category = this.gameData?.getObjectCategory(object.type) ?? 'Other';
-        return {
-          objectId: object.objectId,
-          type: object.type,
-          category,
-          name: object.player?.name || object.name || def?.displayId || def?.id || `0x${object.type.toString(16)}`,
-          x: object.x,
-          y: object.y,
-          textureFile: def?.textureFile ?? '',
-          textureIndex: def?.textureIndex ?? -1,
-          classType: category === 'Player' ? object.type : 0,
-          hp: Number(object.player?.hp ?? object.rawStats?.['1'] ?? 0),
-          maxHp: Number(object.player?.maxHP ?? object.rawStats?.['0'] ?? def?.maxHp ?? 0),
-        };
-      });
+    const tiles = options.includeTiles ? [] as Array<{
+      x: number;
+      y: number;
+      type: number;
+      name: string;
+      textureFile: string;
+      textureIndex: number;
+    }> : undefined;
+    if (tiles) {
+      if (knownTileKeys) {
+        const retentionRadius = r + 3;
+        for (const key of knownTileKeys) {
+          const separator = key.indexOf(',');
+          const x = Number(key.slice(0, separator));
+          const y = Number(key.slice(separator + 1));
+          if (Math.abs(x - center.x) > retentionRadius || Math.abs(y - center.y) > retentionRadius) {
+            knownTileKeys.delete(key);
+          }
+        }
+      }
+      const minX = Math.ceil(center.x - r);
+      const maxX = Math.floor(center.x + r);
+      const minY = Math.ceil(center.y - r);
+      const maxY = Math.floor(center.y + r);
+      for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+          const key = `${x},${y}`;
+          if (knownTileKeys?.has(key)) continue;
+          const tile = client.getTile(x, y);
+          if (!tile) continue;
+          knownTileKeys?.add(key);
+          const texture = this.gameData.getTileTexture(tile.type);
+          tiles.push({
+            x: tile.x,
+            y: tile.y,
+            type: tile.type,
+            name: this.gameData.getTileName(tile.type) ?? `0x${tile.type.toString(16)}`,
+            textureFile: texture?.file ?? '',
+            textureIndex: texture?.index ?? -1,
+          });
+        }
+      }
+    }
+    const objects = options.includeObjects
+      ? client.visibleObjects()
+        .filter((object) => Math.abs(object.x - center.x) <= r && Math.abs(object.y - center.y) <= r)
+        .map((object) => {
+          const def = this.gameData?.getObject(object.type);
+          const category = def?.isLoot
+            ? 'Container'
+            : this.gameData?.getObjectCategory(object.type) ?? 'Other';
+          const liveTextureType = Number(object.player?.texture ?? 0);
+          const visualDef = category === 'Player' && liveTextureType > 0
+            ? this.gameData?.getObject(liveTextureType) ?? def
+            : def;
+          const contents = category === 'Container'
+            ? client.getWorldContainerSlots(object.objectId)
+              .filter((slot) => slot.slotId >= 0 && slot.slotId < 8 && slot.objectType > 0)
+              .map((slot) => {
+                const itemDef = this.gameData?.getObject(slot.objectType);
+                return {
+                  slotIndex: slot.slotId,
+                  objectType: slot.objectType,
+                  name: itemDef?.displayId || itemDef?.id || `0x${slot.objectType.toString(16)}`,
+                  tier: itemDef?.tierStr ?? '',
+                  textureFile: itemDef?.textureFile ?? '',
+                  textureIndex: itemDef?.textureIndex ?? -1,
+                };
+              })
+            : [];
+          return {
+            objectId: object.objectId,
+            type: object.type,
+            category,
+            name: object.player?.name || object.name || def?.displayId || def?.id || `0x${object.type.toString(16)}`,
+            x: object.x,
+            y: object.y,
+            textureFile: visualDef?.textureFile ?? '',
+            textureIndex: visualDef?.textureIndex ?? -1,
+            classType: category === 'Player' ? object.type : 0,
+            hp: Number(object.player?.hp ?? object.rawStats?.['1'] ?? 0),
+            maxHp: Number(object.player?.maxHP ?? object.rawStats?.['0'] ?? def?.maxHp ?? 0),
+            size: Number(object.player?.size ?? object.rawStats?.['2'] ?? def?.size ?? 100),
+            isLoot: def?.isLoot === true,
+            contents,
+          };
+        })
+      : undefined;
+    const projectiles = options.includeSelfProjectiles || options.includeOtherProjectiles
+      ? client.getViewerProjectiles()
+        .filter((projectile) => projectile.side === 'own'
+          ? options.includeSelfProjectiles
+          : options.includeOtherProjectiles)
+        .map((projectile) => {
+          const projectileDef = this.gameData?.getProjectile(projectile.containerType, projectile.bulletType);
+          const containerDef = this.gameData?.getObject(projectile.containerType);
+          const visualDef = projectileDef?.objectId
+            ? this.gameData?.getObjectById(projectileDef.objectId)
+            : undefined;
+          const explicitSize = Number(projectileDef?.visualSize ?? -1);
+          return {
+            key: `${projectile.ownerId}:${projectile.bulletId}`,
+            side: projectile.side,
+            bulletId: projectile.bulletId,
+            bulletType: projectile.bulletType,
+            ownerId: projectile.ownerId,
+            containerType: projectile.containerType,
+            startX: projectile.startX,
+            startY: projectile.startY,
+            angle: projectile.angle,
+            startTime: projectile.startTime,
+            speed: projectile.definition.speed,
+            lifetimeMs: projectile.definition.lifetimeMs,
+            trajectoryLifetimeMs: projectile.definition.trajectoryLifetimeMs ?? projectile.definition.lifetimeMs,
+            amplitude: projectile.definition.amplitude,
+            frequency: projectile.definition.frequency,
+            magnitude: projectile.definition.magnitude,
+            wavy: projectile.definition.wavy,
+            parametric: projectile.definition.parametric,
+            boomerang: projectile.definition.boomerang,
+            acceleration: projectile.definition.acceleration,
+            accelerationDelay: projectile.definition.accelerationDelay,
+            speedClamp: projectile.definition.speedClamp,
+            textureFile: visualDef?.textureFile ?? '',
+            textureIndex: visualDef?.textureIndex ?? -1,
+            size: Number.isFinite(explicitSize) && explicitSize >= 0
+              ? explicitSize
+              : containerDef?.size ?? 100,
+            angleCorrection: visualDef?.angleCorrection ?? 0,
+            rotation: visualDef?.rotation ?? 0,
+            faceDir: projectileDef?.faceDir ?? false,
+            noRotation: projectileDef?.noRotation ?? false,
+          };
+        })
+      : undefined;
+    const playerTextureType = Number(player?.texture ?? 0);
+    const playerVisualDef = playerTextureType > 0
+      ? this.gameData.getObject(playerTextureType) ?? playerDef
+      : playerDef;
+    const tick = client.getTickInfo();
     return {
       mapName: client.getMapName(),
       center,
       radius: r,
       tiles,
       objects,
+      projectiles,
+      tickId: tick.tickId,
+      tickTimeMs: tick.tickTimeMs,
+      msSinceTick: tick.msSinceTick,
+      gameTime: client.getGameTime(),
+      sampledAt: Date.now(),
       player: {
         objectId: client.getObjectId(),
         name: player?.name || client.alias,
@@ -2928,12 +3068,80 @@ export class DevServer {
         skin: Number(player?.texture ?? 0),
         hp: Number(player?.hp ?? 0),
         maxHp: Number(player?.maxHP ?? 0),
+        size: Number(player?.size ?? playerDef?.size ?? 100),
         x: center.x,
         y: center.y,
-        textureFile: playerDef?.textureFile ?? '',
-        textureIndex: playerDef?.textureIndex ?? -1,
+        textureFile: playerVisualDef?.textureFile ?? '',
+        textureIndex: playerVisualDef?.textureIndex ?? -1,
       },
     };
+  }
+
+  private sendHeadlessViewer(
+    ws: WebSocket,
+    subscription: HeadlessViewerSubscription,
+    forceTileReset = false,
+  ): void {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    if (ws.bufferedAmount > 1_000_000) return;
+    const client = this.headlessFleet?.get(subscription.accountId);
+    const nextMapName = client?.getMapName() ?? '';
+    const tilesReset = forceTileReset || subscription.mapName !== nextMapName;
+    if (tilesReset || !subscription.includeTiles) subscription.tileKeys.clear();
+    const payload = this.getHeadlessViewerPayload(
+      subscription.accountId,
+      subscription.radius,
+      subscription,
+      subscription.includeTiles ? subscription.tileKeys : undefined,
+    );
+    subscription.mapName = payload?.mapName ?? nextMapName;
+    ws.send(JSON.stringify({
+      type: 'viewerData',
+      accountId: subscription.accountId,
+      tilesReset,
+      ...(payload ?? {
+        mapName: '',
+        center: { x: 0, y: 0 },
+        radius: subscription.radius,
+        tiles: subscription.includeTiles ? [] : undefined,
+        objects: subscription.includeObjects ? [] : undefined,
+        projectiles: subscription.includeSelfProjectiles || subscription.includeOtherProjectiles ? [] : undefined,
+        player: null,
+        tickId: -1,
+        tickTimeMs: 200,
+        msSinceTick: -1,
+        gameTime: 0,
+        sampledAt: Date.now(),
+      }),
+    }));
+  }
+
+  private broadcastHeadlessViewerTick(accountId: string): void {
+    for (const [ws, subscription] of this.headlessViewerSubscriptions) {
+      if (subscription.accountId === accountId) this.sendHeadlessViewer(ws, subscription);
+    }
+  }
+
+  private queueHeadlessViewerTick(accountId: string): void {
+    this.pendingHeadlessViewerTicks.add(accountId);
+    if (this.headlessViewerTickScheduled) return;
+    this.headlessViewerTickScheduled = true;
+    setImmediate(() => {
+      this.headlessViewerTickScheduled = false;
+      const accountIds = Array.from(this.pendingHeadlessViewerTicks);
+      this.pendingHeadlessViewerTicks.clear();
+      for (const pendingAccountId of accountIds) this.broadcastHeadlessViewerTick(pendingAccountId);
+    });
+  }
+
+  private syncViewerOtherProjectileTracking(): void {
+    const enabledAccounts = new Set<string>();
+    for (const subscription of this.headlessViewerSubscriptions.values()) {
+      if (subscription.includeOtherProjectiles) enabledAccounts.add(subscription.accountId);
+    }
+    for (const session of this.headlessFleet?.list() ?? []) {
+      this.headlessFleet?.get(session.accountId)?.setViewerOtherProjectilesEnabled(enabledAccounts.has(session.accountId));
+    }
   }
 
   private getHeadlessNearbyPlayers(accountId?: string | null) {
@@ -4784,7 +4992,7 @@ export class DevServer {
           const widgetId = String((msg as { widgetId?: unknown }).widgetId ?? '').trim();
           const rawKind = String((msg as { kind?: unknown }).kind ?? '').trim();
           if (!scriptId || !this.scriptHost) return;
-          if (rawKind !== 'click' && rawKind !== 'change' && rawKind !== 'closed-by-user') return;
+          if (rawKind !== 'click' && rawKind !== 'change' && rawKind !== 'submit' && rawKind !== 'select' && rawKind !== 'closed-by-user') return;
           if (rawKind !== 'closed-by-user' && !widgetId) return;
           const evt: ScriptPanelInboundEvent = {
             scriptId,
@@ -4942,15 +5150,36 @@ export class DevServer {
             ...result,
           }));
         } else if (msg.type === 'requestViewer') {
-          const accountId = String(msg.accountId || '') || null;
+          const requestedAccountId = String(msg.accountId || '').trim();
+          const accountId = requestedAccountId && this.headlessFleet?.get(requestedAccountId)
+            ? requestedAccountId
+            : this.headlessFleet?.list()[0]?.accountId ?? '';
           const radiusRaw = Number(msg.radius ?? 15);
-          const radius = Number.isFinite(radiusRaw) ? radiusRaw : 15;
-          const payload = this.getHeadlessViewerPayload(accountId, radius);
-          ws.send(JSON.stringify({
-            type: 'viewerData',
-            accountId: accountId || this.headlessFleet?.list()[0]?.accountId || '',
-            ...(payload ?? { mapName: '', center: { x: 0, y: 0 }, radius: 15, tiles: [], objects: [], player: null }),
-          }));
+          const radius = Math.max(6, Math.min(24, Math.trunc(Number.isFinite(radiusRaw) ? radiusRaw : 15)));
+          const previous = this.headlessViewerSubscriptions.get(ws);
+          const subscription: HeadlessViewerSubscription = {
+            accountId,
+            radius,
+            includeTiles: msg.includeTiles !== false,
+            includeObjects: msg.includeObjects !== false,
+            includeSelfProjectiles: msg.includeSelfProjectiles !== false,
+            includeOtherProjectiles: msg.includeOtherProjectiles !== false,
+            mapName: previous?.accountId === accountId ? previous.mapName : '',
+            tileKeys: previous?.accountId === accountId ? previous.tileKeys : new Set<string>(),
+          };
+          const resetTiles = previous?.accountId !== accountId
+            || previous?.radius !== radius
+            || previous?.includeTiles !== subscription.includeTiles;
+          if (msg.subscribe === true && accountId) {
+            this.headlessViewerSubscriptions.set(ws, subscription);
+          } else {
+            this.headlessViewerSubscriptions.delete(ws);
+          }
+          this.syncViewerOtherProjectileTracking();
+          this.sendHeadlessViewer(ws, subscription, resetTiles);
+        } else if (msg.type === 'unsubscribeViewer') {
+          this.headlessViewerSubscriptions.delete(ws);
+          this.syncViewerOtherProjectileTracking();
         } else if (msg.type === 'disconnectHeadlessClient') {
           const accountId = String(msg.accountId || '').trim();
           const ok = !!accountId && !!this.headlessFleet?.disconnect(accountId, 'dashboard disconnect');
@@ -5105,14 +5334,17 @@ export class DevServer {
             ws.send(JSON.stringify({
               type: 'vaultData',
               capturedAt: vaultState.capturedAt,
+              updatedAt: vaultState.updatedAt,
+              revision: vaultState.revision,
+              active: vaultState.active,
               map: this.currentClient?.playerData?.mapName ?? null,
               gameId: this.currentClient?.state?.gameId ?? null,
               lastVaultUpdate: vaultState.lastVaultUpdate,
-              vault:          { objectId: vaultState.vault.objectId,          contents: vaultState.vault.contents },
-              material:       { objectId: vaultState.material.objectId,       contents: vaultState.material.contents },
-              gift:           { objectId: vaultState.gift.objectId,           contents: vaultState.gift.contents },
-              potion:         { objectId: vaultState.potion.objectId,         contents: vaultState.potion.contents },
-              seasonalSpoils: { objectId: vaultState.seasonalSpoils.objectId, contents: vaultState.seasonalSpoils.contents },
+              vault:          { objectId: vaultState.vault.objectId,          contents: vaultState.vault.contents,          chunks: vaultState.vault.chunks },
+              material:       { objectId: vaultState.material.objectId,       contents: vaultState.material.contents,       chunks: vaultState.material.chunks },
+              gift:           { objectId: vaultState.gift.objectId,           contents: vaultState.gift.contents,           chunks: vaultState.gift.chunks },
+              potion:         { objectId: vaultState.potion.objectId,         contents: vaultState.potion.contents,         chunks: vaultState.potion.chunks },
+              seasonalSpoils: { objectId: vaultState.seasonalSpoils.objectId, contents: vaultState.seasonalSpoils.contents, chunks: vaultState.seasonalSpoils.chunks },
               vaultUpgradeCost:    vaultState.vaultUpgradeCost,
               materialUpgradeCost: vaultState.materialUpgradeCost,
               seasonalSpoilUpgradeCost: vaultState.seasonalSpoilUpgradeCost,
@@ -5365,6 +5597,8 @@ export class DevServer {
     ws.on('close', () => {
       unsub();
       this.headlessPacketSubscriptions.delete(ws);
+      this.headlessViewerSubscriptions.delete(ws);
+      this.syncViewerOtherProjectileTracking();
       Logger.log('DevServer', 'Dashboard client disconnected');
     });
   }

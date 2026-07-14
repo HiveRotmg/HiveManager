@@ -3,7 +3,7 @@ export interface AutoNexusConfig {
   thresholdPercent: number;
 }
 
-export type AutoNexusTriggerSource = 'server' | 'projectile' | 'aoe' | 'ground';
+export type AutoNexusTriggerSource = 'server' | 'projectile' | 'aoe' | 'ground' | 'condition';
 
 export interface AutoNexusState extends AutoNexusConfig {
   serverHp: number | null;
@@ -37,7 +37,7 @@ export interface AutoNexusDamageOptions {
   cursed?: boolean;
 }
 
-const DEFAULT_THRESHOLD_PERCENT = 5;
+const DEFAULT_THRESHOLD_PERCENT = 20;
 
 const AUTO_NEXUS_SAFE_MAPS = new Set([
   'nexus',
@@ -85,7 +85,7 @@ export function calculateAutoNexusDamage(options: AutoNexusDamageOptions): numbe
  * negative deltas never erase locally predicted damage.
  */
 export class AutoNexusMonitor {
-  private enabled = false;
+  private enabled = true;
   private thresholdPercent = DEFAULT_THRESHOLD_PERCENT;
   private serverHp: number | null = null;
   private predictedHp: number | null = null;

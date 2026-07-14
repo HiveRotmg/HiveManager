@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { PicPacket, Reader, ShowEffectPacket, Writer } from '../src';
+import { PicPacket, Reader, ShowEffectPacket, VaultContentPacket, Writer } from '../src';
 
 /** Serializes a packet, then reads it back into a fresh instance. */
 function roundTrip<T extends { read(r: Reader): void; write(w: Writer): void }>(
@@ -71,5 +71,53 @@ describe('read/write round-trip fixes', () => {
     fx.size = 75;
     const back = roundTrip(fx, new ShowEffectPacket());
     expect(back.size).to.equal(75);
+  });
+
+  it('VaultContentPacket round-trips every current storage section and metadata field', () => {
+    const vault = new VaultContentPacket();
+    vault.lastVaultPacket = true;
+    vault.chestObjectId = 1001;
+    vault.materialObjectId = 1002;
+    vault.giftObjectId = 1003;
+    vault.potionObjectId = 1004;
+    vault.spoilsObjectId = 1005;
+    vault.vaultContents = [101, -1];
+    vault.materialContents = [201, -1];
+    vault.giftContents = [301, -1];
+    vault.potionContents = [401, -1];
+    vault.spoilsContents = [501, -1];
+    vault.vaultUpgradeCost = 10;
+    vault.materialUpgradeCost = 20;
+    vault.seasonalSpoilUpgradeCost = 30;
+    vault.potionUpgradeCost = 40;
+    vault.currentPotionMax = 64;
+    vault.nextPotionMax = 80;
+    vault.vaultChestEnchants = 'vault-enchants';
+    vault.giftChestEnchants = 'gift-enchants';
+    vault.spoilsChestEnchants = 'spoils-enchants';
+
+    const back = roundTrip(vault, new VaultContentPacket());
+    expect(back).to.deep.include({
+      lastVaultPacket: true,
+      chestObjectId: 1001,
+      materialObjectId: 1002,
+      giftObjectId: 1003,
+      potionObjectId: 1004,
+      spoilsObjectId: 1005,
+      vaultUpgradeCost: 10,
+      materialUpgradeCost: 20,
+      seasonalSpoilUpgradeCost: 30,
+      potionUpgradeCost: 40,
+      currentPotionMax: 64,
+      nextPotionMax: 80,
+      vaultChestEnchants: 'vault-enchants',
+      giftChestEnchants: 'gift-enchants',
+      spoilsChestEnchants: 'spoils-enchants',
+    });
+    expect(back.vaultContents).to.deep.equal([101, -1]);
+    expect(back.materialContents).to.deep.equal([201, -1]);
+    expect(back.giftContents).to.deep.equal([301, -1]);
+    expect(back.potionContents).to.deep.equal([401, -1]);
+    expect(back.spoilsContents).to.deep.equal([501, -1]);
   });
 });

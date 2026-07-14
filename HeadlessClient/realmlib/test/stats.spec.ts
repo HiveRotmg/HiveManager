@@ -81,6 +81,8 @@ describe('processStatData (current build ids)', () => {
       statData(StatType.SEASONAL_CHARACTER_STAT, 1),
       statData(StatType.ACCOUNT_LEVEL_STAT, 35),
       statData(StatType.ACCOUNT_LEVEL_EXP_STAT, 406026),
+      statData(StatType.POWER_LEVEL_STAT, 151),
+      statData(StatType.ENCHANTMENTS_STAT, 0, 'slot-zero,slot-one'),
     ]);
 
     expect(playerData.maxHP).to.equal(444);
@@ -96,6 +98,8 @@ describe('processStatData (current build ids)', () => {
     expect(playerData.seasonal).to.equal(true);
     expect(playerData.accountLevel).to.equal(35);
     expect(playerData.accountLevelExp).to.equal(406026);
+    expect(playerData.powerLevel).to.equal(151);
+    expect(playerData.enchantmentsRaw).to.equal('slot-zero,slot-one');
   });
 
   it('separates name decoration metadata from the visible name', () => {

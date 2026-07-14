@@ -10,7 +10,7 @@ import { Branch, BranchWalker } from './Branch';
  * const escape = leaf({
  *   name: 'Escape',
  *   isValid: () => Hive.self.getHPPercent() < 0.3,
- *   onLoop: () => { Hive.self.escape(); return 2000; },
+ *   onLoop: () => { Hive.walking.nexus(); return 2000; },
  * });
  * ```
  */

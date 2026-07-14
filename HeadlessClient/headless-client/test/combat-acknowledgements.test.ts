@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   AoeAckPacket,
   AoePacket,
+  AllyShootPacket,
   ChangeAllyShootPacket,
   ConditionEffectBits,
   ConditionEffectBits2,
@@ -14,6 +15,7 @@ import {
   ShootAckPacket,
 } from 'realmlib';
 import { Client } from '../src/client';
+import type { CombatProjectileDefinition } from '../src/combat-tracker';
 import { ClientEvent } from '../src/events';
 
 test('enemy and owned player shoots send a one-count SHOOTACK', () => {
@@ -41,6 +43,94 @@ test('another player SERVERPLAYERSHOOT is not acknowledged', () => {
 
   invoke(client, 'handleServerPlayerShoot', other);
 
+  assert.equal(sent.length, 0);
+});
+
+test('other-player viewer projectiles are render-only and clear when disabled', () => {
+  const definition: CombatProjectileDefinition = {
+    speed: 10000,
+    lifetimeMs: 1000,
+    multiHit: false,
+    passesCover: false,
+    amplitude: 0,
+    frequency: 1,
+    magnitude: 3,
+    wavy: false,
+    parametric: false,
+    boomerang: false,
+    acceleration: 0,
+    accelerationDelay: 0,
+    speedClamp: -1,
+  };
+  const client = new Client({
+    alias: 'viewer-test',
+    accessToken: '',
+    clientToken: '',
+    charId: 1,
+    needsNewChar: false,
+    host: '127.0.0.1',
+    combatData: {
+      getProjectile: () => definition,
+      getObject: () => undefined,
+    },
+  });
+  const sent: Packet[] = [];
+  Object.assign(client as unknown as Record<string, unknown>, {
+    io: { send: (packet: Packet) => sent.push(packet) },
+    objectId: 10,
+    time: () => 456,
+  });
+  const other = new ServerPlayerShootPacket();
+  other.ownerId = 99;
+  other.containerType = 1234;
+  other.bulletId = 7;
+  other.damage = 80;
+  other.startingPos.x = 3;
+  other.startingPos.y = 4;
+  other.angle = Math.PI / 2;
+  other.spellBomb = true;
+  other.bulletCount = 3;
+  other.bulletAngle = 0.2;
+
+  invoke(client, 'handleServerPlayerShoot', other);
+  assert.deepEqual(client.getViewerProjectiles(), []);
+
+  client.setViewerOtherProjectilesEnabled(true);
+  invoke(client, 'handleServerPlayerShoot', other);
+
+  assert.equal(sent.length, 0);
+  assert.deepEqual(client.getViewerProjectiles().map((projectile) => ({
+    side: projectile.side,
+    ownerId: projectile.ownerId,
+    bulletId: projectile.bulletId,
+    startX: projectile.startX,
+    startY: projectile.startY,
+    angle: projectile.angle,
+  })), [
+    { side: 'other', ownerId: 99, bulletId: 7, startX: 3, startY: 4, angle: Math.PI / 2 },
+    { side: 'other', ownerId: 99, bulletId: 8, startX: 3, startY: 4, angle: Math.PI / 2 + 0.2 },
+    { side: 'other', ownerId: 99, bulletId: 9, startX: 3, startY: 4, angle: Math.PI / 2 + 0.4 },
+  ]);
+
+  client.setViewerOtherProjectilesEnabled(false);
+  assert.deepEqual(client.getViewerProjectiles(), []);
+
+  const state = client as unknown as { objects: Map<number, { objectId: number; type: number; x: number; y: number }> };
+  state.objects.set(55, { objectId: 55, type: 0x0300, x: 8, y: 9 });
+  const ally = new AllyShootPacket();
+  ally.ownerId = 55;
+  ally.containerType = 1234;
+  ally.bulletId = 12;
+  ally.angle = 0.75;
+  client.setViewerOtherProjectilesEnabled(true);
+  invoke(client, 'handleAllyShoot', ally);
+  assert.deepEqual(client.getViewerProjectiles().map((projectile) => ({
+    ownerId: projectile.ownerId,
+    bulletId: projectile.bulletId,
+    startX: projectile.startX,
+    startY: projectile.startY,
+    angle: projectile.angle,
+  })), [{ ownerId: 55, bulletId: 12, startX: 8, startY: 9, angle: 0.75 }]);
   assert.equal(sent.length, 0);
 });
 

@@ -109,6 +109,16 @@ function enchantmentsForSlot(
   };
 }
 
+export function buildSlotEnchantments(
+  raw: string | undefined,
+  slotIndex: number,
+  deps: BridgeDeps,
+): LootItemEnchantments | null {
+  const parsed = parseEnchantments(raw);
+  const bySlot = new Map(parsed.map((entry) => [entry.slot, entry]));
+  return enchantmentsForSlot(bySlot, slotIndex, deps) ?? null;
+}
+
 export function buildContainerItems(
   stats: Record<string, number | string>,
   deps: BridgeDeps,

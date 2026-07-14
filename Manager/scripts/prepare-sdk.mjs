@@ -3,11 +3,10 @@
  *
  * Runs as part of `npm run build:sdk` after TypeScript compilation.
  * Replaces only `dist/index.js` with the bridge stub. All other compiled
- * modules stay in `dist/` so internal imports like
- * `@hive/sdk/dist/vault/VaultChest.js` keep working.
+ * modules stay in `dist/`; removed legacy outputs are pruned below.
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -22,7 +21,7 @@ const EXPORT_NAMES = [
   'chat', 'party', 'trade', 'events', 'inventory', 'guild', 'GuildRank', 'connection', 'character',
   'INVENTORY_MAIN_SLOT_COUNT', 'INVENTORY_BACKPACK_SLOT_COUNT', 'INVENTORY_TOTAL_SLOT_COUNT',
   'loot', 'discord', 'DiscordWebhook',
-  'Self', 'Pet', 'Walking', 'Combat', 'Players', 'Enemies', 'Inventory', 'Vault', 'World',
+  'Self', 'Pet', 'Walking', 'Combat', 'Players', 'Enemies', 'World',
   'Tiles', 'Objects', 'Projectiles',
   'Log', 'Settings', 'Timing', 'AutoNexus', 'Hive', 'Position', 'StatusEffect',
   'Panel', 'uiPanel',
@@ -50,8 +49,6 @@ const FALLBACK_MODULES = [
   './combat/Combat.js',
   './players/Players.js',
   './enemies/Enemies.js',
-  './inventory/Inventory.js',
-  './vault/Vault.js',
   './world/World.js',
   './world/tiles/Tiles.js',
   './world/objects/Objects.js',
@@ -96,7 +93,20 @@ function cleanDist() {
     console.error('[prepare-sdk] SDK dist not found - run `npm run build:sdk` first.');
     process.exit(1);
   }
-  console.log('[prepare-sdk] Keeping all .js files and subdirectories.');
+  const removedLegacyOutputs = [
+    'inventory/Inventory.js',
+    'vault',
+    'types/inventory/Inventory.d.ts',
+    'types/vault',
+    'types/items/VaultItem.js',
+    'types/types/items/VaultItem.d.ts',
+    'RealmEngine.js',
+    'types/RealmEngine.d.ts',
+  ];
+  for (const relativePath of removedLegacyOutputs) {
+    rmSync(join(SDK_DIST, relativePath), { recursive: true, force: true });
+  }
+  console.log('[prepare-sdk] Removed legacy SDK outputs.');
 }
 
 function writeStub() {

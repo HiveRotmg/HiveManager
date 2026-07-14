@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { InvResultPacket, InvSwapPacket, Packet, PlayerData, SlotObjectData, StatData, StatType } from 'realmlib';
+import {
+  InvResultPacket,
+  InvSwapPacket,
+  Packet,
+  PlayerData,
+  SlotObjectData,
+  StatData,
+  StatType,
+  VaultContentPacket,
+} from 'realmlib';
 import {
   Client,
   POTION_VAULT_OBJECT_TYPE,
@@ -20,16 +29,27 @@ interface MutableClientState {
   containerSlotItems: Map<number, Map<number, number>>;
   timers: { size: number };
   lastVaultContent?: {
+    capturedAt: string;
+    updatedAt: string;
+    revision: number;
+    active: boolean;
     lastVaultPacket: boolean;
     vaultUpgradeCost: number;
     materialUpgradeCost: number;
+    seasonalSpoilUpgradeCost: number;
     potionUpgradeCost: number;
     currentPotionMax: number;
     nextPotionMax: number;
+    vaultChestEnchants: string;
+    giftChestEnchants: string;
+    spoilsChestEnchants: string;
     at: string;
     sections: Array<{ key: string; label: string; objectId: number; contents: number[] }>;
   };
   capturePetObjectId(stats: StatData[]): void;
+  captureContainerSlots(objectId: number, stats: StatData[]): void;
+  clearMapState(): void;
+  handleVaultContent(packet: VaultContentPacket): void;
   handleInvResult(packet: InvResultPacket): void;
 }
 
@@ -172,6 +192,85 @@ test('withdrawals put the filled storage slot first and INVRESULT state enables 
   assert.deepEqual(slotTuple(sent[1]), [500, 5, 201, 9001, 0, -1]);
 });
 
+test('live vault snapshots cover every storage section and retain contents after map exit', () => {
+  const { client, state } = readyClient();
+
+  assert.equal(client.getContainerObjectId('vault'), 9001);
+  assert.equal(client.getContainerObjectId('materialVault'), 9003);
+  assert.equal(client.getContainerObjectId('giftChest'), 9004);
+  assert.equal(client.getContainerObjectId('potionVault'), 9002);
+  assert.equal(client.getContainerObjectId('spoilsChest'), 9005);
+  assertSlot(client.getContainerSlot('materialVault', 0), 9003, 0, 401);
+  assertSlot(client.getContainerSlot('giftChest', 0), 9004, 0, 501);
+  assertSlot(client.getContainerSlot('spoilsChest', 0), 9005, 0, 601);
+
+  const revision = client.getVaultContent()!.revision;
+  const itemStat = new StatData();
+  itemStat.statType = StatType.INVENTORY_0_STAT;
+  itemStat.statValue = 777;
+  const enchantmentStat = new StatData();
+  enchantmentStat.statType = StatType.ENCHANTMENTS_STAT;
+  enchantmentStat.stringStatValue = 'gift-enchants-live';
+  state.captureContainerSlots(9004, [itemStat, enchantmentStat]);
+  assert.equal(client.getVaultContent()!.revision, revision + 1);
+  assert.equal(client.getContainerSlot('giftChest', 0)?.objectType, 777);
+  assert.equal(client.getVaultContent()!.giftChestEnchants, 'gift-enchants-live');
+
+  state.clearMapState();
+  const snapshot = client.getVaultContent()!;
+  assert.equal(snapshot.active, false);
+  assert.equal(snapshot.sections.find((section) => section.key === 'gift')?.contents[0], 777);
+  assert.equal(client.getContainerObjectId('giftChest'), -1);
+  assertSlot(client.getContainerSlot('giftChest', 0), -1, 0, 777);
+});
+
+test('VAULT_CONTENT chunks flatten logically and swaps use the physical chest local slot', () => {
+  const { client, sent, state } = readyClient();
+  state.objects.set(9101, tracked(9101, VAULT_CHEST_OBJECT_TYPE));
+  state.objects.set(9102, tracked(9102, VAULT_CHEST_OBJECT_TYPE));
+
+  const first = new VaultContentPacket();
+  first.lastVaultPacket = false;
+  first.chestObjectId = 9101;
+  first.vaultContents = [701, -1];
+  first.vaultChestEnchants = 'first-chest-enchants';
+  state.handleVaultContent(first);
+  assert.equal(client.getVaultContent()?.lastVaultPacket, false);
+  assert.deepEqual(client.getVaultSlots().map((slot) => slot.objectType), [701, -1]);
+  assert.equal(client.swapContainerItems(
+    { container: 'vault', slotId: 0 },
+    { container: 'inventory', slotId: 5 },
+  ), false, 'storage swaps wait for the final baseline packet');
+  assert.equal(sent.length, 0);
+
+  const second = new VaultContentPacket();
+  second.lastVaultPacket = true;
+  second.chestObjectId = 9102;
+  second.vaultContents = [702, -1];
+  second.vaultChestEnchants = 'second-chest-enchants';
+  state.handleVaultContent(second);
+
+  const snapshot = client.getVaultContent()!;
+  assert.equal(snapshot.lastVaultPacket, true);
+  assert.deepEqual(
+    snapshot.sections.filter((section) => section.key === 'vault').map((section) => ({
+      objectId: section.objectId,
+      contents: section.contents,
+      enchantments: section.enchantments,
+    })),
+    [
+      { objectId: 9101, contents: [701, -1], enchantments: 'first-chest-enchants' },
+      { objectId: 9102, contents: [702, -1], enchantments: 'second-chest-enchants' },
+    ],
+  );
+  assertSlot(client.getContainerSlot('vault', 2), 9102, 0, 702);
+  assert.equal(client.swapContainerItems(
+    { container: 'vault', slotId: 2 },
+    { container: 'inventory', slotId: 5 },
+  ), true);
+  assert.deepEqual(slotTuple(sent[0]), [9102, 0, 702, 500, 5, -1]);
+});
+
 test('vault object types 1284 and 1859 resolve to live map-scoped object ids as a fallback', () => {
   const { client, sent, state } = readyClient();
   state.lastVaultContent = undefined;
@@ -305,17 +404,32 @@ function readyClient(): { client: Client; state: MutableClientState; sent: InvSw
   state.objects.set(7331, tracked(7331, 999));
   state.objects.set(9001, tracked(9001, VAULT_CHEST_OBJECT_TYPE));
   state.objects.set(9002, tracked(9002, POTION_VAULT_OBJECT_TYPE));
+  state.objects.set(9003, tracked(9003, 999));
+  state.objects.set(9004, tracked(9004, 999));
+  state.objects.set(9005, tracked(9005, 999));
+  const capturedAt = new Date(0).toISOString();
   state.lastVaultContent = {
+    capturedAt,
+    updatedAt: capturedAt,
+    revision: 1,
+    active: true,
     lastVaultPacket: true,
     vaultUpgradeCost: 0,
     materialUpgradeCost: 0,
+    seasonalSpoilUpgradeCost: 0,
     potionUpgradeCost: 0,
     currentPotionMax: 0,
     nextPotionMax: 0,
-    at: new Date(0).toISOString(),
+    vaultChestEnchants: '',
+    giftChestEnchants: '',
+    spoilsChestEnchants: '',
+    at: capturedAt,
     sections: [
       { key: 'vault', label: 'Vault', objectId: 9001, contents: [201, -1] },
+      { key: 'material', label: 'Materials', objectId: 9003, contents: [401, -1] },
+      { key: 'gift', label: 'Gift Chest', objectId: 9004, contents: [501, -1] },
       { key: 'potion', label: 'Potion Storage', objectId: 9002, contents: [301, -1] },
+      { key: 'spoils', label: 'Spoils Chest', objectId: 9005, contents: [601, -1] },
     ],
   };
   state.containerSlotItems.set(9001, new Map([[0, 201], [1, -1]]));

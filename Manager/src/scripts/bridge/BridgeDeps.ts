@@ -54,6 +54,8 @@ export interface BridgeDeps {
    * forwards via `ScriptHost.dispatchPanelEvent`.
    */
   emitScriptPanelMessage?: (msg: ScriptPanelOutboundMessage) => void;
+  /** Optional override for persistent script panel configurations. */
+  scriptPanelConfigDir?: string;
 }
 
 /** Outbound dashboard-bound messages produced by the panel bridge. */
@@ -65,6 +67,8 @@ export type ScriptPanelOutboundMessage =
 
 export type ScriptPanelPatch =
   | { op: 'value'; id: string; value: unknown }
+  | { op: 'options'; id: string; value: unknown[] }
+  | { op: 'props'; id: string; value: Record<string, unknown> }
   | { op: 'image'; id: string; value: string }
   | { op: 'text'; id: string; value: string }
   | { op: 'enabled'; id: string; value: boolean }
@@ -76,6 +80,6 @@ export type ScriptPanelPatch =
 export interface ScriptPanelInboundEvent {
   scriptId: string;
   widgetId: string;
-  kind: 'click' | 'change' | 'closed-by-user';
+  kind: 'click' | 'change' | 'submit' | 'select' | 'closed-by-user';
   value?: unknown;
 }

@@ -6,6 +6,7 @@ import {
   PlayerData,
   PlayerShootPacket,
   PlayerTextPacket,
+  TeleportPacket,
   UsePortalPacket,
   UseItemPacket,
 } from 'realmlib';
@@ -94,6 +95,17 @@ export class CommandSender {
     const use = new UsePortalPacket();
     use.objectId = objectId;
     this.send(use);
+  }
+
+  teleportTo(objectId: number): boolean {
+    const state = this.state();
+    if (!state.io || state.objectId === -1 || !Number.isInteger(objectId) || objectId <= 0) {
+      return false;
+    }
+    const packet = new TeleportPacket();
+    packet.objectId = objectId;
+    state.io.send(packet);
+    return true;
   }
 
   swapInventorySlots(fromSlotId: number, toSlotId: number): boolean {

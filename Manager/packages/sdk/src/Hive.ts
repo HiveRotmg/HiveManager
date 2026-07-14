@@ -4,7 +4,6 @@ import { Combat } from './combat/Combat';
 import { Players } from './players/Players';
 import { Enemies } from './enemies/Enemies';
 import { inventory } from './inventory';
-import { Vault } from './vault/Vault';
 import { World } from './world/World';
 import { Tiles } from './world/tiles/Tiles';
 import { Objects } from './world/objects/Objects';
@@ -30,8 +29,6 @@ export const Hive = {
     players: Players,
     enemies: Enemies,
     inventory,
-    /** @deprecated Use the vault storage and transfer methods on `Hive.inventory`. */
-    vault: Vault,
     connection,
     character,
     autoNexus: AutoNexus,

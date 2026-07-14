@@ -38,6 +38,8 @@ export interface PlayerData {
     accountLevel: number;
     /** Account-level XP / ALXPCurrent (stat 153). */
     accountLevelExp: number;
+    /** Party-finder power level (stat 124). */
+    powerLevel: number;
     /**
      * The current character fame of the player
      */
@@ -83,7 +85,7 @@ export interface PlayerData {
      */
     maxHP: number;
     /**
-     * The increase in max HP which has been added due to bonuses (e.g. equipping a ring)
+     * Combined gear and exaltation increase included in max HP.
      */
     maxHPBoost: number;
     /**
@@ -91,7 +93,7 @@ export interface PlayerData {
      */
     maxMP: number;
     /**
-     * The increase in max MP which has been added due to bonuses (e.g. equipping a ring)
+     * Combined gear and exaltation increase included in max MP.
      */
     maxMPBoost: number;
     /**
@@ -107,7 +109,7 @@ export interface PlayerData {
      */
     atk: number;
     /**
-     * The amount of attack which has been added due to bonuses (e.g. equipping armor)
+     * Combined gear and exaltation attack bonus included in `atk`.
      */
     atkBoost: number;
     /**
@@ -115,7 +117,7 @@ export interface PlayerData {
      */
     def: number;
     /**
-     * The amount of defense which has been added due to bonuses (e.g. equipping armor)
+     * Combined gear and exaltation defense bonus included in `def`.
      */
     defBoost: number;
     /**
@@ -123,7 +125,7 @@ export interface PlayerData {
      */
     spd: number;
     /**
-     * The amount of speed which has been added due to bonuses (e.g. equipping armor)
+     * Combined gear and exaltation speed bonus included in `spd`.
      */
     spdBoost: number;
     /**
@@ -131,7 +133,7 @@ export interface PlayerData {
      */
     dex: number;
     /**
-     * The amount of dexterity which has been added due to bonuses (e.g. equipping armor)
+     * Combined gear and exaltation dexterity bonus included in `dex`.
      */
     dexBoost: number;
     /**
@@ -139,7 +141,7 @@ export interface PlayerData {
      */
     wis: number;
     /**
-     * The amount of wisdom which has been added due to bonuses (e.g. equipping armor)
+     * Combined gear and exaltation wisdom bonus included in `wis`.
      */
     wisBoost: number;
     /**
@@ -147,7 +149,7 @@ export interface PlayerData {
      */
     vit: number;
     /**
-     * The amount of vitality which has been added due to bonuses (e.g. equipping armor)
+     * Combined gear and exaltation vitality bonus included in `vit`.
      */
     vitBoost: number;
     /**
@@ -178,6 +180,8 @@ export interface PlayerData {
      * Items are represented by their item id, or `-1` if the slot is empty
      */
     inventory: number[];
+    /** Raw stat 80 payload containing per-slot item enchantments. */
+    enchantmentsRaw?: string;
     /**
      * The server this entity is connected to.
      * @deprecated This is only guaranteed to be correct for players tracked by the player tracker

@@ -79,13 +79,20 @@ function sdkMatchesPackaged(packagedSdkDir: string, targetDir: string, packagedV
     join('dist', 'types', 'combat', 'Combat.d.ts'),
     join('dist', 'walking', 'Walking.js'),
     join('dist', 'types', 'walking', 'Walking.d.ts'),
+    join('dist', 'self', 'Self.js'),
+    join('dist', 'types', 'self', 'Self.d.ts'),
     join('dist', 'ui', 'Panel.js'),
     join('dist', 'types', 'ui', 'Panel.d.ts'),
+    join('dist', 'inventory.js'),
+    join('dist', 'types', 'inventory.d.ts'),
     join('src', 'events.ts'),
     join('src', 'types', 'events.ts'),
     join('src', 'combat', 'Combat.ts'),
+    join('src', 'self', 'Self.ts'),
     join('src', 'walking', 'Walking.ts'),
     join('src', 'ui', 'Panel.ts'),
+    join('src', 'inventory.ts'),
+    join('src', 'types', 'items', 'StorageItem.ts'),
   ];
 
   return sentinelFiles.every((file) => {

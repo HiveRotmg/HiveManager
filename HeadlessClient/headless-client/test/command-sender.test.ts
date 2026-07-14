@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ConditionEffectBits2, InvSwapPacket, Packet, PacketType, PlayerData, PlayerShootPacket, PlayerTextPacket, UseItemPacket, UsePortalPacket } from 'realmlib';
+import { ConditionEffectBits2, InvSwapPacket, Packet, PacketType, PlayerData, PlayerShootPacket, PlayerTextPacket, TeleportPacket, UseItemPacket, UsePortalPacket } from 'realmlib';
 import { CommandSender } from '../src/command-sender';
 
-test('CommandSender builds outgoing portal and chat packets', () => {
+test('CommandSender builds outgoing portal, teleport, and chat packets', () => {
   const sent: Packet[] = [];
   const commands = new CommandSender(() => ({
     io: { send: (packet: Packet) => sent.push(packet) },
@@ -19,6 +19,7 @@ test('CommandSender builds outgoing portal and chat packets', () => {
 
   commands.say('/tell test hello');
   commands.usePortal(456);
+  assert.equal(commands.teleportTo(789), true);
 
   assert.equal(sent[0].type, PacketType.PLAYERTEXT);
   assert.ok(sent[0] instanceof PlayerTextPacket);
@@ -26,6 +27,9 @@ test('CommandSender builds outgoing portal and chat packets', () => {
   assert.equal(sent[1].type, PacketType.USEPORTAL);
   assert.ok(sent[1] instanceof UsePortalPacket);
   assert.equal(sent[1].objectId, 456);
+  assert.equal(sent[2].type, PacketType.TELEPORT);
+  assert.ok(sent[2] instanceof TeleportPacket);
+  assert.equal(sent[2].objectId, 789);
 });
 
 test('CommandSender validates player state before inventory swaps and shooting', () => {

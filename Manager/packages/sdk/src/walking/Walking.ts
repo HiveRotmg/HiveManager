@@ -18,6 +18,38 @@ export interface AutoDodgeState {
     decision: string;
 }
 
+/**
+ * A Realm teleport-beacon destination. Canonical region names and common
+ * short aliases are suggested while future game destinations remain valid.
+ */
+export type TeleportBeaconDestination =
+    | 'shore'
+    | 'beach'
+    | 'forest'
+    | 'undead forest'
+    | 'undead'
+    | 'desert'
+    | 'plains'
+    | 'coral reefs'
+    | 'coral'
+    | 'dead church'
+    | 'church'
+    | 'haunted hallows'
+    | 'haunted'
+    | 'shipwreck cove'
+    | 'shipwreck'
+    | 'sprite forest'
+    | 'sprite'
+    | 'deep sea abyss'
+    | 'deepsea'
+    | 'floral escape'
+    | 'floral'
+    | 'sanguine forest'
+    | 'sanguine'
+    | 'runic tundra'
+    | 'runic'
+    | (string & {});
+
 export class Walking {
     /**
      * Walk directly toward a tile without pathfinding. Pass world **X** and **Y** as two separate numbers
@@ -39,7 +71,13 @@ export class Walking {
         throw new Error('Must be run inside Hive client');
     }
 
-    static walkToEnemy(enemy: Enemy): boolean {
+    /** Walk directly toward the nearest visible combat enemy. */
+    static walkToEnemy(): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Pathfind to within 1.3 tiles of the nearest visible combat enemy. */
+    static pathfindingWalkToEnemy(): boolean {
         throw new Error('Must be run inside Hive client');
     }
 
@@ -137,6 +175,12 @@ export class Walking {
         throw new Error('Must be run inside Hive client');
     }
 
+    /** Teleport to the nearest live teleport beacon matching a region name or alias. */
+    static teleportBeacon(destination: TeleportBeaconDestination): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Teleport to a currently tracked teleport beacon by runtime object ID. */
     static teleportToBeacon(objectId: number): boolean {
         throw new Error('Must be run inside Hive client');
     }

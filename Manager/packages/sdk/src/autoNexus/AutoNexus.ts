@@ -4,7 +4,7 @@ export interface AutoNexusOptions {
     thresholdPercent: number;
 }
 
-export type AutoNexusTriggerSource = 'server' | 'projectile' | 'aoe' | 'ground';
+export type AutoNexusTriggerSource = 'server' | 'projectile' | 'aoe' | 'ground' | 'condition';
 
 export interface AutoNexusState extends AutoNexusOptions {
     serverHp: number | null;
@@ -22,7 +22,8 @@ export interface AutoNexusState extends AutoNexusOptions {
  *
  * The runtime checks authoritative HP and locally predicted damage. When any
  * tracked HP value reaches the configured percentage, it drops the dangerous
- * map connection and immediately reconnects to Nexus.
+ * map connection and immediately reconnects to Nexus. It is enabled by default
+ * at 20%; scripts can adjust or disable it explicitly.
  */
 export class AutoNexus {
     /** Enables autonexus. Passing a percentage also updates the threshold. */

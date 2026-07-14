@@ -2,6 +2,7 @@ export { Client } from './client';
 export type {
   ClientEventMap,
   ClientDamageTakenEvent,
+  ClientPartyMember,
   ClientShotFiredEvent,
   ContainerSlotRef,
   ItemContainer,

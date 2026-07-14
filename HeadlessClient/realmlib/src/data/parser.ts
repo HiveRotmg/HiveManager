@@ -64,6 +64,9 @@ export function processStatData(stats: StatData[], currentData?: PlayerData): Pl
             case StatType.ACCOUNT_LEVEL_EXP_STAT:
                 playerData.accountLevelExp = stat.statValue;
                 continue;
+            case StatType.POWER_LEVEL_STAT:
+                playerData.powerLevel = stat.statValue;
+                continue;
             case StatType.CURR_FAME_STAT:
                 playerData.currentFame = stat.statValue;
                 continue;
@@ -141,6 +144,9 @@ export function processStatData(stats: StatData[], currentData?: PlayerData): Pl
                 continue;
             case StatType.HASBACKPACK_STAT:
                 playerData.hasBackpack = stat.statValue === 1;
+                continue;
+            case StatType.ENCHANTMENTS_STAT:
+                playerData.enchantmentsRaw = stat.stringStatValue;
                 continue;
             case StatType.NAME_CHOSEN_STAT:
                 playerData.nameChosen = stat.statValue !== 0;

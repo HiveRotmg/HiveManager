@@ -146,7 +146,21 @@
       'accountPopup.managePlan.title': 'Manage Plan', 'accountPopup.managePlan.desc': 'View or change your subscription',
       'accountPopup.signOut': 'Sign Out', 'accountPopup.notSignedIn': 'Not signed in',
       'accountPopup.nextDeduction': '· next deduction {date}', 'accountPopup.renews': '· renews {date}',
-      'settings.title': 'Settings', 'settings.tab.visual': 'Visual',
+      'settings.title': 'Settings', 'settings.tab.visual': 'Visual', 'settings.tab.viewer': 'Viewer',
+      'settings.viewer.rendering': 'Rendering',
+      'settings.viewer.interpolation': 'Smooth movement',
+      'settings.viewer.interpolationDesc': 'Interpolate entities over the server-reported tick duration, matching the original client.',
+      'settings.viewer.frameRate': 'Animation frame rate',
+      'settings.viewer.frameRateDesc': 'Caps viewer-only animation work. This does not affect headless clients.',
+      'settings.viewer.layers': 'Loaded layers',
+      'settings.viewer.tiles': 'Tiles',
+      'settings.viewer.tilesDesc': 'Load and draw nearby ground tiles.',
+      'settings.viewer.objects': 'Objects',
+      'settings.viewer.objectsDesc': 'Load and draw nearby players, enemies, portals, containers, and decorations.',
+      'settings.viewer.selfProjectiles': 'Self projectiles',
+      'settings.viewer.selfProjectilesDesc': 'Load projectiles fired by the selected account.',
+      'settings.viewer.otherProjectiles': 'Other projectiles',
+      'settings.viewer.otherProjectilesDesc': 'Load enemy and other-player projectiles. Extra visual tracking stops when disabled.',
       'settings.tab.developer': 'Developer',
       'settings.tab.plugins': 'Plugins',
       'comingSoon.title': 'Coming soon',
@@ -324,6 +338,28 @@
       'mac.launch.groupsModal.editTitle': 'Edit launch group',
       'mac.launch.groupsModal.name': 'Group name',
       'mac.launch.groupsModal.accounts': 'Accounts in group',
+      'mac.launch.groupsModal.searchPlaceholder': 'Search accounts by name or email',
+      'mac.launch.groupsModal.filter': 'Filter',
+      'mac.launch.groupsModal.filterAll': 'All accounts',
+      'mac.launch.groupsModal.filterSelected': 'Selected',
+      'mac.launch.groupsModal.filterUnselected': 'Unselected',
+      'mac.launch.groupsModal.filterConnected': 'Connected',
+      'mac.launch.groupsModal.filterDisconnected': 'Disconnected',
+      'mac.launch.groupsModal.filterReady': 'Ready to launch',
+      'mac.launch.groupsModal.filterMissing': 'Missing credentials',
+      'mac.launch.groupsModal.sort': 'Sort',
+      'mac.launch.groupsModal.sortNameAsc': 'Name A-Z',
+      'mac.launch.groupsModal.sortNameDesc': 'Name Z-A',
+      'mac.launch.groupsModal.sortServer': 'Server',
+      'mac.launch.groupsModal.sortStatus': 'Connection status',
+      'mac.launch.groupsModal.selectVisible': 'Select visible',
+      'mac.launch.groupsModal.clearSelection': 'Clear selection',
+      'mac.launch.groupsModal.selectedCount': '{n} selected',
+      'mac.launch.groupsModal.visibleCount': '{shown} of {total} accounts',
+      'mac.launch.groupsModal.noMatches': 'No accounts match the current search and filter.',
+      'mac.launch.groupsModal.connected': 'Connected',
+      'mac.launch.groupsModal.disconnected': 'Disconnected',
+      'mac.launch.groupsModal.missingCredentials': 'Missing credentials',
       'mac.launch.groupsModal.delete': 'Delete group',
       'mac.launch.groupsModal.confirmDelete': 'Delete this launch group?',
       'mac.launch.groupsModal.needName': 'Enter a group name.',
@@ -331,12 +367,6 @@
       'mac.launch.groupQueued': 'Launching group «{name}»: {n} client(s) queued.',
       'mac.launch.groupSkippedNoCreds': '{n} account(s) skipped (missing credentials).',
       'mac.launch.groupsSaved': 'Launch group saved.',
-      'mac.launch.groupsModal.layoutRef': 'Virtual desktop (pixels)',
-      'mac.launch.groupsModal.noOverlap': 'Prevent overlapping tiles',
-      'mac.launch.groupsModal.layoutHint':
-        'Drag and resize tiles like the Multibox tab. On Windows, Hive moves each game window after launch (Win32) so positions match this layout — Unity often ignores x/y in launch flags.',
-      'mac.launch.groupsLayoutW': 'W',
-      'mac.launch.groupsLayoutH': 'H',
       'home.accounts.noConfigured': 'No accounts configured yet.',
       'home.accounts.loadingChars': 'Loading character data...',
       'home.accounts.fetchingTop': 'Fetching highest-fame character...',
@@ -2010,6 +2040,14 @@
   }
   let showServerPing = localStorage.getItem('showServerPing') !== 'false';
   let showAccountEmails = localStorage.getItem('showAccountEmails') !== 'false';
+  var viewerSettings = {
+    interpolation: localStorage.getItem('viewerInterpolation') !== 'false',
+    loadTiles: localStorage.getItem('viewerLoadTiles') !== 'false',
+    loadObjects: localStorage.getItem('viewerLoadObjects') !== 'false',
+    selfProjectiles: localStorage.getItem('viewerSelfProjectiles') !== 'false',
+    otherProjectiles: localStorage.getItem('viewerOtherProjectiles') !== 'false',
+    frameRate: localStorage.getItem('viewerFrameRate') === '60' ? 60 : 30,
+  };
   let navbarTabOrder = JSON.parse(localStorage.getItem('navbarTabOrder') || 'null');
   let navbarHiddenTabs = new Set(JSON.parse(localStorage.getItem('navbarHiddenTabs') || '[]'));
   navbarHiddenTabs.delete('scripts');
@@ -2242,8 +2280,27 @@
   let _objectsTreeHash = null;
   let _tilemapTreeHash = null;
   let lastViewerData = null;
-  let viewerPollTimer = null;
+  let viewerAnimationFrame = null;
+  let viewerLastAnimationAt = 0;
+  let viewerLastAccountId = '';
+  let viewerLastMapName = '';
+  let viewerLastTickId = -1;
+  let viewerGameClock = null;
+  let viewerPlayerTrack = null;
+  const viewerObjectTracks = new Map();
+  const viewerTileCache = new Map();
+  let viewerTileLayer = null;
+  let viewerHitState = null;
+  let viewerHoveredTile = null;
+  let viewerHoveredObject = null;
+  let viewerHoverPoint = null;
+  let viewerScriptsLoading = false;
+  let viewerScriptsLoaded = false;
   const viewerTileImages = new Map();
+  const viewerObjectImages = new Map();
+  const viewerSelfProjectileImages = new Map();
+  const viewerOtherProjectileImages = new Map();
+  const viewerSelfImages = new Map();
   const viewerPlayerImages = new Map();
   let lastNearbyPlayers = [];
   let selectedNearbyPlayerId = null;
@@ -2308,6 +2365,11 @@
       }
     });
     renderChatAccountList();
+    refreshViewerScriptGuiButton();
+    var launchGroupModal = document.getElementById('mac-launch-group-modal');
+    if (launchGroupModal && launchGroupModal.style.display !== 'none') {
+      populateMacLaunchGroupModalAccounts();
+    }
   }
 
   var packetLoggerPackets = [];
@@ -2841,10 +2903,10 @@
   let macLaunchGroupModalEditingId = null;
   let macGroupLaunchQuietFeedUntil = 0;
   const MAC_GROUP_LAUNCH_STAGGER_MS = 1600;
-  const MAC_LAUNCH_GROUP_NO_OVERLAP_LS_KEY = 'macLaunchGroupEditorNoOverlap';
-  /** @type {Record<string, { x: number; y: number; width: number; height: number }>} */
-  var macLaunchGroupLayoutByAccount = {};
-  var macLaunchGroupLayoutRefSnapshot = { width: 1920, height: 1080 };
+  var macLaunchGroupSelectedAccountIds = new Set();
+  var macLaunchGroupAccountQuery = '';
+  var macLaunchGroupAccountFilter = 'all';
+  var macLaunchGroupAccountSort = 'name_asc';
   let macLaunchMinFameDebounceTimer = null;
   let homeMultiSearchQuery = String(localStorage.getItem('homeMultiSearchQuery') || '').trim();
   let homeMultiStatusFilterRaw = String(localStorage.getItem('homeMultiStatusFilter') || 'all').trim().toLowerCase();
@@ -3042,6 +3104,12 @@
   const showGearStatBonusesToggle = document.getElementById('setting-show-gear-stat-bonuses');
   const showServerPingToggle = document.getElementById('setting-show-server-ping');
   const showAccountEmailsToggle = document.getElementById('setting-show-account-emails');
+  const viewerInterpolationToggle = document.getElementById('setting-viewer-interpolation');
+  const viewerFrameRateSelect = document.getElementById('setting-viewer-frame-rate');
+  const viewerTilesToggle = document.getElementById('setting-viewer-tiles');
+  const viewerObjectsToggle = document.getElementById('setting-viewer-objects');
+  const viewerSelfProjectilesToggle = document.getElementById('setting-viewer-self-projectiles');
+  const viewerOtherProjectilesToggle = document.getElementById('setting-viewer-other-projectiles');
   const nearbyRefreshBtn = document.getElementById('nearby-refresh-btn');
   const nearbyAccountSelect = document.getElementById('nearby-account-select');
   const nearbySortEl = document.getElementById('nearby-sort');
@@ -3053,10 +3121,19 @@
   const nearbyDebugSubtitleEl = document.getElementById('nearby-debug-subtitle');
   const viewerAccountSelect = document.getElementById('viewer-account-select');
   const viewerRefreshBtn = document.getElementById('viewer-refresh-btn');
+  const viewerScriptSelect = document.getElementById('viewer-script-select');
+  const viewerScriptRunBtn = document.getElementById('viewer-script-run');
+  const viewerScriptStopBtn = document.getElementById('viewer-script-stop');
+  const viewerAutoRefreshCheck = document.getElementById('viewer-auto-refresh');
+  const viewerOpenScriptGuiBtn = document.getElementById('viewer-open-script-gui-btn');
   const viewerCanvas = document.getElementById('viewer-canvas');
   const viewerStage = document.getElementById('viewer-stage');
   const viewerEmpty = document.getElementById('viewer-empty');
   const viewerStatus = document.getElementById('viewer-status');
+  const viewerHoverTileHighlight = document.getElementById('viewer-hover-tile-highlight');
+  const viewerHoverObjectHighlight = document.getElementById('viewer-hover-object-highlight');
+  const viewerHoverTooltip = document.getElementById('viewer-hover-tooltip');
+  const viewerAccountPanel = document.getElementById('viewer-account-panel');
   const overlayLoginError = document.getElementById('overlay-login-error');
   const overlayEmailInput = document.getElementById('overlay-email');
   const overlayPasswordInput = document.getElementById('overlay-password');
@@ -4116,6 +4193,75 @@
     });
   }
 
+  function persistViewerSettings() {
+    localStorage.setItem('viewerInterpolation', viewerSettings.interpolation ? 'true' : 'false');
+    localStorage.setItem('viewerLoadTiles', viewerSettings.loadTiles ? 'true' : 'false');
+    localStorage.setItem('viewerLoadObjects', viewerSettings.loadObjects ? 'true' : 'false');
+    localStorage.setItem('viewerSelfProjectiles', viewerSettings.selfProjectiles ? 'true' : 'false');
+    localStorage.setItem('viewerOtherProjectiles', viewerSettings.otherProjectiles ? 'true' : 'false');
+    localStorage.setItem('viewerFrameRate', String(viewerSettings.frameRate));
+  }
+
+  function applyViewerSettingsChange() {
+    persistViewerSettings();
+    if (!viewerSettings.loadTiles) {
+      viewerTileCache.clear();
+      viewerTileLayer = null;
+      viewerTileImages.clear();
+    }
+    if (!viewerSettings.loadObjects) {
+      viewerObjectTracks.clear();
+      viewerObjectImages.clear();
+    }
+    if (!viewerSettings.selfProjectiles) viewerSelfProjectileImages.clear();
+    if (!viewerSettings.otherProjectiles) viewerOtherProjectileImages.clear();
+    if (lastViewerData) {
+      if (!viewerSettings.loadObjects) lastViewerData.objects = [];
+      if (Array.isArray(lastViewerData.projectiles)) {
+        lastViewerData.projectiles = lastViewerData.projectiles.filter(function (projectile) {
+          return projectile.side === 'own'
+            ? viewerSettings.selfProjectiles
+            : viewerSettings.otherProjectiles;
+        });
+      }
+    }
+    refreshViewerSubscription();
+    if (activeTab === 'viewer') {
+      renderViewer(performance.now());
+      ensureViewerAnimation();
+    }
+  }
+
+  if (viewerInterpolationToggle) {
+    viewerInterpolationToggle.checked = viewerSettings.interpolation;
+    viewerInterpolationToggle.addEventListener('change', function () {
+      viewerSettings.interpolation = viewerInterpolationToggle.checked;
+      applyViewerSettingsChange();
+    });
+  }
+  if (viewerFrameRateSelect) {
+    viewerFrameRateSelect.value = String(viewerSettings.frameRate);
+    viewerFrameRateSelect.addEventListener('change', function () {
+      viewerSettings.frameRate = viewerFrameRateSelect.value === '60' ? 60 : 30;
+      applyViewerSettingsChange();
+    });
+  }
+  [
+    [viewerTilesToggle, 'loadTiles'],
+    [viewerObjectsToggle, 'loadObjects'],
+    [viewerSelfProjectilesToggle, 'selfProjectiles'],
+    [viewerOtherProjectilesToggle, 'otherProjectiles'],
+  ].forEach(function (entry) {
+    var toggle = entry[0];
+    var key = entry[1];
+    if (!toggle) return;
+    toggle.checked = !!viewerSettings[key];
+    toggle.addEventListener('change', function () {
+      viewerSettings[key] = toggle.checked;
+      applyViewerSettingsChange();
+    });
+  });
+
   function getThemeMeta(themeId) {
     var id = String(themeId || '');
     return THEMES.find(function (theme) { return theme.id === id; }) || THEMES[0];
@@ -4220,10 +4366,15 @@
     if (activeSettingsTab === 'plugins') activeSettingsTab = 'visual';
     localStorage.setItem('activeSettingsTab', activeSettingsTab);
     document.querySelectorAll('.settings-tab').forEach(function (btn) {
-      btn.classList.toggle('active', String(btn.getAttribute('data-settings-tab') || '') === activeSettingsTab);
+      var selected = String(btn.getAttribute('data-settings-tab') || '') === activeSettingsTab;
+      btn.classList.toggle('active', selected);
+      btn.setAttribute('aria-selected', selected ? 'true' : 'false');
+      btn.tabIndex = selected ? 0 : -1;
     });
     document.querySelectorAll('.settings-tab-panel').forEach(function (panel) {
-      panel.classList.toggle('active', String(panel.getAttribute('data-settings-panel') || '') === activeSettingsTab);
+      var selected = String(panel.getAttribute('data-settings-panel') || '') === activeSettingsTab;
+      panel.classList.toggle('active', selected);
+      panel.hidden = !selected;
     });
   }
 
@@ -4668,6 +4819,20 @@
       var btn = e.target.closest('.settings-tab');
       if (!btn) return;
       setActiveSettingsTab(btn.getAttribute('data-settings-tab') || 'visual');
+    });
+    settingsTabsEl.addEventListener('keydown', function (e) {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight' && e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+      var tabs = Array.prototype.filter.call(settingsTabsEl.querySelectorAll('.settings-tab'), function (tab) {
+        return !tab.classList.contains('hidden');
+      });
+      if (!tabs.length) return;
+      var current = tabs.indexOf(document.activeElement);
+      if (current < 0) current = tabs.findIndex(function (tab) { return tab.classList.contains('active'); });
+      var direction = e.key === 'ArrowRight' || e.key === 'ArrowDown' ? 1 : -1;
+      var next = tabs[(current + direction + tabs.length) % tabs.length];
+      e.preventDefault();
+      setActiveSettingsTab(next.getAttribute('data-settings-tab') || 'visual');
+      next.focus();
     });
   }
   setActiveSettingsTab(activeSettingsTab);
@@ -5218,6 +5383,10 @@
   }
 
   function tickHomeLiveStats() {
+    if (activeTab === 'viewer') {
+      updateViewerAccountRuntimeFields();
+      return;
+    }
     if (activeTab !== 'clients') return;
     var uptimeEl = document.getElementById('home-conn-uptime');
     if (uptimeEl) uptimeEl.textContent = formatHomeDuration(Date.now() - homeStats.startedAt);
@@ -5233,12 +5402,6 @@
     if (sessionFameGainedEl) sessionFameGainedEl.textContent = Number(homeStats.fameGained || 0).toLocaleString();
     var sessionAverageFpmEl = document.getElementById('home-stat-average-fpm');
     if (sessionAverageFpmEl) sessionAverageFpmEl.textContent = formatHomeFpm(homeStats.averageFpm);
-    var multiFameGainedEl = document.getElementById('home-multi-fame-gained');
-    if (multiFameGainedEl) multiFameGainedEl.textContent = Number(homeStats.fameGained || 0).toLocaleString();
-    var multiAverageFpmEl = document.getElementById('home-multi-average-fpm');
-    if (multiAverageFpmEl) multiAverageFpmEl.textContent = formatHomeFpm(homeStats.averageFpm);
-    var multiRuntimeEl = document.getElementById('home-multi-runtime');
-    if (multiRuntimeEl) multiRuntimeEl.textContent = formatHomeDuration(getMultiHomeRuntimeMs());
     if (macPopoutOpenClientId) {
       var popoutClient = connectedClients.get(macPopoutOpenClientId);
       var popoutRuntimeEl = document.getElementById('mac-popout-runtime-value');
@@ -5642,52 +5805,8 @@
     refreshMacPopoutScriptPanel(clientId);
   }
 
-  function updateMultiHomeHeroMetricsOnly() {
-    var connectedCountEl = document.getElementById('home-multi-connected-count');
-    var fameGainedEl = document.getElementById('home-multi-fame-gained');
-    var averageFpmEl = document.getElementById('home-multi-average-fpm');
-    var runtimeEl = document.getElementById('home-multi-runtime');
-    var liveStatusEl = document.getElementById('home-multi-live-status');
-    var primaryServerEl = document.getElementById('home-multi-primary-server');
-
-    var clients = Array.from(connectedClients.entries()).map(function (entry) {
-      return getConnectedClientSnapshot(entry[0], entry[1]);
-    });
-
-    var serverCounts = Object.create(null);
-    clients.forEach(function (client) {
-      var server = String(client.server || '--').trim();
-      if (!server || server === '--') return;
-      if (!serverCounts[server]) serverCounts[server] = 0;
-      serverCounts[server] += 1;
-    });
-    var primaryServer = '--';
-    var primaryServerCount = 0;
-    Object.keys(serverCounts).forEach(function (server) {
-      if (serverCounts[server] > primaryServerCount) {
-        primaryServer = server;
-        primaryServerCount = serverCounts[server];
-      }
-    });
-
-    if (connectedCountEl) connectedCountEl.textContent = String(clients.length);
-    if (fameGainedEl) fameGainedEl.textContent = Number(homeStats.fameGained || 0).toLocaleString();
-    if (averageFpmEl) averageFpmEl.textContent = formatHomeFpm(homeStats.averageFpm);
-    if (runtimeEl) runtimeEl.textContent = formatHomeDuration(getMultiHomeRuntimeMs());
-    if (primaryServerEl) {
-      primaryServerEl.textContent = primaryServer === '--'
-        ? 'Primary server: --'
-        : ('Primary server: ' + primaryServer + ' (' + String(primaryServerCount) + ')');
-    }
-    if (liveStatusEl) {
-      var liveLabel = clients.length ? (String(clients.length) + ' live session' + (clients.length === 1 ? '' : 's')) : 'No live sessions';
-      liveStatusEl.textContent = liveLabel;
-      liveStatusEl.className = 'home-status-pill' + (clients.length ? ' active' : '');
-    }
-  }
-
   function renderMultiHomeTab() {
-    updateMultiHomeHeroMetricsOnly();
+    renderMacLaunchGroupsList();
     renderMultiAccountSidebar();
     renderMultiHomeConnectedCards();
   }
@@ -6334,7 +6453,7 @@
     return item;
   }
 
-  function buildMacPopoutLiveInventoryHtml(pd) {
+  function buildMacPopoutLiveInventoryHtml(pd, runtimeElementId, showRuntime) {
     var inv = Array.isArray(pd && pd.inventory) ? pd.inventory : [];
     var bp = Array.isArray(pd && pd.backpack) ? pd.backpack : [];
     var sdkTier = sdkBackpackTierFromPlayerData(pd);
@@ -6353,7 +6472,7 @@
       '<span class="mac-popout-section-title mac-popout-section-title--equipment">' +
       escapeHtml('Equipment') +
       '</span>' +
-      '<span id="mac-popout-runtime-value" class="mac-popout-connection-time" title="Time connected">--</span>' +
+      (showRuntime === false ? '' : '<span id="' + escapeHtml(runtimeElementId || 'mac-popout-runtime-value') + '" class="mac-popout-connection-time" title="Time connected">--</span>') +
       '</div>' +
       '<div class="rotmg-item-strip mac-popout-inv-strip">' +
       equip.map(chip).join('') +
@@ -6597,6 +6716,7 @@
       try { ws.send(JSON.stringify({ type: 'requestScriptPanelSnapshots' })); } catch (_e) {}
       if (activeTab === 'chat') requestChatHistory();
       if (activeTab === 'packet-logger') subscribePacketLogger();
+      if (activeTab === 'viewer') startViewerPolling();
       // Re-send dashboard tokens so the server-side bot API client stays in sync
       if (dashboardLoggedIn && accessToken) {
         ws.send(JSON.stringify({
@@ -6728,6 +6848,7 @@
           if (activeTab === 'viewer' && viewerAccountSelect && String(viewerAccountSelect.value || '') !== previousViewerAccountId) {
             selectViewerAccount();
           }
+          if (activeTab === 'viewer') renderViewerAccountPanel();
           if (activeTab === 'packet-logger' && selectedPacketLoggerAccountId() !== previousPacketLoggerAccountId) {
             subscribePacketLogger();
           }
@@ -6789,7 +6910,6 @@
             if (clientStructureChanged || !liveGrid) {
               renderHomeTab();
             } else {
-              updateMultiHomeHeroMetricsOnly();
               connectedClients.forEach(function (_client, clientId) {
                 patchMultiHomeConnectedCardDom(clientId);
               });
@@ -6800,6 +6920,7 @@
           }
           if (macPopoutOpenClientId) updateMacPopoutLiveFields(macPopoutOpenClientId);
           if (activeTab === 'scripts') renderScriptsListFromData(scriptsTabLastData);
+          if (activeTab === 'viewer') renderViewerAccountPanel();
           updateDashboardAvailabilityUi();
           break;
         }
@@ -6822,9 +6943,9 @@
           if (activeTab === 'tilemap') renderTilemapTree(lastTilesData);
           break;
         case 'viewerData':
-          if (!viewerAccountSelect || !viewerAccountSelect.value || String(msg.accountId || '') === String(viewerAccountSelect.value)) {
-            lastViewerData = msg;
-            if (activeTab === 'viewer') renderViewer();
+          if (activeTab === 'viewer' &&
+              (!viewerAccountSelect || !viewerAccountSelect.value || String(msg.accountId || '') === String(viewerAccountSelect.value))) {
+            applyViewerSnapshot(msg);
           }
           break;
         case 'gameWikiCatalog':
@@ -7020,6 +7141,7 @@
 
     if (activeTab === 'clients') renderHomeTab();
     if (activeTab === 'scripts') renderScriptsListFromData(scriptsTabLastData);
+    if (activeTab === 'viewer') renderViewerAccountPanel();
   }
 
   let pendingAllPlayersRawStatsCb = null;
@@ -7653,96 +7775,29 @@
     macLaunchSortBindingsDone = true;
   }
 
-  function clampMacLaunchGeomToRef(g, ref) {
-    var rw = ref.width;
-    var rh = ref.height;
-    var w = Math.max(200, Math.min(Number(g.width) || 640, rw));
-    var h = Math.max(150, Math.min(Number(g.height) || 360, rh));
-    var x = Math.max(0, Math.min(Number(g.x) || 0, rw - w));
-    var y = Math.max(0, Math.min(Number(g.y) || 0, rh - h));
-    return { x: Math.round(x), y: Math.round(y), width: Math.round(w), height: Math.round(h) };
-  }
-
-  function scaleMacLaunchLayoutGeomMap(geomMap, oldRef, newRef) {
-    var sx = newRef.width / Math.max(1, oldRef.width);
-    var sy = newRef.height / Math.max(1, oldRef.height);
-    var out = {};
-    Object.keys(geomMap || {}).forEach(function (id) {
-      var g = geomMap[id];
-      if (!g) return;
-      out[id] = clampMacLaunchGeomToRef(
-        {
-          x: g.x * sx,
-          y: g.y * sy,
-          width: g.width * sx,
-          height: g.height * sy,
-        },
-        newRef,
-      );
-    });
-    return out;
-  }
-
-  function defaultMacLaunchTileGrid(refW, refH, accountIds) {
-    var n = accountIds.length;
-    var out = {};
-    if (!n) return out;
-    var cols = Math.ceil(Math.sqrt(n));
-    var rows = Math.ceil(n / cols);
-    var gap = 8;
-    var cellW = (refW - gap * (cols + 1)) / cols;
-    var cellH = (refH - gap * (rows + 1)) / rows;
-    accountIds.forEach(function (id, i) {
-      var col = i % cols;
-      var row = Math.floor(i / cols);
-      out[id] = clampMacLaunchGeomToRef(
-        {
-          x: gap + col * (cellW + gap),
-          y: gap + row * (cellH + gap),
-          width: cellW,
-          height: cellH,
-        },
-        { width: refW, height: refH },
-      );
-    });
-    return out;
-  }
-
   function normalizeMacLaunchGroup(raw) {
     if (!raw || typeof raw.id !== 'string' || typeof raw.name !== 'string') return null;
     var name = String(raw.name || '').trim() || 'Untitled';
-    var layoutRef = { width: 1920, height: 1080 };
-    if (raw.layoutRef && typeof raw.layoutRef === 'object') {
-      var rw = Number(raw.layoutRef.width);
-      var rh = Number(raw.layoutRef.height);
-      if (Number.isFinite(rw) && rw >= 800 && rw <= 7680) layoutRef.width = Math.round(rw);
-      if (Number.isFinite(rh) && rh >= 600 && rh <= 4320) layoutRef.height = Math.round(rh);
-    }
     var members = [];
+    var seen = new Set();
     if (Array.isArray(raw.members) && raw.members.length) {
       raw.members.forEach(function (m) {
         if (!m || typeof m.accountId !== 'string') return;
-        var geom = clampMacLaunchGeomToRef(
-          {
-            x: m.x,
-            y: m.y,
-            width: m.width,
-            height: m.height,
-          },
-          layoutRef,
-        );
-        members.push({ accountId: String(m.accountId), x: geom.x, y: geom.y, width: geom.width, height: geom.height });
+        var accountId = String(m.accountId);
+        if (!accountId || seen.has(accountId)) return;
+        seen.add(accountId);
+        members.push({ accountId: accountId });
       });
     } else if (Array.isArray(raw.accountIds) && raw.accountIds.length) {
-      var ids = raw.accountIds.map(String);
-      var grid = defaultMacLaunchTileGrid(layoutRef.width, layoutRef.height, ids);
-      ids.forEach(function (id) {
-        var g = grid[id];
-        if (g) members.push({ accountId: id, x: g.x, y: g.y, width: g.width, height: g.height });
+      raw.accountIds.forEach(function (value) {
+        var accountId = String(value || '');
+        if (!accountId || seen.has(accountId)) return;
+        seen.add(accountId);
+        members.push({ accountId: accountId });
       });
     }
     if (!members.length) return null;
-    return { id: String(raw.id), name: name, layoutRef: layoutRef, members: members };
+    return { id: String(raw.id), name: name, members: members };
   }
 
   function loadMacLaunchGroups() {
@@ -7779,13 +7834,11 @@
 
   function closeMacLaunchGroupModal() {
     var modal = document.getElementById('mac-launch-group-modal');
-    var stage = document.getElementById('mac-launch-group-layout-stage');
-    if (stage) stage.innerHTML = '';
-    macLaunchGroupLayoutByAccount = {};
     if (!modal) return;
     modal.style.display = 'none';
     modal.setAttribute('aria-hidden', 'true');
     macLaunchGroupModalEditingId = null;
+    macLaunchGroupSelectedAccountIds.clear();
   }
 
   function compareDashboardAccountLabel(a, b) {
@@ -7800,61 +7853,78 @@
     var scroll = document.getElementById('mac-launch-group-accounts-scroll');
     if (!scroll) return;
     scroll.innerHTML = '';
-    var seen = {};
-    var orderedIds = [];
-    if (macLaunchGroupModalEditingId) {
-      var groups = loadMacLaunchGroups();
-      var cur = groups.find(function (g) {
-        return g.id === macLaunchGroupModalEditingId;
-      });
-      if (cur && cur.members) {
-        cur.members.forEach(function (m) {
-          var id = m.accountId;
-          if (!dashboardAccounts.some(function (a) {
-            return a.id === id;
-          })) return;
-          if (seen[id]) return;
-          seen[id] = true;
-          orderedIds.push(id);
-        });
+    var query = macLaunchGroupAccountQuery.toLowerCase();
+    var accounts = dashboardAccounts.filter(function (account) {
+      var selected = macLaunchGroupSelectedAccountIds.has(account.id);
+      var connected = headlessSessions.has(account.id);
+      var hasCreds = !!String(account.email || '').trim() && !!String(account.password || '');
+      if (query) {
+        var haystack = [account.label, account.email, account.serverName].map(String).join(' ').toLowerCase();
+        if (haystack.indexOf(query) < 0) return false;
       }
-    }
-    var rest = dashboardAccounts
-      .filter(function (a) {
-        return !seen[a.id];
-      })
-      .sort(compareDashboardAccountLabel);
-    rest.forEach(function (a) {
-      orderedIds.push(a.id);
+      if (macLaunchGroupAccountFilter === 'selected' && !selected) return false;
+      if (macLaunchGroupAccountFilter === 'unselected' && selected) return false;
+      if (macLaunchGroupAccountFilter === 'connected' && !connected) return false;
+      if (macLaunchGroupAccountFilter === 'disconnected' && connected) return false;
+      if (macLaunchGroupAccountFilter === 'ready' && !hasCreds) return false;
+      if (macLaunchGroupAccountFilter === 'missing' && hasCreds) return false;
+      return true;
+    });
+    accounts.sort(function (a, b) {
+      if (macLaunchGroupAccountSort === 'name_desc') return compareDashboardAccountLabel(b, a);
+      if (macLaunchGroupAccountSort === 'server') {
+        var byServer = String(a.serverName || '').localeCompare(String(b.serverName || ''), undefined, { sensitivity: 'base' });
+        return byServer || compareDashboardAccountLabel(a, b);
+      }
+      if (macLaunchGroupAccountSort === 'status') {
+        var aConnected = headlessSessions.has(a.id) ? 0 : 1;
+        var bConnected = headlessSessions.has(b.id) ? 0 : 1;
+        return aConnected - bConnected || compareDashboardAccountLabel(a, b);
+      }
+      return compareDashboardAccountLabel(a, b);
     });
 
-    orderedIds.forEach(function (id) {
-      var account = dashboardAccounts.find(function (a) {
-        return a.id === id;
-      });
-      if (!account) return;
+    accounts.forEach(function (account) {
       var line = document.createElement('label');
       line.className = 'mac-launch-group-account-line';
       var cb = document.createElement('input');
       cb.type = 'checkbox';
       cb.className = 'mac-launch-group-acc-cb';
       cb.setAttribute('data-account-id', account.id);
-      if (macLaunchGroupModalEditingId) {
-        var g0 = loadMacLaunchGroups().find(function (g) {
-          return g.id === macLaunchGroupModalEditingId;
-        });
-        if (g0 && g0.members && g0.members.some(function (mm) {
-          return mm.accountId === account.id;
-        })) cb.checked = true;
-      }
-      var span = document.createElement('span');
+      cb.checked = macLaunchGroupSelectedAccountIds.has(account.id);
+      var details = document.createElement('span');
+      details.className = 'mac-launch-group-account-details';
+      var name = document.createElement('strong');
       var labelText = String(account.label || account.email || t('home.account.unnamed'));
       var hasCreds = !!String(account.email || '').trim() && !!String(account.password || '');
-      span.textContent = labelText + (hasCreds ? '' : ' (Fix)');
+      name.textContent = labelText;
+      var meta = document.createElement('span');
+      meta.className = 'mac-launch-group-account-meta';
+      meta.textContent = [showAccountEmails ? account.email : '', account.serverName || 'USWest'].filter(Boolean).join(' / ');
+      var status = document.createElement('span');
+      var connected = headlessSessions.has(account.id);
+      status.className = 'mac-launch-group-account-status' + (connected ? ' connected' : '') + (hasCreds ? '' : ' warning');
+      status.textContent = !hasCreds
+        ? t('mac.launch.groupsModal.missingCredentials')
+        : t(connected ? 'mac.launch.groupsModal.connected' : 'mac.launch.groupsModal.disconnected');
+      details.appendChild(name);
+      details.appendChild(meta);
       line.appendChild(cb);
-      line.appendChild(span);
+      line.appendChild(details);
+      line.appendChild(status);
       scroll.appendChild(line);
     });
+
+    if (!accounts.length) {
+      var empty = document.createElement('div');
+      empty.className = 'mac-launch-group-accounts-empty';
+      empty.textContent = t('mac.launch.groupsModal.noMatches');
+      scroll.appendChild(empty);
+    }
+    var selectedCount = document.getElementById('mac-launch-group-selected-count');
+    if (selectedCount) selectedCount.textContent = tr('mac.launch.groupsModal.selectedCount', { n: macLaunchGroupSelectedAccountIds.size });
+    var visibleCount = document.getElementById('mac-launch-group-visible-count');
+    if (visibleCount) visibleCount.textContent = tr('mac.launch.groupsModal.visibleCount', { shown: accounts.length, total: dashboardAccounts.length });
   }
 
   function openMacLaunchGroupModal(editId) {
@@ -7862,13 +7932,11 @@
     var titleEl = document.getElementById('mac-launch-group-modal-heading');
     var nameInput = document.getElementById('mac-launch-group-name-input');
     var delBtn = document.getElementById('mac-launch-group-delete-btn');
-    var refWEl = document.getElementById('mac-launch-group-ref-w');
-    var refHEl = document.getElementById('mac-launch-group-ref-h');
     if (!modal || !titleEl || !nameInput) return;
-    macLaunchGroupLayoutByAccount = {};
-    macLaunchGroupLayoutRefSnapshot = { width: 1920, height: 1080 };
-    if (refWEl) refWEl.value = '1920';
-    if (refHEl) refHEl.value = '1080';
+    macLaunchGroupSelectedAccountIds = new Set();
+    macLaunchGroupAccountQuery = '';
+    macLaunchGroupAccountFilter = 'all';
+    macLaunchGroupAccountSort = 'name_asc';
     macLaunchGroupModalEditingId = editId || null;
     if (editId) {
       var grp = loadMacLaunchGroups().find(function (g) {
@@ -7877,18 +7945,11 @@
       titleEl.textContent = t('mac.launch.groupsModal.editTitle');
       nameInput.value = grp ? grp.name : '';
       if (delBtn) delBtn.style.display = '';
-      if (grp && grp.layoutRef) {
-        if (refWEl) refWEl.value = String(grp.layoutRef.width);
-        if (refHEl) refHEl.value = String(grp.layoutRef.height);
-      }
       if (grp && grp.members) {
         grp.members.forEach(function (m) {
-          macLaunchGroupLayoutByAccount[m.accountId] = {
-            x: m.x,
-            y: m.y,
-            width: m.width,
-            height: m.height,
-          };
+          if (dashboardAccounts.some(function (account) { return account.id === m.accountId; })) {
+            macLaunchGroupSelectedAccountIds.add(m.accountId);
+          }
         });
       }
     } else {
@@ -7896,61 +7957,40 @@
       nameInput.value = '';
       if (delBtn) delBtn.style.display = 'none';
     }
+    var searchInput = document.getElementById('mac-launch-group-account-search');
+    var filterSelect = document.getElementById('mac-launch-group-account-filter');
+    var sortSelect = document.getElementById('mac-launch-group-account-sort');
+    if (searchInput) searchInput.value = '';
+    if (filterSelect) filterSelect.value = 'all';
+    if (sortSelect) sortSelect.value = 'name_asc';
     populateMacLaunchGroupModalAccounts();
-    var noOvEl = document.getElementById('mac-launch-group-no-overlap');
-    if (noOvEl) {
-      try {
-        noOvEl.checked = localStorage.getItem(MAC_LAUNCH_GROUP_NO_OVERLAP_LS_KEY) === '1';
-      } catch (_ls) {
-        noOvEl.checked = false;
-      }
-    }
     modal.style.display = 'flex';
     modal.setAttribute('aria-hidden', 'false');
-    macLaunchGroupLayoutRefSnapshot = getMacLaunchGroupLayoutRefFromInputs();
-    rebuildMacLaunchGroupLayoutStage();
     try {
       nameInput.focus();
       nameInput.select();
     } catch (_e2) {}
   }
 
-  function getMacLaunchGroupLayoutRefFromInputs() {
-    var refWEl = document.getElementById('mac-launch-group-ref-w');
-    var refHEl = document.getElementById('mac-launch-group-ref-h');
-    var w = parseInt(refWEl && refWEl.value, 10);
-    var h = parseInt(refHEl && refHEl.value, 10);
-    if (!Number.isFinite(w) || w < 800) w = 1920;
-    if (!Number.isFinite(h) || h < 600) h = 1080;
-    if (w > 7680) w = 7680;
-    if (h > 4320) h = 4320;
-    return { width: w, height: h };
-  }
-
   function saveMacLaunchGroupFromModal() {
     var nameInput = document.getElementById('mac-launch-group-name-input');
-    var scroll = document.getElementById('mac-launch-group-accounts-scroll');
-    if (!nameInput || !scroll) return;
+    if (!nameInput) return;
     var name = String(nameInput.value || '').trim();
     if (!name) {
       setHomeActionStatus(t('mac.launch.groupsModal.needName'));
       return;
     }
-    var ids = [];
-    scroll.querySelectorAll('.mac-launch-group-acc-cb').forEach(function (cb) {
-      if (cb.checked) ids.push(String(cb.getAttribute('data-account-id') || ''));
+    var ids = dashboardAccounts.filter(function (account) {
+      return macLaunchGroupSelectedAccountIds.has(account.id);
+    }).map(function (account) {
+      return account.id;
     });
     if (!ids.length) {
       setHomeActionStatus(t('mac.launch.groupsModal.needAccount'));
       return;
     }
-    var ref = getMacLaunchGroupLayoutRefFromInputs();
-    var gridFallback = defaultMacLaunchTileGrid(ref.width, ref.height, ids);
     var members = ids.map(function (id) {
-      var g = macLaunchGroupLayoutByAccount[id] || gridFallback[id];
-      if (!g) g = { x: 8, y: 8, width: 640, height: 360 };
-      g = clampMacLaunchGeomToRef(g, ref);
-      return { accountId: id, x: g.x, y: g.y, width: g.width, height: g.height };
+      return { accountId: id };
     });
     var groups = loadMacLaunchGroups();
     if (macLaunchGroupModalEditingId) {
@@ -7958,13 +7998,12 @@
         return g.id === macLaunchGroupModalEditingId;
       });
       if (ix >= 0) {
-        groups[ix] = { id: groups[ix].id, name: name, layoutRef: ref, members: members };
+        groups[ix] = { id: groups[ix].id, name: name, members: members };
       }
     } else {
       groups.push({
         id: 'lg-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
         name: name,
-        layoutRef: ref,
         members: members,
       });
     }
@@ -8003,10 +8042,7 @@
         skipped++;
         return;
       }
-      withLaunch.push({
-        account: account,
-        rect: { x: m.x, y: m.y, width: m.width, height: m.height },
-      });
+      withLaunch.push(account);
     });
     if (!withLaunch.length) {
       addHomeFeed('err', skipped ? t('mac.launch.groupSkippedNoCreds', { n: skipped }) : t('mac.launch.groupsModal.needAccount'));
@@ -8024,9 +8060,8 @@
     if (skipped) summaryBits.push(t('mac.launch.groupSkippedNoCreds', { n: skipped }));
     addHomeFeed('act', summaryBits.join(' '));
     setHomeActionStatus(t('home.action.launchSent'));
-    withLaunch.forEach(function (entry, i) {
+    withLaunch.forEach(function (account, i) {
       window.setTimeout(function () {
-        var account = entry.account;
         selectedAccountId = account.id;
         renderAccountsTab();
         launchGameWithCredentials(
@@ -8036,422 +8071,85 @@
           false,
           launchOptsWithAccount(account, {
             suppressAccountsLaunchBtn: true,
-            windowRect: entry.rect,
           }),
         );
       }, i * MAC_GROUP_LAUNCH_STAGGER_MS);
     });
   }
 
-  function wireMacLaunchGroupLayoutWin(win, stage) {
-    var MIN_W = 72;
-    var MIN_H = 52;
-    var dragging = false;
-    var resizing = false;
-    var resizeDir = '';
-    var startClientX = 0;
-    var startClientY = 0;
-    var startLeft = 0;
-    var startTop = 0;
-    var startW = 0;
-    var startH = 0;
-    /** Last resize pose that did not overlap others (when “prevent overlap” is on). */
-    var lastGoodResize = null;
-
-    function macLaunchNoOverlapOn() {
-      var el = document.getElementById('mac-launch-group-no-overlap');
-      return !!(el && el.checked);
-    }
-
-    function getOtherWinPixelRects() {
-      var sr = stage.getBoundingClientRect();
-      var out = [];
-      stage.querySelectorAll('.mac-launch-group-layout-win').forEach(function (wEl) {
-        if (wEl === win) return;
-        var wr = wEl.getBoundingClientRect();
-        out.push({
-          l: wr.left - sr.left,
-          t: wr.top - sr.top,
-          w: wr.width,
-          h: wr.height,
-        });
-      });
-      return out;
-    }
-
-    function rectsOverlap(a, b) {
-      return !(a.l + a.w <= b.l || b.l + b.w <= a.l || a.t + a.h <= b.t || b.t + b.h <= a.t);
-    }
-
-    function overlapsAny(test, others) {
-      for (var i = 0; i < others.length; i++) {
-        if (rectsOverlap(test, others[i])) return true;
-      }
-      return false;
-    }
-
-    function resolveDragNoOverlap(l, t, w, h, others, sw, sh, preferL, preferT) {
-      var r = clampStageRect(l, t, w, h, sw, sh);
-      if (!macLaunchNoOverlapOn()) return r;
-      var guard = 0;
-      while (guard++ < 80) {
-        var hit = null;
-        for (var i = 0; i < others.length; i++) {
-          if (rectsOverlap(r, others[i])) {
-            hit = others[i];
-            break;
-          }
-        }
-        if (!hit) break;
-        var o = hit;
-        var cand = [
-          { l: o.l + o.w, t: r.t },
-          { l: o.l - r.w, t: r.t },
-          { l: r.l, t: o.t + o.h },
-          { l: r.l, t: o.t - r.h },
-        ];
-        var best = null;
-        var bestScore = Infinity;
-        for (var j = 0; j < cand.length; j++) {
-          var c = cand[j];
-          var nl = Math.max(0, Math.min(c.l, sw - r.w));
-          var nt = Math.max(0, Math.min(c.t, sh - r.h));
-          var rr = clampStageRect(nl, nt, r.w, r.h, sw, sh);
-          if (!rectsOverlap(rr, o)) {
-            var dist = Math.abs(rr.l - preferL) + Math.abs(rr.t - preferT);
-            if (dist < bestScore) {
-              bestScore = dist;
-              best = rr;
-            }
-          }
-        }
-        if (best) {
-          r = best;
-          continue;
-        }
-        var overlapX = Math.min(r.l + r.w, o.l + o.w) - Math.max(r.l, o.l);
-        var overlapY = Math.min(r.t + r.h, o.t + o.h) - Math.max(r.t, o.t);
-        if (overlapX <= 0 || overlapY <= 0) break;
-        if (overlapX < overlapY) {
-          if (r.l + r.w / 2 < o.l + o.w / 2) r.l = o.l - r.w;
-          else r.l = o.l + o.w;
-        } else {
-          if (r.t + r.h / 2 < o.t + o.h / 2) r.t = o.t - r.h;
-          else r.t = o.t + o.h;
-        }
-        r = clampStageRect(r.l, r.t, r.w, r.h, sw, sh);
-      }
-      return r;
-    }
-
-    function commitGeomFromDom() {
-      var ref = getMacLaunchGroupLayoutRefFromInputs();
-      var sw = stage.clientWidth;
-      var sh = stage.clientHeight;
-      if (sw < 1 || sh < 1) return;
-      var id = win.getAttribute('data-account-id');
-      if (!id) return;
-      var wr = win.getBoundingClientRect();
-      var sr = stage.getBoundingClientRect();
-      var left = wr.left - sr.left;
-      var top = wr.top - sr.top;
-      macLaunchGroupLayoutByAccount[id] = clampMacLaunchGeomToRef(
-        {
-          x: (left / sw) * ref.width,
-          y: (top / sh) * ref.height,
-          width: (wr.width / sw) * ref.width,
-          height: (wr.height / sh) * ref.height,
-        },
-        ref,
-      );
-    }
-
-    function clampStageRect(l, t, w, h, sw, sh) {
-      w = Math.max(MIN_W, w);
-      h = Math.max(MIN_H, h);
-      if (l < 0) {
-        w += l;
-        l = 0;
-      }
-      if (t < 0) {
-        h += t;
-        t = 0;
-      }
-      w = Math.max(MIN_W, w);
-      h = Math.max(MIN_H, h);
-      if (l + w > sw) w = Math.max(MIN_W, sw - l);
-      if (t + h > sh) h = Math.max(MIN_H, sh - t);
-      if (l + w > sw) l = Math.max(0, sw - w);
-      if (t + h > sh) t = Math.max(0, sh - h);
-      return { l: l, t: t, w: w, h: h };
-    }
-
-    function applyResizeMove(e) {
-      var sw = stage.clientWidth;
-      var sh = stage.clientHeight;
-      var dx = e.clientX - startClientX;
-      var dy = e.clientY - startClientY;
-      var l = startLeft;
-      var t = startTop;
-      var w = startW;
-      var h = startH;
-      switch (resizeDir) {
-        case 'se':
-          w = startW + dx;
-          h = startH + dy;
-          break;
-        case 'nw':
-          l = startLeft + dx;
-          t = startTop + dy;
-          w = startW - dx;
-          h = startH - dy;
-          break;
-        case 'ne':
-          t = startTop + dy;
-          w = startW + dx;
-          h = startH - dy;
-          break;
-        case 'sw':
-          l = startLeft + dx;
-          w = startW - dx;
-          h = startH + dy;
-          break;
-        case 'n':
-          t = startTop + dy;
-          h = startH - dy;
-          break;
-        case 's':
-          h = startH + dy;
-          break;
-        case 'e':
-          w = startW + dx;
-          break;
-        case 'w':
-          l = startLeft + dx;
-          w = startW - dx;
-          break;
-        default:
-          return;
-      }
-      var r = clampStageRect(l, t, w, h, sw, sh);
-      if (macLaunchNoOverlapOn()) {
-        var others = getOtherWinPixelRects();
-        var test = { l: r.l, t: r.t, w: r.w, h: r.h };
-        if (overlapsAny(test, others)) {
-          if (lastGoodResize) {
-            win.style.left = lastGoodResize.l + 'px';
-            win.style.top = lastGoodResize.t + 'px';
-            win.style.width = lastGoodResize.w + 'px';
-            win.style.height = lastGoodResize.h + 'px';
-          }
-          return;
-        }
-        lastGoodResize = { l: r.l, t: r.t, w: r.w, h: r.h };
-      }
-      win.style.left = r.l + 'px';
-      win.style.top = r.t + 'px';
-      win.style.width = r.w + 'px';
-      win.style.height = r.h + 'px';
-      if (!macLaunchNoOverlapOn()) lastGoodResize = { l: r.l, t: r.t, w: r.w, h: r.h };
-    }
-
-    function endResizeDoc(e) {
-      if (!resizing) return;
-      resizing = false;
-      resizeDir = '';
-      document.removeEventListener('pointermove', onResizeDocMove);
-      document.removeEventListener('pointerup', endResizeDoc);
-      document.removeEventListener('pointercancel', endResizeDoc);
-      commitGeomFromDom();
-    }
-
-    function onResizeDocMove(e) {
-      if (!resizing) return;
-      applyResizeMove(e);
-    }
-
-    win.addEventListener('pointerdown', function (e) {
-      if (e.button !== 0) return;
-      if (e.target.closest('.mac-launch-group-layout-handle')) return;
-      e.preventDefault();
-      dragging = true;
-      resizing = false;
-      startClientX = e.clientX;
-      startClientY = e.clientY;
-      var wr = win.getBoundingClientRect();
-      var sr = stage.getBoundingClientRect();
-      startLeft = wr.left - sr.left;
-      startTop = wr.top - sr.top;
-      startW = wr.width;
-      startH = wr.height;
-      try {
-        win.setPointerCapture(e.pointerId);
-      } catch (_e) {}
-    });
-
-    win.addEventListener('pointermove', function (e) {
-      if (!dragging || resizing) return;
-      var dx = e.clientX - startClientX;
-      var dy = e.clientY - startClientY;
-      var sw = stage.clientWidth;
-      var sh = stage.clientHeight;
-      var nl = startLeft + dx;
-      var nt = startTop + dy;
-      nl = Math.max(0, Math.min(nl, sw - startW));
-      nt = Math.max(0, Math.min(nt, sh - startH));
-      var others = getOtherWinPixelRects();
-      var r = resolveDragNoOverlap(nl, nt, startW, startH, others, sw, sh, nl, nt);
-      win.style.left = r.l + 'px';
-      win.style.top = r.t + 'px';
-    });
-
-    function endDrag(e) {
-      if (!dragging) return;
-      dragging = false;
-      try {
-        win.releasePointerCapture(e.pointerId);
-      } catch (_e2) {}
-      commitGeomFromDom();
-    }
-    win.addEventListener('pointerup', endDrag);
-    win.addEventListener('pointercancel', endDrag);
-
-    win.querySelectorAll('.mac-launch-group-layout-handle').forEach(function (handleEl) {
-      handleEl.addEventListener('pointerdown', function (e) {
-        if (e.button !== 0) return;
-        e.preventDefault();
-        e.stopPropagation();
-        dragging = false;
-        resizing = true;
-        resizeDir = String(handleEl.getAttribute('data-dir') || 'se');
-        startClientX = e.clientX;
-        startClientY = e.clientY;
-        var wr = win.getBoundingClientRect();
-        var sr = stage.getBoundingClientRect();
-        startLeft = wr.left - sr.left;
-        startTop = wr.top - sr.top;
-        startW = wr.width;
-        startH = wr.height;
-        lastGoodResize = { l: startLeft, t: startTop, w: startW, h: startH };
-        document.addEventListener('pointermove', onResizeDocMove);
-        document.addEventListener('pointerup', endResizeDoc);
-        document.addEventListener('pointercancel', endResizeDoc);
-        try {
-          handleEl.setPointerCapture(e.pointerId);
-        } catch (_eh) {}
-      });
-    });
-  }
-
-  function rebuildMacLaunchGroupLayoutStage() {
-    var scroll = document.getElementById('mac-launch-group-accounts-scroll');
-    var stage = document.getElementById('mac-launch-group-layout-stage');
-    if (!scroll || !stage) return;
-    var ref = getMacLaunchGroupLayoutRefFromInputs();
-    var ids = [];
-    scroll.querySelectorAll('.mac-launch-group-acc-cb').forEach(function (cb) {
-      if (cb.checked) ids.push(String(cb.getAttribute('data-account-id') || ''));
-    });
-    var prevGeom = macLaunchGroupLayoutByAccount;
-    macLaunchGroupLayoutByAccount = {};
-    var grid = defaultMacLaunchTileGrid(ref.width, ref.height, ids);
-    ids.forEach(function (id) {
-      if (prevGeom[id]) {
-        macLaunchGroupLayoutByAccount[id] = clampMacLaunchGeomToRef(prevGeom[id], ref);
-      } else if (grid[id]) {
-        macLaunchGroupLayoutByAccount[id] = grid[id];
-      }
-    });
-    stage.innerHTML = '';
-    if (!ids.length) return;
-
-    function paint() {
-      stage.style.aspectRatio = ref.width + ' / ' + ref.height;
-      var sw = stage.clientWidth;
-      var sh = stage.clientHeight;
-      if (sw < 24 || sh < 24) {
-        window.requestAnimationFrame(paint);
-        return;
-      }
-      ids.forEach(function (id) {
-        var account = dashboardAccounts.find(function (a) {
-          return a.id === id;
-        });
-        var g = macLaunchGroupLayoutByAccount[id];
-        if (!account || !g) return;
-        var win = document.createElement('div');
-        win.className = 'mac-launch-group-layout-win';
-        win.setAttribute('data-account-id', id);
-        win.style.left = (g.x / ref.width) * sw + 'px';
-        win.style.top = (g.y / ref.height) * sh + 'px';
-        win.style.width = (g.width / ref.width) * sw + 'px';
-        win.style.height = (g.height / ref.height) * sh + 'px';
-        var head = document.createElement('div');
-        head.className = 'mac-launch-group-layout-win-head';
-        head.textContent = String(account.label || account.email || t('home.account.unnamed')).slice(0, 22);
-        var handles = document.createElement('div');
-        handles.className = 'mac-launch-group-layout-handles';
-        handles.setAttribute('aria-hidden', 'true');
-        ['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'].forEach(function (dir) {
-          var h = document.createElement('div');
-          h.className = 'mac-launch-group-layout-handle mac-launch-group-layout-handle--' + dir;
-          h.setAttribute('data-dir', dir);
-          handles.appendChild(h);
-        });
-        win.appendChild(head);
-        win.appendChild(handles);
-        stage.appendChild(win);
-        wireMacLaunchGroupLayoutWin(win, stage);
-      });
-    }
-    window.requestAnimationFrame(function () {
-      window.requestAnimationFrame(paint);
-    });
-  }
-
   function renderMacLaunchGroupsList() {
-    var container = document.getElementById('mac-launch-groups-list');
-    if (!container) return;
     bindMacLaunchGroupsOnce();
-    container.innerHTML = '';
     var groups = loadMacLaunchGroups();
+    renderMacLaunchGroupContainer(document.getElementById('mac-launch-groups-list'), groups, false);
+    renderMacLaunchGroupContainer(document.getElementById('home-launch-groups-list'), groups, true);
+  }
+
+  function renderMacLaunchGroupContainer(container, groups, homeStyle) {
+    if (!container) return;
+    container.innerHTML = '';
     if (!groups.length) {
       var empty = document.createElement('div');
-      empty.className = 'mac-launch-groups-empty';
-      empty.setAttribute('data-i18n', 'mac.launch.groupsEmpty');
-      empty.textContent = t('mac.launch.groupsEmpty');
+      empty.className = homeStyle ? 'home-launch-groups-empty' : 'mac-launch-groups-empty';
+      empty.textContent = homeStyle ? 'No launch groups' : t('mac.launch.groupsEmpty');
       container.appendChild(empty);
       return;
     }
     groups.forEach(function (g) {
       var ids = macLaunchGroupMemberIds(g);
-      var present = ids.filter(function (id) {
-        return dashboardAccounts.some(function (a) {
-          return a.id === id;
-        });
+      var accounts = ids.map(function (id) {
+        return dashboardAccounts.find(function (account) { return account.id === id; });
+      }).filter(Boolean);
+      var present = accounts.length;
+      var ready = accounts.filter(function (account) {
+        return String(account.email || '').trim() && String(account.password || '');
       }).length;
       var row = document.createElement('div');
-      row.className = 'mac-launch-group-row';
+      row.className = homeStyle ? 'home-launch-group-row' : 'mac-launch-group-row';
       row.setAttribute('role', 'listitem');
-      row.innerHTML =
-        '<div class="mac-launch-group-row-main">' +
-          '<div class="mac-launch-group-row-name">' + escapeHtml(g.name) + '</div>' +
-          '<div class="mac-launch-group-row-meta">' +
-            escapeHtml(tr('mac.launch.groupsRowMeta', { present: present, total: ids.length })) +
+      if (homeStyle) {
+        var memberNames = accounts.map(function (account) {
+          return String(account.label || account.email || t('home.account.unnamed'));
+        });
+        row.innerHTML =
+          '<div class="home-launch-group-main">' +
+            '<div class="home-launch-group-title-line">' +
+              '<span class="home-launch-group-name">' + escapeHtml(g.name) + '</span>' +
+              '<span class="home-launch-group-count">' +
+                escapeHtml(tr('mac.launch.groupsRowMeta', { present: present, total: ids.length })) +
+              '</span>' +
+            '</div>' +
+            '<div class="home-launch-group-members">' +
+              escapeHtml(memberNames.length ? memberNames.join(' · ') : t('home.accounts.noConfigured')) +
+            '</div>' +
           '</div>' +
-        '</div>' +
-        '<div class="mac-launch-group-row-actions">' +
-          '<button type="button" class="setting-btn mac-launch-group-launch-btn" data-mac-group-launch="' +
-            escapeHtml(g.id) +
-            '" data-i18n="mac.launch.groupsLaunch">' +
-            escapeHtml(t('mac.launch.groupsLaunch')) +
-          '</button>' +
-          '<button type="button" class="setting-btn setting-btn-secondary mac-launch-group-edit-btn" data-mac-group-edit="' +
-            escapeHtml(g.id) +
-            '" data-i18n="mac.launch.groupsEdit">' +
-            escapeHtml(t('mac.launch.groupsEdit')) +
-          '</button>' +
-        '</div>';
+          '<div class="home-launch-group-actions">' +
+            '<span class="home-launch-group-ready' + (ready < ids.length ? ' warning' : '') + '">' +
+              escapeHtml(String(ready) + ' ready') +
+            '</span>' +
+            '<button type="button" class="setting-btn home-launch-group-launch-btn" data-mac-group-launch="' +
+              escapeHtml(g.id) + '"' + (ready ? '' : ' disabled') + '>' + escapeHtml(t('mac.launch.groupsLaunch')) + '</button>' +
+            '<button type="button" class="setting-btn setting-btn-secondary home-launch-group-edit-btn" data-mac-group-edit="' +
+              escapeHtml(g.id) + '">' + escapeHtml(t('mac.launch.groupsEdit')) + '</button>' +
+          '</div>';
+      } else {
+        row.innerHTML =
+          '<div class="mac-launch-group-row-main">' +
+            '<div class="mac-launch-group-row-name">' + escapeHtml(g.name) + '</div>' +
+            '<div class="mac-launch-group-row-meta">' +
+              escapeHtml(tr('mac.launch.groupsRowMeta', { present: present, total: ids.length })) +
+            '</div>' +
+          '</div>' +
+          '<div class="mac-launch-group-row-actions">' +
+            '<button type="button" class="setting-btn mac-launch-group-launch-btn" data-mac-group-launch="' +
+              escapeHtml(g.id) + '" data-i18n="mac.launch.groupsLaunch">' +
+              escapeHtml(t('mac.launch.groupsLaunch')) +
+            '</button>' +
+            '<button type="button" class="setting-btn setting-btn-secondary mac-launch-group-edit-btn" data-mac-group-edit="' +
+              escapeHtml(g.id) + '" data-i18n="mac.launch.groupsEdit">' +
+              escapeHtml(t('mac.launch.groupsEdit')) +
+            '</button>' +
+          '</div>';
+      }
       container.appendChild(row);
     });
   }
@@ -8459,16 +8157,22 @@
   function bindMacLaunchGroupsOnce() {
     if (macLaunchGroupsBindingsDone) return;
     macLaunchGroupsBindingsDone = true;
-    var addBtn = document.getElementById('mac-launch-group-add');
+    var addBtns = [
+      document.getElementById('mac-launch-group-add'),
+      document.getElementById('home-launch-group-add'),
+    ].filter(Boolean);
     var modal = document.getElementById('mac-launch-group-modal');
     var saveBtn = document.getElementById('mac-launch-group-save-btn');
     var delBtn = document.getElementById('mac-launch-group-delete-btn');
-    var list = document.getElementById('mac-launch-groups-list');
-    if (addBtn) {
+    var lists = [
+      document.getElementById('mac-launch-groups-list'),
+      document.getElementById('home-launch-groups-list'),
+    ].filter(Boolean);
+    addBtns.forEach(function (addBtn) {
       addBtn.addEventListener('click', function () {
         openMacLaunchGroupModal(null);
       });
-    }
+    });
     if (modal) {
       modal.querySelectorAll('[data-mac-group-modal-close]').forEach(function (el) {
         el.addEventListener('click', function () {
@@ -8481,35 +8185,59 @@
     var accScroll = document.getElementById('mac-launch-group-accounts-scroll');
     if (accScroll) {
       accScroll.addEventListener('change', function (e) {
-        var t = e.target;
-        if (!t || !t.classList || !t.classList.contains('mac-launch-group-acc-cb')) return;
-        rebuildMacLaunchGroupLayoutStage();
+        var target = e.target;
+        if (!target || !target.classList || !target.classList.contains('mac-launch-group-acc-cb')) return;
+        var accountId = String(target.getAttribute('data-account-id') || '');
+        if (!accountId) return;
+        if (target.checked) macLaunchGroupSelectedAccountIds.add(accountId);
+        else macLaunchGroupSelectedAccountIds.delete(accountId);
+        if (macLaunchGroupAccountFilter === 'selected' || macLaunchGroupAccountFilter === 'unselected') {
+          populateMacLaunchGroupModalAccounts();
+        } else {
+          var selectedCount = document.getElementById('mac-launch-group-selected-count');
+          if (selectedCount) selectedCount.textContent = tr('mac.launch.groupsModal.selectedCount', { n: macLaunchGroupSelectedAccountIds.size });
+        }
       });
     }
-    var refWInput = document.getElementById('mac-launch-group-ref-w');
-    var refHInput = document.getElementById('mac-launch-group-ref-h');
-    function onMacLaunchLayoutRefChange() {
-      var newRef = getMacLaunchGroupLayoutRefFromInputs();
-      macLaunchGroupLayoutByAccount = scaleMacLaunchLayoutGeomMap(
-        macLaunchGroupLayoutByAccount,
-        macLaunchGroupLayoutRefSnapshot,
-        newRef,
-      );
-      macLaunchGroupLayoutRefSnapshot = newRef;
-      rebuildMacLaunchGroupLayoutStage();
-    }
-    if (refWInput) refWInput.addEventListener('change', onMacLaunchLayoutRefChange);
-    if (refHInput) refHInput.addEventListener('change', onMacLaunchLayoutRefChange);
-    var noOvEl = document.getElementById('mac-launch-group-no-overlap');
-    if (noOvEl && !noOvEl.dataset.macNoOverlapBound) {
-      noOvEl.dataset.macNoOverlapBound = '1';
-      noOvEl.addEventListener('change', function () {
-        try {
-          localStorage.setItem(MAC_LAUNCH_GROUP_NO_OVERLAP_LS_KEY, noOvEl.checked ? '1' : '0');
-        } catch (_ls2) {}
+    var searchInput = document.getElementById('mac-launch-group-account-search');
+    if (searchInput) {
+      searchInput.addEventListener('input', function () {
+        macLaunchGroupAccountQuery = String(searchInput.value || '').trim();
+        populateMacLaunchGroupModalAccounts();
       });
     }
-    if (list) {
+    var filterSelect = document.getElementById('mac-launch-group-account-filter');
+    if (filterSelect) {
+      filterSelect.addEventListener('change', function () {
+        macLaunchGroupAccountFilter = String(filterSelect.value || 'all');
+        populateMacLaunchGroupModalAccounts();
+      });
+    }
+    var sortSelect = document.getElementById('mac-launch-group-account-sort');
+    if (sortSelect) {
+      sortSelect.addEventListener('change', function () {
+        macLaunchGroupAccountSort = String(sortSelect.value || 'name_asc');
+        populateMacLaunchGroupModalAccounts();
+      });
+    }
+    var selectVisibleBtn = document.getElementById('mac-launch-group-select-visible');
+    if (selectVisibleBtn && accScroll) {
+      selectVisibleBtn.addEventListener('click', function () {
+        accScroll.querySelectorAll('.mac-launch-group-acc-cb').forEach(function (checkbox) {
+          var accountId = String(checkbox.getAttribute('data-account-id') || '');
+          if (accountId) macLaunchGroupSelectedAccountIds.add(accountId);
+        });
+        populateMacLaunchGroupModalAccounts();
+      });
+    }
+    var clearSelectionBtn = document.getElementById('mac-launch-group-clear-selection');
+    if (clearSelectionBtn) {
+      clearSelectionBtn.addEventListener('click', function () {
+        macLaunchGroupSelectedAccountIds.clear();
+        populateMacLaunchGroupModalAccounts();
+      });
+    }
+    lists.forEach(function (list) {
       list.addEventListener('click', function (e) {
         var launchBtn = e.target.closest('[data-mac-group-launch]');
         if (launchBtn) {
@@ -8523,7 +8251,7 @@
           if (id2) openMacLaunchGroupModal(id2);
         }
       });
-    }
+    });
     document.addEventListener('keydown', function (e) {
       if (e.key !== 'Escape') return;
       var m = document.getElementById('mac-launch-group-modal');
@@ -10211,27 +9939,49 @@
     return 'hsl(' + hue + ' 28% 28%)';
   }
 
-  function getViewerTileImage(tile) {
-    if (!tile || !tile.textureFile || Number(tile.textureIndex) < 0) return null;
-    var key = String(tile.textureFile) + ':' + String(tile.textureIndex);
-    var cached = viewerTileImages.get(key);
+  function getViewerAssetImage(asset, cache, invalidatesTileLayer) {
+    if (!asset || !asset.textureFile || Number(asset.textureIndex) < 0) return null;
+    var key = String(asset.textureFile) + ':' + String(asset.textureIndex);
+    var cached = cache.get(key);
     if (cached) return cached;
     var img = new Image();
     var entry = { img: img, loaded: false, failed: false };
-    viewerTileImages.set(key, entry);
+    cache.set(key, entry);
     img.onload = function () {
       entry.loaded = true;
-      if (activeTab === 'viewer') renderViewer();
+      if (invalidatesTileLayer) viewerTileLayer = null;
+      if (activeTab === 'viewer') ensureViewerAnimation();
     };
     img.onerror = function () {
       entry.failed = true;
+      if (invalidatesTileLayer) viewerTileLayer = null;
       setTimeout(function () {
-        if (viewerTileImages.get(key) === entry) viewerTileImages.delete(key);
-        if (activeTab === 'viewer') renderViewer();
+        if (cache.get(key) === entry) cache.delete(key);
+        if (activeTab === 'viewer') ensureViewerAnimation();
       }, 3000);
     };
-    img.src = '/api/wiki-texture-file?file=' + encodeURIComponent(String(tile.textureFile)) + '&index=' + encodeURIComponent(String(tile.textureIndex));
+    img.src = '/api/wiki-texture-file?file=' + encodeURIComponent(String(asset.textureFile)) + '&index=' + encodeURIComponent(String(asset.textureIndex));
     return entry;
+  }
+
+  function getViewerTileImage(tile) {
+    return getViewerAssetImage(tile, viewerTileImages, true);
+  }
+
+  function getViewerObjectImage(object) {
+    return getViewerAssetImage(object, viewerObjectImages, false);
+  }
+
+  function getViewerSelfImage(player) {
+    return getViewerAssetImage(player, viewerSelfImages, false) || getViewerPlayerImage(player && player.classType);
+  }
+
+  function getViewerProjectileImage(projectile) {
+    return getViewerAssetImage(
+      projectile,
+      projectile && projectile.side === 'own' ? viewerSelfProjectileImages : viewerOtherProjectileImages,
+      false
+    );
   }
 
   function getViewerPlayerImage(classType) {
@@ -10243,7 +9993,7 @@
     viewerPlayerImages.set(key, entry);
     img.onload = function () {
       entry.loaded = true;
-      if (activeTab === 'viewer') renderViewer();
+      if (activeTab === 'viewer') ensureViewerAnimation();
     };
     img.src = renderClassSprite(Number(classType) || 0);
     return entry;
@@ -10257,68 +10007,798 @@
     return colors[String(category || '').replace(/\s+/g, '')] || '#b3bdc7';
   }
 
-  function drawViewerObject(ctx, object, minX, minY, originX, originY, tileSize) {
-    var x = originX + (Number(object.x) - minX) * tileSize;
-    var y = originY + (Number(object.y) - minY) * tileSize;
-    var category = String(object.category || 'Other');
-    var image = getViewerTileImage(object);
-    if (category === 'Player' && (!image || image.failed)) image = getViewerPlayerImage(object.classType);
-    var drawnWidth = tileSize;
-    var drawnHeight = tileSize;
+  function viewerTypeLabel(type) {
+    var value = Number(type);
+    if (!Number.isFinite(value)) return 'Unknown';
+    value = Math.trunc(value);
+    return '0x' + value.toString(16).toUpperCase() + ' (' + value + ')';
+  }
 
+  function viewerPlayerTarget(data) {
+    var player = data && data.player;
+    if (!player) return null;
+    return {
+      objectId: player.objectId,
+      type: player.classType,
+      category: 'Player',
+      name: player.name || 'Player',
+      x: player.x,
+      y: player.y,
+      hp: player.hp,
+      maxHp: player.maxHp,
+      classType: player.classType,
+      size: player.size,
+      textureFile: player.textureFile,
+      textureIndex: player.textureIndex
+    };
+  }
+
+  function viewerDistanceToPlayer(target, isTile) {
+    var player = lastViewerData && lastViewerData.player;
+    if (!player || !target) return null;
+    var x = Number(target.x) + (isTile ? 0.5 : 0);
+    var y = Number(target.y) + (isTile ? 0.5 : 0);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    return Math.hypot(x - Number(player.x), y - Number(player.y));
+  }
+
+  function loadViewerScripts() {
+    if (viewerScriptsLoading || viewerScriptsLoaded || (scriptsTabLastData.scripts || []).length) return;
+    viewerScriptsLoading = true;
+    fetch('/api/scripts')
+      .then(function (response) { return response.json(); })
+      .then(function (data) {
+        scriptsTabLastData = data || { scripts: [], dir: null };
+      })
+      .catch(function () {})
+      .finally(function () {
+        viewerScriptsLoading = false;
+        viewerScriptsLoaded = true;
+        renderViewerScriptControls();
+        renderViewerAccountPanel();
+      });
+  }
+
+  function renderViewerScriptControls() {
+    if (!viewerScriptSelect || !viewerScriptRunBtn || !viewerScriptStopBtn) return;
+    var accountId = String(viewerAccountSelect && viewerAccountSelect.value || '');
+    var ui = computeMacScriptSelectionUi(accountId);
+    viewerScriptSelect.innerHTML = '<option value="">-- Select Script --</option>';
+    ui.scripts.forEach(function (script) {
+      var option = document.createElement('option');
+      option.value = String(script.id || '');
+      option.textContent = String(script.name || option.value);
+      option.selected = option.value === ui.selectedScriptId;
+      viewerScriptSelect.appendChild(option);
+    });
+    viewerScriptSelect.disabled = !accountId || ui.scripts.length === 0;
+    viewerScriptRunBtn.disabled = !accountId || !(ui.selectedScriptId && !ui.selectedScriptRunning);
+    viewerScriptStopBtn.disabled = !accountId || !(ui.selectedScriptId && ui.selectedScriptRunning);
+    if (!ui.scripts.length) loadViewerScripts();
+  }
+
+  function runViewerAccountScriptAction(action, scriptId, accountId) {
+    if (!scriptId || (action !== 'start' && action !== 'stop')) return;
+    var body = { id: scriptId };
+    if (action === 'start') body.accountId = String(accountId || '');
+    fetch('/api/scripts/' + action, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+      .then(function (response) { return response.json(); })
+      .then(function () { return fetch('/api/scripts'); })
+      .then(function (response) { return response.json(); })
+      .then(function (data) {
+        scriptsTabLastData = data || { scripts: [], dir: null };
+        renderViewerScriptControls();
+        renderViewerAccountPanel();
+      })
+      .catch(function () {});
+  }
+
+  function updateViewerAccountRuntimeFields() {
+    var accountId = String(viewerAccountSelect && viewerAccountSelect.value || '');
+    if (!accountId) return;
+    var client = connectedClients.get(accountId);
+    var session = headlessSessions.get(accountId);
+    var connectedAt = Number(client && client.connectedAt || session && session.connectedAt || 0);
+    var sessionUptime = document.getElementById('viewer-account-session-uptime');
+    if (sessionUptime && connectedAt > 0) {
+      sessionUptime.textContent = formatHomeDuration(Math.max(0, Date.now() - connectedAt));
+    }
+  }
+
+  function renderViewerAccountPanel() {
+    if (!viewerAccountPanel) return;
+    renderViewerScriptControls();
+    var accountId = String(viewerAccountSelect && viewerAccountSelect.value || '');
+    var client = connectedClients.get(accountId);
+    var session = headlessSessions.get(accountId);
+    if (!accountId || (!client && !session)) {
+      viewerAccountPanel.innerHTML = '<div class="viewer-account-empty">Select a connected account to view its character.</div>';
+      return;
+    }
+
+    var pd = client && (client.fullData || client) || {
+      name: session && (session.playerName || session.alias) || 'Connecting',
+      classType: lastViewerData && lastViewerData.player && lastViewerData.player.classType,
+      level: 1,
+      inventory: [],
+      backpack: [],
+      stars: 0,
+      fame: 0,
+      map: session && session.mapName,
+      server: session && session.serverName,
+    };
+    var classType = Number(pd.classType != null ? pd.classType : client && client.classType);
+    var className = Number.isFinite(classType) && CLASS_NAMES[classType]
+      ? CLASS_NAMES[classType]
+      : String(pd.class || 'Unknown');
+    var connectedAt = Number(client && client.connectedAt || session && session.connectedAt || 0);
+    var runtime = connectedAt > 0 ? formatHomeDuration(Math.max(0, Date.now() - connectedAt)) : '--';
+    var mapName = String(pd.mapName || pd.map || session && session.mapName || '--');
+    var serverName = String(pd.server || client && client.server || session && session.serverName || '--');
+    var hp = Number(client && client.hp != null ? client.hp : pd.hp);
+    var maxHp = Number(client && client.maxHp != null ? client.maxHp : pd.maxHp);
+    var mp = Number(pd.mana);
+    var maxMp = Number(pd.maxMana);
+    hp = Number.isFinite(hp) ? hp : 0;
+    maxHp = Number.isFinite(maxHp) && maxHp > 0 ? maxHp : 1;
+    mp = Number.isFinite(mp) ? mp : 0;
+    maxMp = Number.isFinite(maxMp) && maxMp > 0 ? maxMp : 1;
+    var hpPct = Math.min(100, Math.max(0, hp / maxHp * 100));
+    var mpPct = Math.min(100, Math.max(0, mp / maxMp * 100));
+    var position = pd.pos && Number.isFinite(Number(pd.pos.x)) && Number.isFinite(Number(pd.pos.y))
+      ? Math.round(Number(pd.pos.x)) + ', ' + Math.round(Number(pd.pos.y))
+      : '--';
+    var sessionUptime = pd.sessionUptimeMs != null && Number.isFinite(Number(pd.sessionUptimeMs))
+      ? formatHomeDuration(Number(pd.sessionUptimeMs))
+      : runtime;
+    var sessionFame = pd.sessionFameGained != null
+      ? Math.max(0, Number(pd.sessionFameGained || 0)).toLocaleString()
+      : '--';
+    var sessionFpm = pd.sessionAverageFpm != null
+      ? formatHomeFpm(Number(pd.sessionAverageFpm || 0))
+      : '--';
+    var developerStat = function (label, value) {
+      return '<div class="detail-row"><span>' + escapeHtml(label) + '</span><span>' + escapeHtml(String(value)) + '</span></div>';
+    };
+
+    viewerAccountPanel.innerHTML =
+      '<div class="mac-popout-header viewer-account-header">' +
+        '<div class="mac-popout-avatar" id="viewer-account-avatar" data-viewer-account-id="' + escapeHtml(accountId) + '"></div>' +
+        '<div class="mac-popout-title">' +
+          '<span class="mac-popout-name">' + escapeHtml(pd.name || 'Unknown') + '</span>' +
+          '<span class="mac-popout-class">Lv.' + escapeHtml(String(pd.level || 1)) + ' ' + escapeHtml(className) + '</span>' +
+        '</div>' +
+        '<span id="viewer-account-session-uptime" class="viewer-account-header-runtime">' + escapeHtml(sessionUptime) + '</span>' +
+      '</div>' +
+      '<div class="viewer-account-combat-stats">' +
+        '<div class="mac-popout-player-bars">' +
+          '<div class="stat-bar"><div class="bar-label">HP</div><div class="bar-track hp-track">' +
+            '<div class="bar-fill hp-fill" style="width:' + hpPct + '%"></div>' +
+            '<div class="bar-value bar-value-row"><div class="bar-value-center"><span>' + escapeHtml(hp + ' / ' + maxHp) + '</span><span class="bar-bonus">' + escapeHtml(buildGearExaltBonusSuffix(pd.healthBonus, pd.exaltedMaxHP)) + '</span></div>' +
+            '<div class="bar-value-right">' + escapeHtml(pd.hpRegenPerSec != null && pd.hpRegenPerSec !== '' ? pd.hpRegenPerSec + '/s' : '') + '</div></div>' +
+          '</div></div>' +
+          '<div class="stat-bar"><div class="bar-label">MP</div><div class="bar-track mp-track">' +
+            '<div class="bar-fill mp-fill" style="width:' + mpPct + '%"></div>' +
+            '<div class="bar-value bar-value-row"><div class="bar-value-center"><span>' + escapeHtml(mp + ' / ' + maxMp) + '</span><span class="bar-bonus">' + escapeHtml(buildGearExaltBonusSuffix(pd.manaBonus, pd.exaltedMaxMP)) + '</span></div>' +
+            '<div class="bar-value-right">' + escapeHtml(pd.mpRegenPerSec != null && pd.mpRegenPerSec !== '' ? pd.mpRegenPerSec + '/s' : '') + '</div></div>' +
+          '</div></div>' +
+        '</div>' +
+        '<div class="mac-popout-stats mac-popout-stats-grid">' +
+          '<div class="mini-stat"><span class="stat-icon">ATK</span><span class="stat-val">' + escapeHtml(formatPlayerStatLine(pd.attack, pd.attackBonus, pd.exaltedAttack)) + '</span></div>' +
+          '<div class="mini-stat"><span class="stat-icon">DEF</span><span class="stat-val">' + escapeHtml(formatPlayerStatLine(pd.defense, pd.defenseBonus, pd.exaltedDefense)) + '</span></div>' +
+          '<div class="mini-stat"><span class="stat-icon">SPD</span><span class="stat-val">' + escapeHtml(formatPlayerStatLine(pd.speed, pd.speedBonus, pd.exaltedSpeed)) + '</span></div>' +
+          '<div class="mini-stat"><span class="stat-icon">DEX</span><span class="stat-val">' + escapeHtml(formatPlayerStatLine(pd.dexterity, pd.dexterityBonus, pd.exaltedDexterity)) + '</span></div>' +
+          '<div class="mini-stat"><span class="stat-icon">VIT</span><span class="stat-val">' + escapeHtml(formatPlayerStatLine(pd.vitality, pd.vitalityBonus, pd.exaltedVitality)) + '</span></div>' +
+          '<div class="mini-stat"><span class="stat-icon">WIS</span><span class="stat-val">' + escapeHtml(formatPlayerStatLine(pd.wisdom, pd.wisdomBonus, pd.exaltedWisdom)) + '</span></div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="mac-popout-inventory-section">' +
+        '<div class="mac-popout-inventory-inner">' + buildMacPopoutLiveInventoryHtml(pd, '', false) + '</div>' +
+      '</div>' +
+      '<div class="mac-popout-details mac-popout-detail-grid viewer-account-details">' +
+        '<div class="detail-row"><span>' + escapeHtml(t('detail.stars')) + '</span><span>' + escapeHtml(formatNumber(pd.stars || 0)) + '</span></div>' +
+        '<div class="detail-row"><span>' + escapeHtml(t('detail.fame')) + '</span><span>' + escapeHtml(formatNumber(pd.fame || 0)) + '</span></div>' +
+        '<div class="detail-row"><span>' + escapeHtml(t('detail.map')) + '</span><span>' + escapeHtml(mapName) + '</span></div>' +
+        '<div class="detail-row"><span>' + escapeHtml(t('detail.server')) + '</span><span>' + escapeHtml(serverName) + '</span></div>' +
+      '</div>' +
+      '<div class="viewer-account-developer">' +
+        '<div class="mac-popout-details mac-popout-detail-grid mac-popout-details--dev">' +
+          developerStat(t('detail.level'), pd.level != null ? pd.level : '--') +
+          developerStat(t('detail.guild'), pd.guild || '--') +
+          developerStat(t('detail.gameid'), pd.gameId != null ? pd.gameId : '--') +
+          developerStat(t('detail.objectid'), pd.objectId != null ? pd.objectId : '--') +
+          developerStat(t('detail.objecttype'), macPopoutDetailObjectTypeStr(pd)) +
+          developerStat(t('detail.position'), position) +
+          developerStat(t('detail.questTargetId'), macPopoutDetailQuestTargetIdStr(pd)) +
+          developerStat(t('detail.questTargetType'), macPopoutDetailQuestTargetTypeStr(pd)) +
+          developerStat(t('detail.backpackTier'), sdkBackpackTierFromPlayerData(pd)) +
+          developerStat('Teleport allowed', pd.teleportAllowed === undefined ? '--' : pd.teleportAllowed ? 'yes' : 'no') +
+        '</div>' +
+        '<div class="detail-row viewer-account-conditions-row"><span>Conditions</span><span class="mac-popout-effects">' + macPopoutEffectsInnerHtml(pd) + '</span></div>' +
+        '<div class="mac-popout-session-kv">' +
+          developerStat('Session fame gained', sessionFame) +
+          developerStat('Session avg FPM', sessionFpm) +
+        '</div>' +
+      '</div>';
+
+    var avatar = document.getElementById('viewer-account-avatar');
+    if (avatar && Number.isFinite(classType) && classType > 0) {
+      avatar.style.backgroundImage = 'url(' + renderClassSprite(classType) + ')';
+      avatar.style.backgroundSize = 'contain';
+      avatar.style.backgroundRepeat = 'no-repeat';
+      avatar.style.backgroundPosition = 'center';
+      avatar.style.imageRendering = 'pixelated';
+      if (typeof window.renderEamPortrait === 'function') {
+        var skin = Number(pd.skin != null ? pd.skin : client && client.skin);
+        var tex1 = Number(pd.tex1 != null ? pd.tex1 : client && client.tex1);
+        var tex2 = Number(pd.tex2 != null ? pd.tex2 : client && client.tex2);
+        window.renderEamPortrait(
+          classType,
+          Number.isFinite(skin) && skin > 0 ? skin : classType,
+          Number.isFinite(tex1) ? tex1 : 0,
+          Number.isFinite(tex2) ? tex2 : 0
+        ).then(function (portraitUrl) {
+          var currentAvatar = document.getElementById('viewer-account-avatar');
+          if (!portraitUrl || !currentAvatar || currentAvatar.dataset.viewerAccountId !== accountId) return;
+          currentAvatar.style.backgroundImage = 'url(' + portraitUrl + ')';
+        }).catch(function () {});
+      }
+    }
+  }
+
+  function hideViewerHoverTooltip() {
+    if (viewerHoverTooltip) viewerHoverTooltip.hidden = true;
+  }
+
+  function viewerPointFromEvent(event) {
+    if (!viewerCanvas) return null;
+    var rect = viewerCanvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  }
+
+  function findViewerObjectHit(point) {
+    var hits = viewerHitState && viewerHitState.objects;
+    if (!point || !Array.isArray(hits)) return null;
+    for (var i = hits.length - 1; i >= 0; i--) {
+      var hit = hits[i];
+      if (point.x >= hit.left && point.x <= hit.left + hit.width &&
+          point.y >= hit.top && point.y <= hit.top + hit.height) return hit;
+      var dx = point.x - hit.x;
+      var dy = point.y - hit.y;
+      if (dx * dx + dy * dy <= hit.radius * hit.radius) return hit;
+    }
+    return null;
+  }
+
+  function findViewerTileHit(point) {
+    var state = viewerHitState;
+    if (!point || !state) return null;
+    var tileX = Math.floor(state.centerX + (point.x - state.screenCenterX) / state.tileSize);
+    var tileY = Math.floor(state.centerY + (point.y - state.screenCenterY) / state.tileSize);
+    return state.tiles.get(String(tileX) + ',' + String(tileY)) || null;
+  }
+
+  function positionViewerTileHighlight(element, tile) {
+    var state = viewerHitState;
+    if (!element || !state || !tile) {
+      if (element) element.hidden = true;
+      return;
+    }
+    var x = Number(tile.x);
+    var y = Number(tile.y);
+    var key = String(x) + ',' + String(y);
+    if (!Number.isFinite(x) || !Number.isFinite(y) ||
+        !state.tiles.has(key)) {
+      element.hidden = true;
+      return;
+    }
+    element.style.left = (state.screenCenterX + (x - state.centerX) * state.tileSize) + 'px';
+    element.style.top = (state.screenCenterY + (y - state.centerY) * state.tileSize) + 'px';
+    element.style.width = state.tileSize + 'px';
+    element.style.height = state.tileSize + 'px';
+    element.hidden = false;
+  }
+
+  function positionViewerObjectHighlight(element, hit) {
+    if (!element || !hit) {
+      if (element) element.hidden = true;
+      return;
+    }
+    var padding = 2;
+    var left = Number(hit.left);
+    var top = Number(hit.top);
+    var width = Number(hit.width);
+    var height = Number(hit.height);
+    if (![left, top, width, height].every(Number.isFinite) || width <= 0 || height <= 0) {
+      element.hidden = true;
+      return;
+    }
+    element.style.left = (left - padding) + 'px';
+    element.style.top = (top - padding) + 'px';
+    element.style.width = (width + padding * 2) + 'px';
+    element.style.height = (height + padding * 2) + 'px';
+    element.hidden = false;
+  }
+
+  function renderViewerHighlights() {
+    positionViewerTileHighlight(viewerHoverTileHighlight, viewerHoveredObject ? null : viewerHoveredTile);
+    positionViewerObjectHighlight(viewerHoverObjectHighlight, viewerHoveredObject);
+  }
+
+  function viewerTierLabel(tier) {
+    var value = String(tier || '').trim();
+    if (!value) return '';
+    return /^(?:UT|ST|T)/i.test(value) ? value : 'T' + value;
+  }
+
+  function showViewerHover(target, isTile, point) {
+    if (!viewerHoverTooltip || !viewerStage || !target || !point) return;
+    var category = isTile ? 'Tile' : String(target.category || 'Object');
+    var hp = Math.max(0, Number(target.hp) || 0);
+    var maxHp = Math.max(0, Number(target.maxHp) || 0);
+    var distance = viewerDistanceToPlayer(target, isTile);
+    var title = document.createElement('strong');
+    title.textContent = String(target.name || category);
+    var detail = document.createElement('span');
+    detail.textContent = category + '  |  Type ' + viewerTypeLabel(target.type) + '\n' +
+      (isTile
+        ? 'Position ' + Math.trunc(Number(target.x)) + ', ' + Math.trunc(Number(target.y))
+        : 'Object ' + String(target.objectId) + '  |  ' + Number(target.x).toFixed(2) + ', ' + Number(target.y).toFixed(2)) +
+      (maxHp > 0 ? '\nHP ' + hp + ' / ' + maxHp : '') +
+      (distance === null ? '' : '\nDistance ' + distance.toFixed(2) + ' tiles');
+    var children = [title, detail];
+    if (!isTile && category === 'Container') {
+      var contents = Array.isArray(target.contents) ? target.contents : [];
+      var contentsWrap = document.createElement('div');
+      contentsWrap.className = 'viewer-tooltip-contents';
+      var heading = document.createElement('span');
+      heading.className = 'viewer-tooltip-contents-title';
+      heading.textContent = 'Contents  ' + contents.length + (contents.length === 1 ? ' item' : ' items');
+      contentsWrap.appendChild(heading);
+      if (!contents.length) {
+        var empty = document.createElement('span');
+        empty.className = 'viewer-tooltip-content-row viewer-tooltip-content-empty';
+        empty.textContent = 'Empty';
+        contentsWrap.appendChild(empty);
+      } else {
+        contents.forEach(function (item) {
+          var row = document.createElement('span');
+          row.className = 'viewer-tooltip-content-row';
+          var tier = viewerTierLabel(item.tier);
+          row.textContent = (Number(item.slotIndex) + 1) + '. ' + String(item.name || viewerTypeLabel(item.objectType)) + (tier ? '  ' + tier : '');
+          contentsWrap.appendChild(row);
+        });
+      }
+      children.push(contentsWrap);
+    }
+    viewerHoverTooltip.replaceChildren.apply(viewerHoverTooltip, children);
+    viewerHoverTooltip.hidden = false;
+    var left = Math.min(point.x + 14, viewerStage.clientWidth - viewerHoverTooltip.offsetWidth - 8);
+    var top = Math.min(point.y + 14, viewerStage.clientHeight - viewerHoverTooltip.offsetHeight - 8);
+    viewerHoverTooltip.style.left = Math.max(8, left) + 'px';
+    viewerHoverTooltip.style.top = Math.max(8, top) + 'px';
+  }
+
+  function viewerTrackPosition(track, now) {
+    if (!track) return { x: 0, y: 0 };
+    if (!viewerSettings.interpolation || track.endAt <= track.startAt || now >= track.endAt) {
+      return { x: track.targetX, y: track.targetY };
+    }
+    var progress = Math.max(0, Math.min(1, (now - track.startAt) / (track.endAt - track.startAt)));
+    return {
+      x: track.fromX + (track.targetX - track.fromX) * progress,
+      y: track.fromY + (track.targetY - track.fromY) * progress
+    };
+  }
+
+  function updateViewerTrack(track, data, now, duration, tickId) {
+    var targetX = Number(data && data.x);
+    var targetY = Number(data && data.y);
+    if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) return track;
+    var current = track ? viewerTrackPosition(track, now) : { x: targetX, y: targetY };
+    var teleport = !track || Math.hypot(targetX - current.x, targetY - current.y) > 4;
+    var renderData = Object.assign({}, data, teleport ? { x: targetX, y: targetY } : current);
+    return {
+      fromX: teleport ? targetX : current.x,
+      fromY: teleport ? targetY : current.y,
+      targetX: targetX,
+      targetY: targetY,
+      startAt: now,
+      endAt: teleport || !viewerSettings.interpolation ? now : now + duration,
+      tickId: tickId,
+      data: renderData
+    };
+  }
+
+  function updateViewerRenderPositions(now) {
+    if (viewerPlayerTrack) {
+      var playerPosition = viewerTrackPosition(viewerPlayerTrack, now);
+      viewerPlayerTrack.data.x = playerPosition.x;
+      viewerPlayerTrack.data.y = playerPosition.y;
+    }
+    viewerObjectTracks.forEach(function (track) {
+      var position = viewerTrackPosition(track, now);
+      track.data.x = position.x;
+      track.data.y = position.y;
+    });
+    if (lastViewerData && viewerPlayerTrack) {
+      lastViewerData.player = viewerPlayerTrack.data;
+      lastViewerData.center = { x: viewerPlayerTrack.data.x, y: viewerPlayerTrack.data.y };
+      lastViewerData.objects = Array.from(viewerObjectTracks.values(), function (track) { return track.data; });
+    }
+  }
+
+  function resetViewerMotionState() {
+    viewerPlayerTrack = null;
+    viewerObjectTracks.clear();
+    viewerTileCache.clear();
+    viewerTileLayer = null;
+    viewerTileImages.clear();
+    viewerObjectImages.clear();
+    viewerSelfProjectileImages.clear();
+    viewerOtherProjectileImages.clear();
+    viewerSelfImages.clear();
+    viewerGameClock = null;
+    viewerLastTickId = -1;
+  }
+
+  function applyViewerSnapshot(msg) {
+    var now = performance.now();
+    var accountId = String(msg && msg.accountId || '');
+    var mapName = String(msg && msg.mapName || '');
+    var changedWorld = accountId !== viewerLastAccountId || mapName !== viewerLastMapName;
+    if (changedWorld) resetViewerMotionState();
+    viewerLastAccountId = accountId;
+    viewerLastMapName = mapName;
+
+    if (msg.tilesReset || !viewerSettings.loadTiles) {
+      viewerTileCache.clear();
+      viewerTileLayer = null;
+    }
+    if (viewerSettings.loadTiles && Array.isArray(msg.tiles)) {
+      if (msg.tiles.length) viewerTileLayer = null;
+      msg.tiles.forEach(function (tile) {
+        viewerTileCache.set(String(Number(tile.x)) + ',' + String(Number(tile.y)), tile);
+      });
+      var center = msg.center || msg.player || { x: 0, y: 0 };
+      var retentionRadius = Math.max(6, Number(msg.radius) || 15) + 3;
+      viewerTileCache.forEach(function (tile, key) {
+        if (Math.abs(Number(tile.x) - Number(center.x)) > retentionRadius ||
+            Math.abs(Number(tile.y) - Number(center.y)) > retentionRadius) {
+          viewerTileCache.delete(key);
+          viewerTileLayer = null;
+        }
+      });
+    }
+
+    var tickId = Number(msg.tickId);
+    var tickDuration = Number(msg.tickTimeMs);
+    tickDuration = Number.isFinite(tickDuration) ? Math.max(16, Math.min(1000, tickDuration)) : 200;
+    var msSinceTick = Number(msg.msSinceTick);
+    if (Number.isFinite(msSinceTick) && msSinceTick >= 0) {
+      tickDuration = Math.max(16, tickDuration - Math.min(tickDuration, msSinceTick));
+    }
+    if (viewerSettings.loadObjects && Array.isArray(msg.objects)) {
+      var seen = new Set();
+      msg.objects.forEach(function (object) {
+        var key = String(object.objectId);
+        seen.add(key);
+        viewerObjectTracks.set(key, updateViewerTrack(viewerObjectTracks.get(key), object, now, tickDuration, tickId));
+      });
+      viewerObjectTracks.forEach(function (_track, key) {
+        if (!seen.has(key)) viewerObjectTracks.delete(key);
+      });
+    } else if (!viewerSettings.loadObjects) {
+      viewerObjectTracks.clear();
+    }
+    if (msg.player) viewerPlayerTrack = updateViewerTrack(viewerPlayerTrack, msg.player, now, tickDuration, tickId);
+
+    if (Number.isFinite(Number(msg.gameTime))) {
+      viewerGameClock = { gameTime: Number(msg.gameTime), receivedAt: now };
+    }
+    viewerLastTickId = Number.isFinite(tickId) ? tickId : viewerLastTickId;
+    var previousProjectiles = lastViewerData && Array.isArray(lastViewerData.projectiles)
+      ? lastViewerData.projectiles
+      : [];
+    lastViewerData = Object.assign({}, lastViewerData || {}, msg, {
+      tiles: viewerSettings.loadTiles ? Array.from(viewerTileCache.values()) : [],
+      objects: viewerSettings.loadObjects
+        ? Array.from(viewerObjectTracks.values(), function (track) { return track.data; })
+        : [],
+      projectiles: Array.isArray(msg.projectiles) ? msg.projectiles : previousProjectiles,
+      player: viewerPlayerTrack ? viewerPlayerTrack.data : null
+    });
+    if (!viewerSettings.selfProjectiles && !viewerSettings.otherProjectiles) lastViewerData.projectiles = [];
+    updateViewerRenderPositions(now);
+    if (activeTab === 'viewer') {
+      renderViewer(now);
+      ensureViewerAnimation();
+    }
+  }
+
+  function viewerEstimatedGameTime(now) {
+    return viewerGameClock ? viewerGameClock.gameTime + Math.max(0, now - viewerGameClock.receivedAt) : 0;
+  }
+
+  function viewerProjectilePosition(projectile, gameTime) {
+    var elapsed = gameTime - Number(projectile.startTime);
+    var lifetime = Math.max(1, Number(projectile.lifetimeMs) || 1);
+    var trajectoryLifetime = Math.max(1, Number(projectile.trajectoryLifetimeMs) || lifetime);
+    var speed = Number(projectile.speed) || 0;
+    var baseSpeed = speed / 10000;
+    var acceleration = Number(projectile.acceleration) || 0;
+    var accelerationDelay = Number(projectile.accelerationDelay) || 0;
+    var speedClamp = Number.isFinite(Number(projectile.speedClamp)) ? Number(projectile.speedClamp) : -1;
+    var distance;
+    if (acceleration === 0 || elapsed < accelerationDelay) {
+      distance = elapsed * baseSpeed;
+    } else {
+      var accelerationElapsed = elapsed - accelerationDelay;
+      var accelerationTime = lifetime - accelerationDelay;
+      var clampedTime = 0;
+      var clampedSpeed = 0;
+      if (speedClamp !== -1) {
+        clampedSpeed = speedClamp / 10000;
+        var speedNeeded = Math.abs(speedClamp - speed);
+        var timeToClamp = speedNeeded / Math.abs(acceleration) * 1000;
+        accelerationTime = Math.min(accelerationElapsed, timeToClamp);
+        clampedTime = Math.max(0, accelerationElapsed - accelerationTime);
+      }
+      distance = accelerationDelay * baseSpeed
+        + accelerationTime * baseSpeed
+        + (accelerationTime * accelerationTime / 1000) * 0.5 * (acceleration / 10000)
+        + clampedTime * clampedSpeed;
+    }
+    var angle = Number(projectile.angle) || 0;
+    var phase = Number(projectile.bulletId) % 2 === 0 ? 0 : Math.PI;
+    var x = Number(projectile.startX) || 0;
+    var y = Number(projectile.startY) || 0;
+    if (projectile.wavy) {
+      var waveAngle = angle + Math.PI / 64 * Math.sin(phase + 6 * Math.PI * elapsed / 1000);
+      x += distance * Math.cos(waveAngle);
+      y += distance * Math.sin(waveAngle);
+    } else if (projectile.parametric) {
+      var t = elapsed / trajectoryLifetime * 2 * Math.PI;
+      var localX = Math.sin(t) * (Number(projectile.bulletId) % 2 ? 1 : -1);
+      var localY = Math.sin(2 * t) * (Number(projectile.bulletId) % 4 < 2 ? 1 : -1);
+      var magnitude = Number(projectile.magnitude) || 0;
+      x += (localX * Math.cos(angle) - localY * Math.sin(angle)) * magnitude;
+      y += (localX * Math.sin(angle) + localY * Math.cos(angle)) * magnitude;
+    } else {
+      if (projectile.boomerang) {
+        var halfway = trajectoryLifetime * baseSpeed * 0.5;
+        if (distance > halfway) distance = halfway - (distance - halfway);
+      }
+      x += distance * Math.cos(angle);
+      y += distance * Math.sin(angle);
+      var amplitude = Number(projectile.amplitude) || 0;
+      if (amplitude !== 0) {
+        var deflection = amplitude * Math.sin(
+          phase + elapsed / trajectoryLifetime * (Number(projectile.frequency) || 0) * 2 * Math.PI
+        );
+        x += deflection * Math.cos(angle + Math.PI / 2);
+        y += deflection * Math.sin(angle + Math.PI / 2);
+      }
+    }
+    return { x: x, y: y };
+  }
+
+  function viewerHasActiveProjectiles(now) {
+    var projectiles = lastViewerData && Array.isArray(lastViewerData.projectiles) ? lastViewerData.projectiles : [];
+    var gameTime = viewerEstimatedGameTime(now);
+    return projectiles.some(function (projectile) {
+      var elapsed = gameTime - Number(projectile.startTime);
+      return elapsed >= 0 && elapsed <= Number(projectile.lifetimeMs);
+    });
+  }
+
+  function viewerTrackNeedsAnimation(track, now) {
+    return !!track && viewerSettings.interpolation && now < track.endAt &&
+      (Math.abs(track.targetX - track.fromX) > 0.0001 || Math.abs(track.targetY - track.fromY) > 0.0001);
+  }
+
+  function viewerNeedsAnimation(now) {
+    if (viewerTrackNeedsAnimation(viewerPlayerTrack, now) || viewerHasActiveProjectiles(now)) return true;
+    var moving = false;
+    viewerObjectTracks.forEach(function (track) {
+      if (viewerTrackNeedsAnimation(track, now)) moving = true;
+    });
+    return moving;
+  }
+
+  function ensureViewerAnimation() {
+    if (activeTab !== 'viewer' || viewerAnimationFrame !== null || !lastViewerData) return;
+    viewerAnimationFrame = requestAnimationFrame(viewerAnimationLoop);
+  }
+
+  function stopViewerAnimation() {
+    if (viewerAnimationFrame !== null) cancelAnimationFrame(viewerAnimationFrame);
+    viewerAnimationFrame = null;
+    viewerLastAnimationAt = 0;
+  }
+
+  function viewerAnimationLoop(now) {
+    viewerAnimationFrame = null;
+    if (activeTab !== 'viewer' || !lastViewerData) return;
+    var frameInterval = 1000 / Math.max(1, Number(viewerSettings.frameRate) || 30);
+    if (!viewerLastAnimationAt || now - viewerLastAnimationAt >= frameInterval - 1) {
+      updateViewerRenderPositions(now);
+      renderViewer(now);
+      viewerLastAnimationAt = now;
+    }
+    if (viewerNeedsAnimation(now)) viewerAnimationFrame = requestAnimationFrame(viewerAnimationLoop);
+  }
+
+  function buildViewerTileLayer(width, height, dpr, tileSize, centerX, centerY, radius) {
+    var canvas = document.createElement('canvas');
+    var padding = tileSize * 2;
+    canvas.width = Math.floor((width + padding * 2) * dpr);
+    canvas.height = Math.floor((height + padding * 2) * dpr);
+    var ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    var screenCenterX = padding + width / 2;
+    var screenCenterY = padding + height / 2;
+    viewerTileCache.forEach(function (tile) {
+      if (Math.abs(Number(tile.x) - centerX) > radius + 2 || Math.abs(Number(tile.y) - centerY) > radius + 2) return;
+      var x = screenCenterX + (Number(tile.x) - centerX) * tileSize;
+      var y = screenCenterY + (Number(tile.y) - centerY) * tileSize;
+      ctx.fillStyle = viewerTileColor(tile.type);
+      ctx.fillRect(x, y, tileSize, tileSize);
+      var image = getViewerTileImage(tile);
+      if (image && image.loaded && !image.failed) ctx.drawImage(image.img, x, y, tileSize, tileSize);
+    });
+    return {
+      canvas: canvas,
+      width: width,
+      height: height,
+      dpr: dpr,
+      tileSize: tileSize,
+      centerX: centerX,
+      centerY: centerY,
+      radius: radius,
+      padding: padding
+    };
+  }
+
+  function drawViewerObject(ctx, object, centerX, centerY, screenCenterX, screenCenterY, tileSize, isSelf) {
+    var x = screenCenterX + (Number(object.x) - centerX) * tileSize;
+    var y = screenCenterY + (Number(object.y) - centerY) * tileSize;
+    var category = String(object.category || 'Other');
+    var size = Number(object.size);
+    if (!Number.isFinite(size)) size = 100;
+    if (size <= 0) return null;
+    var image = isSelf ? getViewerSelfImage(object) : getViewerObjectImage(object);
+    if (category === 'Player' && (!image || image.failed)) image = getViewerPlayerImage(object.classType);
+    var drawnWidth = tileSize * Math.max(0.1, size / 100);
+    var drawnHeight = drawnWidth;
+    var objectLeft = x - drawnWidth / 2;
+    var objectTop = y - drawnHeight;
+
+    if (isSelf) {
+      ctx.fillStyle = 'rgba(34,197,94,0.24)';
+      ctx.beginPath();
+      ctx.arc(x, y, Math.max(8, tileSize * 0.55), 0, Math.PI * 2);
+      ctx.fill();
+    }
     if (image && image.loaded && !image.failed) {
       var naturalWidth = Math.max(1, Number(image.img.naturalWidth) || 8);
       var naturalHeight = Math.max(1, Number(image.img.naturalHeight) || 8);
-      var scale = Math.max(1, Math.min(2.4, Math.max(naturalWidth, naturalHeight) / 8));
-      var maxSize = tileSize * scale;
-      var ratio = naturalWidth / naturalHeight;
-      if (ratio >= 1) {
-        drawnWidth = maxSize;
-        drawnHeight = maxSize / ratio;
-      } else {
-        drawnHeight = maxSize;
-        drawnWidth = maxSize * ratio;
-      }
-      ctx.drawImage(image.img, Math.round(x - drawnWidth / 2), Math.round(y - drawnHeight * 0.72), drawnWidth, drawnHeight);
+      var renderSize = naturalHeight === 64 ? 25 : size;
+      drawnWidth = naturalWidth / 8 * tileSize * (renderSize / 100);
+      drawnHeight = naturalHeight / 8 * tileSize * (renderSize / 100);
+      objectLeft = x - drawnWidth / 2;
+      objectTop = y - drawnHeight;
+      ctx.drawImage(image.img, Math.round(objectLeft), Math.round(objectTop), drawnWidth, drawnHeight);
     } else {
-      ctx.fillStyle = viewerObjectColor(category);
+      var fallbackRadius = Math.max(3, drawnWidth * 0.28);
+      objectLeft = x - fallbackRadius;
+      objectTop = y - fallbackRadius * 2;
+      drawnWidth = fallbackRadius * 2;
+      drawnHeight = fallbackRadius * 2;
+      ctx.fillStyle = isSelf ? '#35c66b' : viewerObjectColor(category);
       ctx.strokeStyle = 'rgba(0,0,0,0.75)';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
-      ctx.arc(x, y, Math.max(3, tileSize * 0.28), 0, Math.PI * 2);
+      ctx.arc(x, y - fallbackRadius, fallbackRadius, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
     }
 
-    var important = category === 'Player' || category === 'Enemy' || category === 'Portal' || category === 'Pet' || category === 'Container' || category === 'Beacon';
+    if (category === 'Container') {
+      ctx.strokeStyle = object.isLoot ? '#f7c948' : '#d69a45';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(objectLeft - 2, objectTop - 2, drawnWidth + 4, drawnHeight + 4);
+    }
+
+    var important = isSelf || category === 'Player' || category === 'Enemy' || category === 'Portal' || category === 'Pet' || category === 'Container' || category === 'Beacon';
     if (important) {
-      ctx.font = '600 10px system-ui, sans-serif';
+      ctx.font = (isSelf ? '600 12px' : '600 10px') + ' system-ui, sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'bottom';
       ctx.fillStyle = '#f4f7fb';
       ctx.shadowColor = '#000';
       ctx.shadowBlur = 3;
-      ctx.fillText(String(object.name || category), x, y - drawnHeight * 0.72 - 2);
+      ctx.fillText(String(object.name || category), x, objectTop - 2);
       ctx.shadowBlur = 0;
     }
 
     var hp = Math.max(0, Number(object.hp) || 0);
     var maxHp = Math.max(0, Number(object.maxHp) || 0);
     if ((category === 'Player' || category === 'Enemy') && maxHp > 0) {
-      var barWidth = Math.max(18, tileSize * 1.2);
-      var barY = y + Math.max(3, drawnHeight * 0.28);
-      ctx.fillStyle = 'rgba(0,0,0,0.75)';
-      ctx.fillRect(x - barWidth / 2, barY, barWidth, 3);
-      ctx.fillStyle = category === 'Enemy' ? '#ef5a62' : '#4aa3ff';
-      ctx.fillRect(x - barWidth / 2, barY, barWidth * Math.min(1, hp / maxHp), 3);
+      var barWidth = isSelf ? Math.max(30, tileSize * 2.2) : Math.max(18, tileSize * 1.2);
+      var barHeight = isSelf ? 5 : 3;
+      var barY = y + 5;
+      ctx.fillStyle = 'rgba(0,0,0,0.78)';
+      ctx.fillRect(x - barWidth / 2, barY, barWidth, barHeight);
+      ctx.fillStyle = isSelf ? '#35c66b' : category === 'Enemy' ? '#ef5a62' : '#4aa3ff';
+      ctx.fillRect(x - barWidth / 2, barY, barWidth * Math.min(1, hp / maxHp), barHeight);
     }
+    return {
+      data: object,
+      x: x,
+      y: objectTop + drawnHeight / 2,
+      left: objectLeft,
+      top: objectTop,
+      width: drawnWidth,
+      height: drawnHeight,
+      radius: Math.max(8, Math.min(40, Math.max(drawnWidth, drawnHeight) * 0.58))
+    };
   }
 
-  function renderViewer() {
+  function drawViewerProjectile(ctx, projectile, gameTime, centerX, centerY, screenCenterX, screenCenterY, tileSize, width, height) {
+    var elapsed = gameTime - Number(projectile.startTime);
+    if (elapsed < 0 || elapsed > Number(projectile.lifetimeMs)) return false;
+    var position = viewerProjectilePosition(projectile, gameTime);
+    var x = screenCenterX + (position.x - centerX) * tileSize;
+    var y = screenCenterY + (position.y - centerY) * tileSize;
+    if (x < -tileSize * 2 || y < -tileSize * 2 || x > width + tileSize * 2 || y > height + tileSize * 2) return true;
+    var size = Number(projectile.size);
+    if (!Number.isFinite(size)) size = 100;
+    if (size <= 0) return true;
+    var drawSize = tileSize * size / 100;
+    var image = getViewerProjectileImage(projectile);
+    if (image && image.loaded && !image.failed) {
+      var drawAngle = Number(projectile.angle) || 0;
+      if (projectile.faceDir) {
+        var next = viewerProjectilePosition(projectile, Math.min(gameTime + 8, Number(projectile.startTime) + Number(projectile.lifetimeMs)));
+        drawAngle = Math.atan2(next.y - position.y, next.x - position.x);
+      }
+      drawAngle = projectile.noRotation ? 0 : drawAngle;
+      drawAngle += Number(projectile.angleCorrection) || 0;
+      if (!projectile.noRotation && Number(projectile.rotation)) drawAngle += gameTime / Number(projectile.rotation);
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(drawAngle);
+      ctx.drawImage(image.img, -drawSize / 2, -drawSize / 2, drawSize, drawSize);
+      ctx.restore();
+    } else {
+      ctx.fillStyle = projectile.side === 'own' ? '#65d7ff' : projectile.side === 'enemy' ? '#ff5964' : '#f7c948';
+      ctx.beginPath();
+      ctx.arc(x, y, Math.max(2, drawSize * 0.22), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    return true;
+  }
+
+  function renderViewer(now) {
     if (!viewerCanvas || !viewerStage || !viewerEmpty) return;
+    now = Number.isFinite(Number(now)) ? Number(now) : performance.now();
+    updateViewerRenderPositions(now);
     var data = lastViewerData;
     var player = data && data.player;
     if (!data || !player) {
+      viewerHitState = null;
+      viewerHoveredTile = null;
+      viewerHoveredObject = null;
+      renderViewerHighlights();
+      hideViewerHoverTooltip();
       viewerCanvas.style.display = 'none';
       viewerEmpty.style.display = 'flex';
       if (viewerStatus) viewerStatus.textContent = 'Waiting for a connected account';
@@ -10336,6 +10816,7 @@
     if (viewerCanvas.width !== pixelWidth || viewerCanvas.height !== pixelHeight) {
       viewerCanvas.width = pixelWidth;
       viewerCanvas.height = pixelHeight;
+      viewerTileLayer = null;
     }
     var ctx = viewerCanvas.getContext('2d');
     if (!ctx) return;
@@ -10347,67 +10828,74 @@
     var radius = Math.max(6, Number(data.radius) || 15);
     var count = radius * 2 + 1;
     var tileSize = Math.max(8, Math.min(36, Math.floor(Math.min(width / count, height / count))));
-    var fieldWidth = count * tileSize;
-    var fieldHeight = count * tileSize;
-    var originX = Math.floor((width - fieldWidth) / 2);
-    var originY = Math.floor((height - fieldHeight) / 2);
     var centerX = Number(data.center && data.center.x) || Number(player.x) || 0;
     var centerY = Number(data.center && data.center.y) || Number(player.y) || 0;
-    var minX = Math.floor(centerX) - radius;
-    var minY = Math.floor(centerY) - radius;
-
-    (Array.isArray(data.tiles) ? data.tiles : []).forEach(function (tile) {
-      var tx = Number(tile.x) - minX;
-      var ty = Number(tile.y) - minY;
-      if (tx < 0 || ty < 0 || tx >= count || ty >= count) return;
-      var x = originX + tx * tileSize;
-      var y = originY + ty * tileSize;
-      ctx.fillStyle = viewerTileColor(tile.type);
-      ctx.fillRect(x, y, tileSize, tileSize);
-      var image = getViewerTileImage(tile);
-      if (image && image.loaded && !image.failed) ctx.drawImage(image.img, x, y, tileSize, tileSize);
-    });
+    var screenCenterX = width / 2;
+    var screenCenterY = height / 2;
+    var viewerTileLookup = viewerSettings.loadTiles ? viewerTileCache : new Map();
+    if (viewerSettings.loadTiles) {
+      var layerNeedsRebuild = !viewerTileLayer
+        || viewerTileLayer.width !== width
+        || viewerTileLayer.height !== height
+        || viewerTileLayer.dpr !== dpr
+        || viewerTileLayer.tileSize !== tileSize
+        || viewerTileLayer.radius !== radius
+        || Math.abs(viewerTileLayer.centerX - centerX) >= 1
+        || Math.abs(viewerTileLayer.centerY - centerY) >= 1;
+      if (layerNeedsRebuild) viewerTileLayer = buildViewerTileLayer(width, height, dpr, tileSize, centerX, centerY, radius);
+      if (viewerTileLayer) {
+        var layerOffsetX = (viewerTileLayer.centerX - centerX) * tileSize;
+        var layerOffsetY = (viewerTileLayer.centerY - centerY) * tileSize;
+        var layerPadding = viewerTileLayer.padding;
+        ctx.drawImage(
+          viewerTileLayer.canvas,
+          layerOffsetX - layerPadding,
+          layerOffsetY - layerPadding,
+          width + layerPadding * 2,
+          height + layerPadding * 2
+        );
+      }
+    }
 
     var viewerObjects = Array.isArray(data.objects) ? data.objects.slice() : [];
+    var viewerObjectHits = [];
     viewerObjects.sort(function (a, b) {
       return (Number(a.y) - Number(b.y)) || (Number(a.x) - Number(b.x));
     });
     viewerObjects.forEach(function (object) {
-      drawViewerObject(ctx, object, minX, minY, originX, originY, tileSize);
+      var hit = drawViewerObject(ctx, object, centerX, centerY, screenCenterX, screenCenterY, tileSize, false);
+      if (hit) viewerObjectHits.push(hit);
     });
 
-    var px = originX + (Number(player.x) - minX) * tileSize;
-    var py = originY + (Number(player.y) - minY) * tileSize;
-    var spriteSize = Math.max(18, Math.round(tileSize * 1.35));
-    var playerImage = getViewerTileImage(player);
-    if (!playerImage || playerImage.failed) playerImage = getViewerPlayerImage(player.classType);
-    ctx.fillStyle = 'rgba(34,197,94,0.24)';
-    ctx.beginPath();
-    ctx.arc(px, py, Math.max(8, tileSize * 0.55), 0, Math.PI * 2);
-    ctx.fill();
-    if (playerImage.loaded) {
-      ctx.drawImage(playerImage.img, Math.round(px - spriteSize / 2), Math.round(py - spriteSize / 2), spriteSize, spriteSize);
-    }
+    var gameTime = viewerEstimatedGameTime(now);
+    var visibleProjectileCount = 0;
+    (Array.isArray(data.projectiles) ? data.projectiles : []).forEach(function (projectile) {
+      if (projectile.side === 'own' ? !viewerSettings.selfProjectiles : !viewerSettings.otherProjectiles) return;
+      if (drawViewerProjectile(ctx, projectile, gameTime, centerX, centerY, screenCenterX, screenCenterY, tileSize, width, height)) {
+        visibleProjectileCount++;
+      }
+    });
 
-    var hp = Math.max(0, Number(player.hp) || 0);
-    var maxHp = Math.max(0, Number(player.maxHp) || 0);
-    var barWidth = Math.max(30, tileSize * 2.2);
-    var barY = py + spriteSize / 2 + 5;
-    ctx.fillStyle = 'rgba(0,0,0,0.78)';
-    ctx.fillRect(px - barWidth / 2, barY, barWidth, 5);
-    ctx.fillStyle = '#35c66b';
-    ctx.fillRect(px - barWidth / 2, barY, barWidth * (maxHp > 0 ? Math.min(1, hp / maxHp) : 0), 5);
-    ctx.font = '600 12px system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'bottom';
-    ctx.fillStyle = '#f4f7fb';
-    ctx.shadowColor = '#000';
-    ctx.shadowBlur = 3;
-    ctx.fillText(String(player.name || 'Player'), px, py - spriteSize / 2 - 4);
-    ctx.shadowBlur = 0;
+    var playerTarget = viewerPlayerTarget(data);
+    if (playerTarget) {
+      var playerHit = drawViewerObject(ctx, playerTarget, centerX, centerY, screenCenterX, screenCenterY, tileSize, true);
+      if (playerHit) viewerObjectHits.push(playerHit);
+    }
+    viewerHitState = {
+      tileSize: tileSize,
+      centerX: centerX,
+      centerY: centerY,
+      screenCenterX: screenCenterX,
+      screenCenterY: screenCenterY,
+      tiles: viewerTileLookup,
+      objects: viewerObjectHits
+    };
+    viewerHoveredObject = viewerHoverPoint ? findViewerObjectHit(viewerHoverPoint) : null;
+    viewerHoveredTile = viewerHoverPoint && !viewerHoveredObject ? findViewerTileHit(viewerHoverPoint) : null;
+    renderViewerHighlights();
 
     if (viewerStatus) {
-      viewerStatus.textContent = String(data.mapName || 'Unknown') + '  |  ' + Number(player.x).toFixed(2) + ', ' + Number(player.y).toFixed(2) + '  |  ' + (data.tiles || []).length + ' tiles  |  ' + viewerObjects.length + ' objects';
+      viewerStatus.textContent = String(data.mapName || 'Unknown') + '  |  ' + Number(player.x).toFixed(2) + ', ' + Number(player.y).toFixed(2) + '  |  ' + viewerTileCache.size + ' tiles  |  ' + viewerObjects.length + ' objects  |  ' + visibleProjectileCount + ' projectiles';
     }
   }
 
@@ -10415,6 +10903,30 @@
     new ResizeObserver(function () {
       if (activeTab === 'viewer') renderViewer();
     }).observe(viewerStage);
+  }
+
+  if (viewerCanvas) {
+    viewerCanvas.addEventListener('pointermove', function (event) {
+      var point = viewerPointFromEvent(event);
+      var hit = findViewerObjectHit(point);
+      var tile = findViewerTileHit(point);
+      viewerHoverPoint = point;
+      viewerHoveredObject = hit;
+      viewerHoveredTile = hit ? null : tile;
+      renderViewerHighlights();
+      viewerCanvas.style.cursor = hit || tile ? 'help' : 'default';
+      if (hit) showViewerHover(hit.data, false, point);
+      else if (tile) showViewerHover(tile, true, point);
+      else hideViewerHoverTooltip();
+    });
+    viewerCanvas.addEventListener('pointerleave', function () {
+      viewerHoverPoint = null;
+      viewerHoveredTile = null;
+      viewerHoveredObject = null;
+      renderViewerHighlights();
+      viewerCanvas.style.cursor = 'default';
+      hideViewerHoverTooltip();
+    });
   }
 
   // One-time expand/collapse delegation on the tree container
@@ -12478,32 +12990,71 @@
     }
   }
 
-  function requestViewer() {
+  function viewerLiveRequested() {
+    return activeTab === 'viewer' && !!(viewerAutoRefreshCheck && viewerAutoRefreshCheck.checked);
+  }
+
+  function requestViewer(subscribe) {
     if (ws && ws.readyState === 1) {
+      var shouldSubscribe = subscribe === undefined ? viewerLiveRequested() : !!subscribe;
       ws.send(JSON.stringify({
         type: 'requestViewer',
         accountId: viewerAccountSelect && viewerAccountSelect.value || null,
         radius: 15,
+        subscribe: shouldSubscribe,
+        includeTiles: viewerSettings.loadTiles,
+        includeObjects: viewerSettings.loadObjects,
+        includeSelfProjectiles: viewerSettings.selfProjectiles,
+        includeOtherProjectiles: viewerSettings.otherProjectiles,
       }));
     }
   }
 
+  function refreshViewerSubscription() {
+    if (activeTab === 'viewer') requestViewer();
+  }
+
   function stopViewerPolling() {
-    if (viewerPollTimer) {
-      clearInterval(viewerPollTimer);
-      viewerPollTimer = null;
+    stopViewerAnimation();
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'unsubscribeViewer' }));
     }
+    lastViewerData = null;
+    resetViewerMotionState();
+    viewerLastAccountId = '';
+    viewerLastMapName = '';
+    viewerHoverPoint = null;
+    viewerHoveredTile = null;
+    viewerHoveredObject = null;
+    renderViewerHighlights();
+    hideViewerHoverTooltip();
+    renderViewer();
   }
 
   function startViewerPolling() {
     stopViewerPolling();
+    loadViewerScripts();
+    renderViewerScriptControls();
+    renderViewerAccountPanel();
     requestViewer();
-    viewerPollTimer = setInterval(requestViewer, 750);
+    ensureViewerAnimation();
   }
 
   function selectViewerAccount() {
     lastViewerData = null;
+    resetViewerMotionState();
+    viewerLastAccountId = '';
+    viewerLastMapName = '';
+    viewerHitState = null;
+    viewerHoverPoint = null;
+    viewerHoveredTile = null;
+    viewerHoveredObject = null;
+    renderViewerHighlights();
+    hideViewerHoverTooltip();
     renderViewer();
+    renderViewerScriptControls();
+    renderViewerAccountPanel();
+    refreshViewerScriptGuiButton();
     requestViewer();
   }
 
@@ -12526,7 +13077,37 @@
   if (damageRefreshBtn) damageRefreshBtn.addEventListener('click', requestHeadlessDamage);
   if (damageAccountSelect) damageAccountSelect.addEventListener('change', selectDamageAccount);
   if (viewerRefreshBtn) viewerRefreshBtn.addEventListener('click', requestViewer);
+  if (viewerScriptSelect) viewerScriptSelect.addEventListener('change', function () {
+    var accountId = String(viewerAccountSelect && viewerAccountSelect.value || '');
+    setMacScriptSelection(accountId, String(viewerScriptSelect.value || ''));
+    renderViewerScriptControls();
+    renderViewerAccountPanel();
+  });
+  if (viewerScriptRunBtn) viewerScriptRunBtn.addEventListener('click', function () {
+    var accountId = String(viewerAccountSelect && viewerAccountSelect.value || '');
+    runViewerAccountScriptAction('start', getMacScriptSelection(accountId), accountId);
+  });
+  if (viewerScriptStopBtn) viewerScriptStopBtn.addEventListener('click', function () {
+    var accountId = String(viewerAccountSelect && viewerAccountSelect.value || '');
+    runViewerAccountScriptAction('stop', getMacScriptSelection(accountId), accountId);
+  });
+  if (viewerAutoRefreshCheck) {
+    viewerAutoRefreshCheck.checked = localStorage.getItem('viewerAutoRefresh') !== 'false';
+    viewerAutoRefreshCheck.addEventListener('change', function () {
+      localStorage.setItem('viewerAutoRefresh', this.checked ? 'true' : 'false');
+      if (activeTab !== 'viewer') return;
+      if (this.checked) requestViewer(true);
+      else {
+        if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'unsubscribeViewer' }));
+      }
+    });
+  }
   if (viewerAccountSelect) viewerAccountSelect.addEventListener('change', selectViewerAccount);
+  if (viewerOpenScriptGuiBtn) viewerOpenScriptGuiBtn.addEventListener('click', function () {
+    var scriptId = String(viewerOpenScriptGuiBtn.dataset.scriptOpenGui || '');
+    if (scriptId) openScriptPanelById(scriptId);
+    else refreshViewerScriptGuiButton();
+  });
 
   if (objectsAutoRefreshCheck) {
     objectsAutoRefreshCheck.addEventListener('change', function () {
@@ -18746,6 +19327,7 @@
       if (scriptPanelOpenId === scriptId) renderScriptPanel(scriptId);
     }
     refreshScriptsDetailGuiButton();
+    refreshViewerScriptGuiButton();
   }
 
   function handleScriptPanelPatches(msg) {
@@ -18789,6 +19371,14 @@
         if (w.type === 'item') w.item = patch.value;
         else if (w.type === 'itemGrid') w.items = Array.isArray(patch.value) ? patch.value.slice() : [];
         else w.value = patch.value;
+        break;
+      case 'options': w.options = Array.isArray(patch.value) ? patch.value.slice() : []; break;
+      case 'props':
+        if (patch.value && typeof patch.value === 'object') {
+          Object.keys(patch.value).forEach(function (key) {
+            if (key !== 'id' && key !== 'type' && key.indexOf('on') !== 0) w[key] = patch.value[key];
+          });
+        }
         break;
       case 'image': w.src = String(patch.value || ''); break;
       case 'text':
@@ -18835,6 +19425,10 @@
         if (progressFill) progressFill.style.width = Math.max(0, Math.min(1, Number(patch.value) || 0)) * 100 + '%';
         break;
       }
+      case 'options':
+      case 'props':
+        replaceScriptPanelWidgetDom(scriptId, patch.id);
+        break;
       case 'image': {
         var img = el.querySelector('img.script-panel-image-img');
         if (img) img.src = String(patch.value || '');
@@ -18953,6 +19547,14 @@
     } else {
       inner.style.removeProperty('--script-panel-width');
     }
+    var maxHeight = Number(def.maxHeight);
+    if (Number.isFinite(maxHeight) && maxHeight >= 280 && maxHeight <= 1200) {
+      inner.style.setProperty('--script-panel-max-height', maxHeight + 'px');
+    } else {
+      inner.style.removeProperty('--script-panel-max-height');
+    }
+    applyScriptPanelTheme(inner, def.theme);
+    inner.dataset.density = def.density === 'compact' ? 'compact' : 'comfortable';
     body.innerHTML = '';
     var widgets = Array.isArray(def.widgets) ? def.widgets : [];
     if (!widgets.length) {
@@ -18972,6 +19574,7 @@
     if (w.id) wrap.dataset.scriptWidgetId = String(w.id);
     if (w.visible === false) wrap.hidden = true;
     if (w.tooltip) wrap.title = String(w.tooltip);
+    applyScriptPanelWidgetLayout(wrap, w);
 
     switch (w.type) {
       case 'group':       buildGroupWidget(wrap, w, scriptId); break;
@@ -18988,6 +19591,11 @@
       case 'number':      buildNumberWidget(wrap, w, scriptId); break;
       case 'text':        buildTextWidget(wrap, w, scriptId); break;
       case 'select':      buildSelectWidget(wrap, w, scriptId); break;
+      case 'search':      buildSearchWidget(wrap, w, scriptId); break;
+      case 'badge':       buildBadgeWidget(wrap, w); break;
+      case 'metric':      buildMetricWidget(wrap, w); break;
+      case 'divider':     buildDividerWidget(wrap, w); break;
+      case 'code':        buildCodeWidget(wrap, w); break;
       case 'progress':    buildProgressWidget(wrap, w); break;
       case 'log':         buildLogWidget(wrap, w); break;
       case 'spacer':      wrap.style.height = (Number(w.size) || 8) + 'px'; break;
@@ -18995,11 +19603,100 @@
         wrap.textContent = 'Unknown widget: ' + String(w.type);
         wrap.className += ' script-panel-empty';
     }
+    applyScriptPanelWidgetAppearance(wrap, w);
     return wrap;
+  }
+
+  function applyScriptPanelWidgetLayout(wrap, w) {
+    if (typeof w.minWidth === 'number' && Number.isFinite(w.minWidth)) {
+      wrap.style.minWidth = Math.max(0, Math.min(1200, w.minWidth)) + 'px';
+    }
+    if (typeof w.width === 'number' && Number.isFinite(w.width)) {
+      wrap.style.width = Math.max(40, Math.min(1200, w.width)) + 'px';
+      wrap.style.maxWidth = '100%';
+      wrap.style.flex = '0 1 auto';
+    } else if (w.width === 'auto') {
+      wrap.style.width = 'auto';
+      wrap.style.alignSelf = 'flex-start';
+      wrap.style.flex = '0 0 auto';
+    } else if (w.width === 'full') {
+      wrap.style.width = '100%';
+      wrap.style.flex = '1 1 100%';
+    }
+    if (w.grow) wrap.style.flexGrow = '1';
+  }
+
+  function validScriptPanelColor(value) {
+    if (typeof value !== 'string') return null;
+    var color = value.trim();
+    if (!color || color.length > 96 || !window.CSS || typeof window.CSS.supports !== 'function') return null;
+    return window.CSS.supports('color', color) ? color : null;
+  }
+
+  function setScriptPanelColorVariable(el, property, value) {
+    var color = validScriptPanelColor(value);
+    if (color) el.style.setProperty(property, color);
+    else el.style.removeProperty(property);
+  }
+
+  function applyScriptPanelTheme(inner, theme) {
+    var next = theme && typeof theme === 'object' ? theme : {};
+    setScriptPanelColorVariable(inner, '--script-panel-accent', next.accentColor);
+    setScriptPanelColorVariable(inner, '--text-primary', next.textColor);
+    setScriptPanelColorVariable(inner, '--text-secondary', next.mutedTextColor);
+    setScriptPanelColorVariable(inner, '--bg-secondary', next.backgroundColor);
+    setScriptPanelColorVariable(inner, '--script-panel-surface', next.surfaceColor);
+    setScriptPanelColorVariable(inner, '--border', next.borderColor);
+  }
+
+  function applyScriptPanelWidgetAppearance(wrap, w) {
+    var style = w.style && typeof w.style === 'object' ? w.style : null;
+    if (!style) return;
+    var box = w.type === 'button' ? (wrap.querySelector('.script-panel-button-control') || wrap) : wrap;
+
+    var textColor = validScriptPanelColor(style.textColor);
+    if (textColor) {
+      wrap.classList.add('has-custom-text-color');
+      wrap.style.setProperty('--script-widget-text', textColor);
+      wrap.style.setProperty('--text-primary', textColor);
+    }
+    var mutedTextColor = validScriptPanelColor(style.mutedTextColor);
+    if (mutedTextColor) wrap.style.setProperty('--text-secondary', mutedTextColor);
+    var backgroundColor = validScriptPanelColor(style.backgroundColor);
+    if (backgroundColor) box.style.backgroundColor = backgroundColor;
+    var borderColor = validScriptPanelColor(style.borderColor);
+    if (borderColor) {
+      box.style.borderColor = borderColor;
+      wrap.style.setProperty('--border', borderColor);
+    }
+    var accentColor = validScriptPanelColor(style.accentColor);
+    if (accentColor) wrap.style.setProperty('--script-panel-accent', accentColor);
+
+    var fontSize = Number(style.fontSize);
+    if (typeof style.fontSize === 'number' && Number.isFinite(fontSize)) {
+      wrap.classList.add('has-custom-font-size');
+      wrap.style.setProperty('--script-widget-font-size', Math.max(8, Math.min(48, fontSize)) + 'px');
+    }
+    var fontWeight = Number(style.fontWeight);
+    if (typeof style.fontWeight === 'number' && [400, 500, 600, 700].indexOf(fontWeight) !== -1) {
+      wrap.classList.add('has-custom-font-weight');
+      wrap.style.setProperty('--script-widget-font-weight', String(fontWeight));
+    }
+    if (style.textAlign === 'left' || style.textAlign === 'center' || style.textAlign === 'right') {
+      wrap.style.textAlign = style.textAlign;
+      if (box !== wrap) box.style.textAlign = style.textAlign;
+    }
+    var padding = Number(style.padding);
+    if (typeof style.padding === 'number' && Number.isFinite(padding)) box.style.padding = Math.max(0, Math.min(40, padding)) + 'px';
+    var radius = Number(style.borderRadius);
+    if (typeof style.borderRadius === 'number' && Number.isFinite(radius)) box.style.borderRadius = Math.max(0, Math.min(8, radius)) + 'px';
+    var opacity = Number(style.opacity);
+    if (typeof style.opacity === 'number' && Number.isFinite(opacity)) wrap.style.opacity = String(Math.max(0, Math.min(1, opacity)));
   }
 
   function buildGroupWidget(wrap, w, scriptId) {
     wrap.classList.add('script-panel-group');
+    wrap.classList.add('appearance-' + (w.appearance || 'subtle'));
     if (w.collapsed) wrap.classList.add('collapsed');
     if (w.title) {
       var t = document.createElement('div');
@@ -19020,6 +19717,12 @@
   function buildRowWidget(wrap, w, scriptId) {
     wrap.classList.add('script-panel-row');
     if (typeof w.gap === 'number') wrap.style.gap = w.gap + 'px';
+    if (w.wrap === true) wrap.style.flexWrap = 'wrap';
+    else if (w.wrap === false) wrap.style.flexWrap = 'nowrap';
+    var align = { start: 'flex-start', center: 'center', end: 'flex-end', stretch: 'stretch' }[w.align];
+    var justify = { start: 'flex-start', center: 'center', end: 'flex-end', between: 'space-between' }[w.justify];
+    if (align) wrap.style.alignItems = align;
+    if (justify) wrap.style.justifyContent = justify;
     (Array.isArray(w.children) ? w.children : []).forEach(function (c) {
       var el = renderScriptPanelWidget(c, scriptId);
       if (el) wrap.appendChild(el);
@@ -19244,7 +19947,7 @@
   function buildButtonWidget(wrap, w, scriptId) {
     var btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'script-panel-button variant-' + (w.variant || 'secondary');
+    btn.className = 'script-panel-button-control variant-' + (w.variant || 'secondary');
     btn.disabled = w.enabled === false;
     var span = document.createElement('span');
     span.className = 'script-panel-text-target';
@@ -19355,6 +20058,271 @@
     wrap.appendChild(select);
   }
 
+  function buildSearchWidget(wrap, w, scriptId) {
+    var labelEl = null;
+    if (w.label) {
+      labelEl = document.createElement('label');
+      labelEl.className = 'script-panel-search-label script-panel-text-target';
+      labelEl.textContent = String(w.label);
+      wrap.appendChild(labelEl);
+    }
+
+    var shell = document.createElement('div');
+    shell.className = 'script-panel-search-shell';
+    var line = document.createElement('div');
+    line.className = 'script-panel-search-line';
+    var icon = document.createElement('span');
+    icon.className = 'script-panel-search-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.textContent = '\u2315';
+    var input = document.createElement('input');
+    input.type = 'search';
+    input.className = 'script-panel-search-input script-panel-input';
+    input.placeholder = String(w.placeholder || 'Search...');
+    input.value = String(w.value == null ? '' : w.value);
+    input.disabled = w.enabled === false;
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    input.setAttribute('role', 'combobox');
+    input.setAttribute('aria-autocomplete', 'list');
+    input.setAttribute('aria-expanded', 'false');
+    input.id = 'script-panel-search-' + String(scriptId || 'script') + '-' + String(w.id || 'search');
+    if (labelEl) labelEl.htmlFor = input.id;
+
+    var clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'script-panel-search-clear';
+    clear.title = 'Clear search';
+    clear.setAttribute('aria-label', 'Clear search');
+    clear.textContent = '\u00d7';
+    clear.disabled = input.disabled;
+
+    var meta = document.createElement('div');
+    meta.className = 'script-panel-search-meta';
+    var dropdown = document.createElement('div');
+    dropdown.className = 'script-panel-search-dropdown';
+    dropdown.setAttribute('role', 'listbox');
+    dropdown.hidden = true;
+    var activeIndex = -1;
+    var visibleOptions = [];
+    var changeTimer = null;
+
+    function options() {
+      return (Array.isArray(w.options) ? w.options : []).filter(Boolean).map(function (opt) {
+        if (typeof opt !== 'object') return { value: String(opt), label: String(opt) };
+        return {
+          value: String(opt.value == null ? '' : opt.value),
+          label: String(opt.label == null ? opt.value : opt.label),
+          description: opt.description == null ? '' : String(opt.description),
+          keywords: Array.isArray(opt.keywords) ? opt.keywords.map(String) : []
+        };
+      });
+    }
+
+    var selectedOption = options().find(function (opt) {
+      return opt.value === String(w.value == null ? '' : w.value);
+    });
+    if (selectedOption) input.value = selectedOption.label;
+
+    function sendChange(immediate) {
+      if (changeTimer) window.clearTimeout(changeTimer);
+      var delay = Math.max(0, Math.min(2000, Number(w.debounceMs == null ? 120 : w.debounceMs) || 0));
+      var value = String(input.value);
+      if (immediate || delay === 0) sendScriptPanelEvent(scriptId, w.id, 'change', value);
+      else changeTimer = window.setTimeout(function () {
+        sendScriptPanelEvent(scriptId, w.id, 'change', value);
+      }, delay);
+    }
+
+    function closeDropdown() {
+      dropdown.hidden = true;
+      activeIndex = -1;
+      input.setAttribute('aria-expanded', 'false');
+    }
+
+    function chooseOption(index) {
+      var opt = visibleOptions[index];
+      if (!opt) return;
+      if (changeTimer) window.clearTimeout(changeTimer);
+      input.value = opt.label;
+      w.value = opt.value;
+      updateClear();
+      closeDropdown();
+      sendScriptPanelEvent(scriptId, w.id, 'select', opt.value);
+    }
+
+    function setActive(index) {
+      var buttons = dropdown.querySelectorAll('.script-panel-search-option');
+      if (!buttons.length) return;
+      activeIndex = (index + buttons.length) % buttons.length;
+      buttons.forEach(function (button, i) {
+        button.classList.toggle('active', i === activeIndex);
+        button.setAttribute('aria-selected', i === activeIndex ? 'true' : 'false');
+      });
+      buttons[activeIndex].scrollIntoView({ block: 'nearest' });
+    }
+
+    function updateClear() {
+      clear.hidden = !w.clearable || !input.value;
+    }
+
+    function renderResults() {
+      var query = String(input.value || '').trim().toLowerCase();
+      var tokens = query.split(/\s+/).filter(Boolean);
+      var allOptions = options();
+      var limit = Math.max(1, Math.min(50, Number(w.maxResults) || 8));
+      visibleOptions = allOptions.filter(function (opt) {
+        var haystack = [opt.label, opt.value, opt.description].concat(opt.keywords).join(' ').toLowerCase();
+        return tokens.every(function (token) { return haystack.indexOf(token) !== -1; });
+      }).slice(0, limit);
+      dropdown.innerHTML = '';
+      activeIndex = -1;
+
+      if (w.showResultCount) {
+        meta.textContent = query ? visibleOptions.length + (visibleOptions.length === 1 ? ' result' : ' results') : '';
+      } else {
+        meta.textContent = '';
+      }
+
+      if (!query || !allOptions.length) {
+        closeDropdown();
+        return;
+      }
+      if (!visibleOptions.length) {
+        var empty = document.createElement('div');
+        empty.className = 'script-panel-search-empty';
+        empty.textContent = String(w.emptyText || 'No results');
+        dropdown.appendChild(empty);
+      } else {
+        visibleOptions.forEach(function (opt, index) {
+          var button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'script-panel-search-option';
+          button.setAttribute('role', 'option');
+          button.setAttribute('aria-selected', 'false');
+          var title = document.createElement('span');
+          title.className = 'script-panel-search-option-title';
+          title.textContent = opt.label;
+          button.appendChild(title);
+          if (opt.description) {
+            var description = document.createElement('span');
+            description.className = 'script-panel-search-option-description';
+            description.textContent = opt.description;
+            button.appendChild(description);
+          }
+          button.addEventListener('mousedown', function (event) { event.preventDefault(); });
+          button.addEventListener('click', function () { chooseOption(index); });
+          dropdown.appendChild(button);
+        });
+      }
+      dropdown.hidden = false;
+      input.setAttribute('aria-expanded', 'true');
+    }
+
+    input.addEventListener('input', function () {
+      w.value = String(input.value);
+      updateClear();
+      renderResults();
+      sendChange(false);
+    });
+    input.addEventListener('focus', renderResults);
+    input.addEventListener('keydown', function (event) {
+      if (event.key === 'ArrowDown' && visibleOptions.length) {
+        event.preventDefault();
+        setActive(activeIndex + 1);
+      } else if (event.key === 'ArrowUp' && visibleOptions.length) {
+        event.preventDefault();
+        setActive(activeIndex < 0 ? visibleOptions.length - 1 : activeIndex - 1);
+      } else if (event.key === 'Enter') {
+        event.preventDefault();
+        if (!dropdown.hidden && activeIndex >= 0) chooseOption(activeIndex);
+        else {
+          if (changeTimer) window.clearTimeout(changeTimer);
+          sendScriptPanelEvent(scriptId, w.id, 'submit', String(input.value));
+          closeDropdown();
+        }
+      } else if (event.key === 'Escape') {
+        closeDropdown();
+      }
+    });
+    shell.addEventListener('focusout', function () {
+      window.setTimeout(function () {
+        if (!shell.contains(document.activeElement)) closeDropdown();
+      }, 0);
+    });
+    clear.addEventListener('click', function () {
+      input.value = '';
+      w.value = '';
+      updateClear();
+      closeDropdown();
+      sendChange(true);
+      input.focus();
+    });
+
+    updateClear();
+    line.appendChild(icon);
+    line.appendChild(input);
+    line.appendChild(clear);
+    shell.appendChild(line);
+    shell.appendChild(meta);
+    shell.appendChild(dropdown);
+    wrap.appendChild(shell);
+  }
+
+  function buildBadgeWidget(wrap, w) {
+    var badge = document.createElement('span');
+    badge.className = 'script-panel-badge-value script-panel-text-target tone-' + String(w.tone || 'neutral');
+    badge.textContent = String(w.text == null ? '' : w.text);
+    wrap.appendChild(badge);
+  }
+
+  function buildMetricWidget(wrap, w) {
+    wrap.classList.add('tone-' + String(w.tone || 'neutral'));
+    var label = document.createElement('div');
+    label.className = 'script-panel-metric-label script-panel-text-target';
+    label.textContent = String(w.label == null ? '' : w.label);
+    var value = document.createElement('div');
+    value.className = 'script-panel-metric-value';
+    value.textContent = String(w.value == null ? '' : w.value);
+    wrap.appendChild(label);
+    wrap.appendChild(value);
+    if (w.detail) {
+      var detail = document.createElement('div');
+      detail.className = 'script-panel-metric-detail';
+      detail.textContent = String(w.detail);
+      wrap.appendChild(detail);
+    }
+  }
+
+  function buildDividerWidget(wrap, w) {
+    var line = document.createElement('span');
+    line.className = 'script-panel-divider-line';
+    wrap.appendChild(line);
+    if (w.label) {
+      var label = document.createElement('span');
+      label.className = 'script-panel-divider-label script-panel-text-target';
+      label.textContent = String(w.label);
+      wrap.appendChild(label);
+      var trailing = document.createElement('span');
+      trailing.className = 'script-panel-divider-line';
+      wrap.appendChild(trailing);
+    }
+  }
+
+  function buildCodeWidget(wrap, w) {
+    if (w.label) {
+      var label = document.createElement('div');
+      label.className = 'script-panel-code-label script-panel-text-target';
+      label.textContent = String(w.label);
+      wrap.appendChild(label);
+    }
+    var code = document.createElement('code');
+    code.className = 'script-panel-code-value';
+    if (w.wrap) code.classList.add('wrap');
+    code.textContent = String(w.code == null ? '' : w.code);
+    wrap.appendChild(code);
+  }
+
   function buildProgressWidget(wrap, w) {
     if (w.label) {
       var labelEl = document.createElement('div');
@@ -19412,6 +20380,56 @@
     btn.dataset.scriptOpenGui = String(id || '');
   }
 
+  function resolveViewerScriptPanelId() {
+    if (!scriptPanels || typeof scriptPanels.keys !== 'function') return '';
+    if (!viewerAccountSelect || viewerAccountSelect.disabled) return '';
+    var panelIds = Array.from(scriptPanels.keys()).map(String);
+    if (!panelIds.length) return '';
+
+    var accountId = String(viewerAccountSelect && viewerAccountSelect.value || '');
+    var scripts = Array.isArray(scriptsTabLastData && scriptsTabLastData.scripts)
+      ? scriptsTabLastData.scripts
+      : [];
+    if (accountId) {
+      var matching = scripts.filter(function (script) {
+        return script
+          && String(script.accountId || '') === accountId
+          && panelIds.indexOf(String(script.id || '')) !== -1;
+      }).sort(function (a, b) {
+        return Number(b.startedAt || 0) - Number(a.startedAt || 0);
+      });
+      if (matching.length) return String(matching[0].id || '');
+      var hasKnownBindings = scripts.some(function (script) {
+        return script
+          && String(script.accountId || '')
+          && panelIds.indexOf(String(script.id || '')) !== -1;
+      });
+      if (hasKnownBindings) return '';
+    }
+
+    return panelIds.length === 1 ? panelIds[0] : '';
+  }
+
+  function refreshViewerScriptGuiButton() {
+    if (!viewerOpenScriptGuiBtn) return;
+    var scriptId = resolveViewerScriptPanelId();
+    var scripts = Array.isArray(scriptsTabLastData && scriptsTabLastData.scripts)
+      ? scriptsTabLastData.scripts
+      : [];
+    var script = scripts.find(function (entry) { return String(entry && entry.id || '') === scriptId; });
+    viewerOpenScriptGuiBtn.disabled = !scriptId;
+    viewerOpenScriptGuiBtn.dataset.scriptOpenGui = scriptId;
+    if (scriptId) {
+      viewerOpenScriptGuiBtn.title = 'Open ' + String(script && (script.name || script.id) || scriptId) + ' GUI';
+    } else if (!viewerAccountSelect || viewerAccountSelect.disabled) {
+      viewerOpenScriptGuiBtn.title = 'Connect an account to open its script GUI.';
+    } else if (scriptPanels && scriptPanels.size > 0) {
+      viewerOpenScriptGuiBtn.title = 'No GUI-bearing script is bound to the selected Viewer account.';
+    } else {
+      viewerOpenScriptGuiBtn.title = 'No running script has registered a GUI panel.';
+    }
+  }
+
   function wireScriptPanelGlobals() {
     var popout = getScriptPanelEl();
     if (!popout || popout.dataset.wired) return;
@@ -19434,6 +20452,7 @@
       scripts: Array.isArray(msg.scripts) ? msg.scripts : [],
       dir: msg.dir !== undefined ? msg.dir : scriptsTabLastData.dir,
     };
+    refreshViewerScriptGuiButton();
     if (activeTab === 'scripts') renderScriptsListFromData(scriptsTabLastData);
     if (activeTab === 'clients' && isMacMultiHome()) {
       connectedClients.forEach(function (_c, clientId) {
@@ -19443,6 +20462,7 @@
     renderSingleAccountDock();
     if (isMacStyleSidebar() && multiAccountSidebarMode === 'connected') renderMultiAccountConnectedList();
     if (macPopoutOpenClientId) refreshMacPopoutScriptPanel(macPopoutOpenClientId);
+    if (activeTab === 'viewer') renderViewerAccountPanel();
   }
 
   function appendScriptLogLineLegacy(line, level) {
@@ -19528,6 +20548,7 @@
       .then(function (r) { return r.json(); })
       .then(function (data) {
         scriptsTabLastData = data || { scripts: [], dir: null };
+        refreshViewerScriptGuiButton();
         renderScriptsListFromData(scriptsTabLastData);
         populateScriptSelect();
         if (isMacStyleSidebar() && multiAccountSidebarMode === 'connected') renderMultiAccountConnectedList();

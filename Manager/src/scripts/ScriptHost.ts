@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { homedir } from 'os';
-import { basename, isAbsolute, join, relative, resolve } from 'path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'path';
 import { pathToFileURL } from 'url';
 import { SDKBridge } from './bridge/index.js';
 import type { BridgeDeps, ScriptLogLevel, ScriptPanelInboundEvent } from './bridge/BridgeDeps.js';
@@ -24,6 +24,8 @@ export interface ScriptInfo {
   startedAt?: number;
   /** Current run duration in milliseconds, only present while running. */
   runtimeMs?: number;
+  /** Headless account this run is bound to, only present while running. */
+  accountId?: string;
 }
 
 export interface MarketplaceScriptInfo {
@@ -106,6 +108,7 @@ export class ScriptHost {
   /** Patch @hive/sdk stubs with host implementations (`chat`, `party`, `events`, ...). Call once at startup. */
   installBridge(deps: BridgeDeps): void {
     if (this.bridgeInstalled) return;
+    deps.scriptPanelConfigDir ??= join(dirname(this.scriptsDir), 'ScriptConfigs');
     deps.setScriptActivityLabel = (label) => {
       const id = this.resolveActivityScriptId(deps);
       if (!id) return;
@@ -207,6 +210,7 @@ export class ScriptHost {
       activity: this.scriptActivityById.get(folderName),
       startedAt: runningEntry?.startedAt,
       runtimeMs: runningEntry ? Math.max(0, Date.now() - runningEntry.startedAt) : undefined,
+      accountId: runningEntry?.accountId,
     };
   }
 

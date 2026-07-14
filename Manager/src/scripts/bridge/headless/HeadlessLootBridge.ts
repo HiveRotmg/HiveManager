@@ -175,6 +175,16 @@ export function installHeadlessLootBridge(deps: BridgeDeps): void {
     return !!source && source.objectType > 0 && !!destination && client.swapSlots(source, destination);
   };
 
+  loot.pickupToSlot = (bag, slotIndex, inventorySlotIndex) => {
+    const client = active(deps);
+    if (!client || !Number.isInteger(inventorySlotIndex) || inventorySlotIndex < 0) return false;
+    const object = visibleLootObject(client, bag.objectId, deps);
+    if (!object) return false;
+    const source = client.getWorldContainerSlot(object.objectId, slotIndex);
+    const destination = client.getInventorySlot(inventorySlotIndex);
+    return !!source && source.objectType > 0 && !!destination && client.swapSlots(source, destination);
+  };
+
   loot.pickupId = (bagObjectId, options) => {
     const client = active(deps);
     if (!client) return -1;
@@ -199,4 +209,5 @@ export function installHeadlessLootBridge(deps: BridgeDeps): void {
     const source = client.getWorldContainerSlot(bag.objectId, slotIndex);
     return !!source && source.objectType > 0 && client.useItemNear(source);
   };
+  loot.getItemInfo = (objectType) => deps.gameData.buildSdkItem(objectType);
 }

@@ -17,7 +17,7 @@ function toStatInt(value: number | string): number {
  * **Exalt-only** slices (subtract from the matching combined row above for true gear):
  *   105 ATK, 106 DEF, 107 SPD, 108 VIT, 109 DEX, 110 WIS, 111 max HP, 112 max MP.
  *
- * Public `healthBonus` … `dexterityBonus` = max(0, combined − exalt). `exalted*` holds the exalt slice.
+ * Public `healthBonus` … `dexterityBonus` = combined − exalt. `exalted*` holds the exalt slice.
  */
 export class PlayerData {
   ownerObjectId = 0;
@@ -73,6 +73,7 @@ export class PlayerData {
   inventory: number[] = new Array(12).fill(-1);
   backpack: number[] = new Array(16).fill(-1);
   quickSlots: number[] = new Array(3).fill(-1);
+  enchantmentsRaw = '';
   healthStackCount = 0;
   magicStackCount = 0;
 
@@ -124,12 +125,12 @@ export class PlayerData {
   /** Stat 124: power level. */
   powerLevel = 0;
 
-  /** Gear-only = max(0, combined − exalted); exalted ≤ 0 treated as 0. */
+  /** Gear-only = combined − exalted; exalted ≤ 0 is treated as 0. */
   private static gearOnlyFromCombined(combined: number, exalted: number): number {
     const c = Math.trunc(Number(combined)) || 0;
     const e = Math.trunc(Number(exalted)) || 0;
     const ex = e > 0 ? e : 0;
-    return Math.max(0, c - ex);
+    return c - ex;
   }
 
   private refreshBackpackPresenceFromStats(): void {
@@ -237,6 +238,7 @@ export class PlayerData {
       case StatType.WireExaltWisdom: this.exaltedWisdom = toStatInt(value); break; // 110 → from 52
       case StatType.WireExaltMaxHP: this.exaltedMaxHP = toStatInt(value); break; // 111 → from 46
       case StatType.WireExaltMaxMP: this.exaltedMaxMP = toStatInt(value); break; // 112 → from 47
+      case StatType.Enchantments: this.enchantmentsRaw = String(value ?? ''); break;
       default:
         // Inventory slots 8-19
         if (id >= 8 && id <= 19) {

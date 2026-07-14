@@ -402,6 +402,26 @@ export function install(deps: BridgeDeps): void {
     }
   };
 
+  loot.pickupToSlot = (bag, slotIndex, inventorySlotIndex) => {
+    const c = deps.clientRef.current;
+    if (!c?.connected || !c.objectId || !Number.isInteger(inventorySlotIndex) || inventorySlotIndex < 0) return false;
+    const itemId = getCurrentBagSlotItem(deps, c, bag.objectId, slotIndex);
+    if (itemId <= 0) return false;
+    const currentObjectType = inventorySlotIndex < 12
+      ? Number(c.playerData.inventory[inventorySlotIndex] ?? -1)
+      : Number(c.playerData.backpack[inventorySlotIndex - 12] ?? -1);
+    try {
+      sendInventorySwap(c, deps, bag.objectId, slotIndex, itemId, {
+        packetSlotId: inventorySlotIndex,
+        currentObjectType,
+      });
+      return true;
+    } catch (err) {
+      Logger.warn('BridgeLoot', `pickupToSlot failed: ${(err as Error).message}`);
+      return false;
+    }
+  };
+
   loot.pickupId = (bagObjectId, opts) => {
     const c = deps.clientRef.current;
     if (!c?.connected || !c.objectId) return -1;
@@ -474,6 +494,7 @@ export function install(deps: BridgeDeps): void {
   // ─── Item classification + filter ────────────────────────────────────────────
 
   loot.shouldPickup = (objectType, opts = {}) => runShouldPickup(objectType, opts, deps);
+  loot.getItemInfo = (objectType) => deps.gameData.buildSdkItem(objectType);
 
   loot.isUT = (objectType) => {
     const info = catalog.get(objectType);

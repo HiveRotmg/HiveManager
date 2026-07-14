@@ -81,12 +81,38 @@ function buildStats(p: PlayerData): Stats {
   return {
     maxHP: p.maxHealth,
     maxMP: p.maxMana,
-    attack: p.attack + p.attackBonus + p.exaltedAttack,
-    defense: p.defense + p.defenseBonus + p.exaltedDefense,
-    speed: p.speed + p.speedBonus + p.exaltedSpeed,
-    dexterity: p.dexterity + p.dexterityBonus + p.exaltedDexterity,
-    vitality: p.vitality + p.vitalityBonus + p.exaltedVitality,
-    wisdom: p.wisdom + p.wisdomBonus + p.exaltedWisdom,
+    attack: p.attack,
+    defense: p.defense,
+    speed: p.speed,
+    dexterity: p.dexterity,
+    vitality: p.vitality,
+    wisdom: p.wisdom,
+  };
+}
+
+function buildBaseStats(p: PlayerData): Stats {
+  return {
+    maxHP: p.maxHealth - p.healthBonus - p.exaltedMaxHP,
+    maxMP: p.maxMana - p.manaBonus - p.exaltedMaxMP,
+    attack: p.attack - p.attackBonus - p.exaltedAttack,
+    defense: p.defense - p.defenseBonus - p.exaltedDefense,
+    speed: p.speed - p.speedBonus - p.exaltedSpeed,
+    dexterity: p.dexterity - p.dexterityBonus - p.exaltedDexterity,
+    vitality: p.vitality - p.vitalityBonus - p.exaltedVitality,
+    wisdom: p.wisdom - p.wisdomBonus - p.exaltedWisdom,
+  };
+}
+
+function buildStatsWithGear(p: PlayerData): Stats {
+  return {
+    maxHP: p.maxHealth - p.exaltedMaxHP,
+    maxMP: p.maxMana - p.exaltedMaxMP,
+    attack: p.attack - p.exaltedAttack,
+    defense: p.defense - p.exaltedDefense,
+    speed: p.speed - p.exaltedSpeed,
+    dexterity: p.dexterity - p.exaltedDexterity,
+    vitality: p.vitality - p.exaltedVitality,
+    wisdom: p.wisdom - p.exaltedWisdom,
   };
 }
 
@@ -116,12 +142,12 @@ function buildGearBonuses(p: PlayerData): GearBonuses {
   };
 }
 
-type CombatStatKey = 'attack' | 'defense' | 'speed' | 'dexterity' | 'vitality' | 'wisdom';
+type StatKey = keyof Stats;
 
-function combatStat(deps: BridgeDeps, key: CombatStatKey): number {
+function statFrom(deps: BridgeDeps, build: (player: PlayerData) => Stats, key: StatKey): number {
   const p = playerData(deps);
   if (!p) return 0;
-  return buildStats(p)[key];
+  return build(p)[key];
 }
 
 export class BridgeSelf {
@@ -175,6 +201,32 @@ export class BridgeSelf {
       if (!p) return { ...EMPTY_STATS };
       return buildStats(p);
     };
+    Self.getBaseStats = () => {
+      const p = playerData(deps);
+      if (!p) return { ...EMPTY_STATS };
+      return buildBaseStats(p);
+    };
+    Self.getStatsWithGear = () => {
+      const p = playerData(deps);
+      if (!p) return { ...EMPTY_STATS };
+      return buildStatsWithGear(p);
+    };
+    Self.getBaseMaxHP = () => statFrom(deps, buildBaseStats, 'maxHP');
+    Self.getMaxHPWithGear = () => statFrom(deps, buildStatsWithGear, 'maxHP');
+    Self.getBaseMaxMP = () => statFrom(deps, buildBaseStats, 'maxMP');
+    Self.getMaxMPWithGear = () => statFrom(deps, buildStatsWithGear, 'maxMP');
+    Self.getBaseAtk = () => statFrom(deps, buildBaseStats, 'attack');
+    Self.getAtkWithGear = () => statFrom(deps, buildStatsWithGear, 'attack');
+    Self.getBaseDef = () => statFrom(deps, buildBaseStats, 'defense');
+    Self.getDefWithGear = () => statFrom(deps, buildStatsWithGear, 'defense');
+    Self.getBaseSpd = () => statFrom(deps, buildBaseStats, 'speed');
+    Self.getSpdWithGear = () => statFrom(deps, buildStatsWithGear, 'speed');
+    Self.getBaseDex = () => statFrom(deps, buildBaseStats, 'dexterity');
+    Self.getDexWithGear = () => statFrom(deps, buildStatsWithGear, 'dexterity');
+    Self.getBaseVit = () => statFrom(deps, buildBaseStats, 'vitality');
+    Self.getVitWithGear = () => statFrom(deps, buildStatsWithGear, 'vitality');
+    Self.getBaseWis = () => statFrom(deps, buildBaseStats, 'wisdom');
+    Self.getWisWithGear = () => statFrom(deps, buildStatsWithGear, 'wisdom');
     Self.getExaltedBonuses = () => {
       const p = playerData(deps);
       if (!p) return { ...EMPTY_EXALTED };
@@ -201,12 +253,12 @@ export class BridgeSelf {
     Self.getGearDex = () => playerData(deps)?.dexterityBonus ?? 0;
     Self.getGearVit = () => playerData(deps)?.vitalityBonus ?? 0;
     Self.getGearWis = () => playerData(deps)?.wisdomBonus ?? 0;
-    Self.getAtk = () => combatStat(deps, 'attack');
-    Self.getDef = () => combatStat(deps, 'defense');
-    Self.getSpd = () => combatStat(deps, 'speed');
-    Self.getDex = () => combatStat(deps, 'dexterity');
-    Self.getVit = () => combatStat(deps, 'vitality');
-    Self.getWis = () => combatStat(deps, 'wisdom');
+    Self.getAtk = () => statFrom(deps, buildStats, 'attack');
+    Self.getDef = () => statFrom(deps, buildStats, 'defense');
+    Self.getSpd = () => statFrom(deps, buildStats, 'speed');
+    Self.getDex = () => statFrom(deps, buildStats, 'dexterity');
+    Self.getVit = () => statFrom(deps, buildStats, 'vitality');
+    Self.getWis = () => statFrom(deps, buildStats, 'wisdom');
     Self.hasEffect = (effect: StatusEffect) => {
       const p = playerData(deps);
       if (!p) return false;
@@ -232,6 +284,12 @@ export class BridgeSelf {
     Self.getAbility = (): Item | null => equippedFromInventory(deps, 1);
     Self.getArmor = (): Item | null => equippedFromInventory(deps, 2);
     Self.getRing = (): Item | null => equippedFromInventory(deps, 3);
+    Self.canEquip = (objectType: number) => {
+      const classType = playerData(deps)?.classType;
+      const itemSlotType = deps.gameData.getObject(objectType)?.slotType;
+      if (!classType || !Number.isFinite(itemSlotType)) return false;
+      return deps.gameData.getObject(classType)?.slotTypes?.slice(0, 4).includes(itemSlotType!) ?? false;
+    };
 
     Self.getName = () => {
       const p = playerData(deps);

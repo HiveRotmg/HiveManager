@@ -39,12 +39,21 @@ export class VaultContentPacket implements Packet {
   vaultUpgradeCost: number;
   /** Gold cost of the next material storage upgrade. */
   materialUpgradeCost: number;
+  /** Gold cost of the next seasonal spoils storage upgrade. */
+  seasonalSpoilUpgradeCost: number;
   /** Gold cost of the next potion storage upgrade. */
   potionUpgradeCost: number;
   /** Current potion storage size. */
   currentPotionMax: number;
   /** Potion storage size after the next upgrade. */
   nextPotionMax: number;
+
+  /** Serialized enchantment metadata for the main vault chest. */
+  vaultChestEnchants: string;
+  /** Serialized enchantment metadata for the gift chest. */
+  giftChestEnchants: string;
+  /** Serialized enchantment metadata for the seasonal spoils chest. */
+  spoilsChestEnchants: string;
 
   /** Trailing bytes that are not yet understood. */
   unknownBytes: number[];
@@ -63,9 +72,13 @@ export class VaultContentPacket implements Packet {
     this.spoilsContents = [];
     this.vaultUpgradeCost = -1;
     this.materialUpgradeCost = -1;
+    this.seasonalSpoilUpgradeCost = -1;
     this.potionUpgradeCost = -1;
     this.currentPotionMax = -1;
     this.nextPotionMax = -1;
+    this.vaultChestEnchants = '';
+    this.giftChestEnchants = '';
+    this.spoilsChestEnchants = '';
     this.unknownBytes = [];
   }
 
@@ -101,9 +114,13 @@ export class VaultContentPacket implements Packet {
 
     this.vaultUpgradeCost = reader.readShort();
     this.materialUpgradeCost = reader.readShort();
+    this.seasonalSpoilUpgradeCost = reader.readShort();
     this.potionUpgradeCost = reader.readShort();
     this.currentPotionMax = reader.readShort();
     this.nextPotionMax = reader.readShort();
+    this.vaultChestEnchants = reader.readString();
+    this.giftChestEnchants = reader.readString();
+    this.spoilsChestEnchants = reader.readString();
 
     this.unknownBytes = [];
     while (reader.remaining > 0) {
@@ -127,9 +144,13 @@ export class VaultContentPacket implements Packet {
 
     writer.writeShort(this.vaultUpgradeCost);
     writer.writeShort(this.materialUpgradeCost);
+    writer.writeShort(this.seasonalSpoilUpgradeCost);
     writer.writeShort(this.potionUpgradeCost);
     writer.writeShort(this.currentPotionMax);
     writer.writeShort(this.nextPotionMax);
+    writer.writeString(this.vaultChestEnchants);
+    writer.writeString(this.giftChestEnchants);
+    writer.writeString(this.spoilsChestEnchants);
 
     for (const byte of this.unknownBytes) {
       writer.writeByte(byte);

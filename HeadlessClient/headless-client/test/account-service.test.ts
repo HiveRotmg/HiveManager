@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import axios from 'axios';
-import { AppEngineError, classifyError, deleteCharacter, resolveClassType } from '../src/account-service';
+import {
+  AppEngineError,
+  classifyError,
+  deleteCharacter,
+  getCharAndServers,
+  resolveClassType,
+} from '../src/account-service';
 import { Classes } from 'realmlib';
 
 test('classifyError returns undefined when there is no <Error> element', () => {
@@ -38,6 +44,39 @@ test('resolveClassType accepts class names and numeric object types', () => {
   assert.equal(resolveClassType('rOgUe'), Classes.Rogue);
   assert.equal(resolveClassType(12345), 12345);
   assert.equal(resolveClassType('not-a-class'), Classes.Wizard);
+});
+
+test('getCharAndServers returns metadata for every account character', async () => {
+  const original = axios.post;
+  axios.post = (async () => ({
+    status: 200,
+    data:
+      '<Chars nextCharId="9" maxNumChars="3">' +
+      '<Char id="4"><ObjectType>782</ObjectType><Seasonal>True</Seasonal>' +
+      '<Level>20</Level><Exp>12345</Exp><CurrentFame>678</CurrentFame>' +
+      '<Equipment>2504,2667,-1,-1</Equipment></Char>' +
+      '<Char id="7"><ObjectType>768</ObjectType><Seasonal>False</Seasonal>' +
+      '<Level>8</Level><Exp>900</Exp><CurrentFame>12</CurrentFame>' +
+      '<Equipment>-1,-1,-1,-1</Equipment></Char></Chars>',
+  })) as typeof axios.post;
+  try {
+    const result = await getCharAndServers('test-token');
+    assert.equal(result.char.charId, 4);
+    assert.equal(result.characters.length, 2);
+    assert.deepEqual(result.characters[0], {
+      charId: 4,
+      needsNewChar: false,
+      seasonal: true,
+      classType: 782,
+      level: 20,
+      exp: 12345,
+      currentFame: 678,
+      equipment: [2504, 2667, -1, -1],
+    });
+    assert.equal(result.characters[1].charId, 7);
+  } finally {
+    axios.post = original;
+  }
 });
 
 test('deleteCharacter posts accessToken and charId to /char/delete', async () => {

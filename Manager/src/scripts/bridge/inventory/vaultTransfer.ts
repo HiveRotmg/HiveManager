@@ -4,7 +4,7 @@ import type { PlayerData } from '../../../state/PlayerData.js';
 import { Logger } from '../../../util/Logger.js';
 import type { BridgeDeps } from '../BridgeDeps.js';
 import { INVENTORY_MAIN_SLOT_COUNT, INVENTORY_TOTAL_SLOT_COUNT } from '@hive/sdk';
-import { getVaultStore } from './VaultStore.js';
+import { getVaultStore, resolveChestSlot } from './VaultStore.js';
 
 /** RotMG vault map id. */
 export const GAME_ID_VAULT = GameId.Vault;
@@ -22,15 +22,6 @@ function typeIdAtSlot(p: PlayerData, slotIndex: number): number {
     return cellTypeId(p.inventory[slotIndex]);
   }
   return cellTypeId(p.backpack[slotIndex - INVENTORY_MAIN_SLOT_COUNT]);
-}
-
-function setSlot(p: PlayerData, slotIndex: number, typeId: number): void {
-  const t = typeId < 0 ? -1 : Math.trunc(typeId);
-  if (slotIndex < INVENTORY_MAIN_SLOT_COUNT) {
-    p.inventory[slotIndex] = t;
-  } else {
-    p.backpack[slotIndex - INVENTORY_MAIN_SLOT_COUNT] = t;
-  }
 }
 
 /** Bag slots only — indices 4–11 main, 12–27 backpack. Slots 0–3 are equipment and must not be used. */
@@ -63,16 +54,6 @@ function getVaultSlots(deps: BridgeDeps, _p: PlayerData): number[] | null {
   const state = getVaultStore(c);
   if (!state || state.vault.contents.length === 0) return null;
   return state.vault.contents.slice();
-}
-
-function setVaultSlot(deps: BridgeDeps, _p: PlayerData, slotIndex: number, typeId: number): void {
-  const c = deps.clientRef.current;
-  if (!c) return;
-  const state = getVaultStore(c);
-  if (!state) return;
-  const contents = state.vault.contents;
-  while (contents.length <= slotIndex) contents.push(-1);
-  contents[slotIndex] = typeId < 0 ? -1 : Math.trunc(typeId);
 }
 
 /**
@@ -125,7 +106,7 @@ function resolveInventorySourceSlot(
   return null;
 }
 
-function sendInventorySwap(
+export function sendInventorySwap(
   deps: BridgeDeps,
   c: ClientConnection,
   o1: { objectId: number; slotId: number; objectType: number },
@@ -170,9 +151,8 @@ export function withdrawFromVault(
   }
   const p = c.playerData;
   const vaultStore = getVaultStore(c);
-  const vaultOid = vaultStore?.vault.objectId ?? -1;
-  if (vaultOid <= 0) {
-    Logger.warn('InventoryVault', 'withdraw: vault chest objectId unknown (wait for VAULTCONTENT)');
+  if (!vaultStore?.active || !vaultStore.lastVaultUpdate || vaultStore.vault.objectId <= 0) {
+    Logger.warn('InventoryVault', 'withdraw: vault baseline incomplete (wait for final VAULTCONTENT)');
     return false;
   }
   const playerOid = p.ownerObjectId || c.objectId;
@@ -225,18 +205,23 @@ export function withdrawFromVault(
 
   const curVault = Math.trunc(vault[vSlot] ?? -1) | 0;
   const curInv = typeIdAtSlot(p, invSlot);
+  const physicalVaultSlot = resolveChestSlot(vaultStore.vault, vSlot);
+  if (!physicalVaultSlot || physicalVaultSlot.objectId <= 0) {
+    Logger.warn('InventoryVault', 'withdraw: physical vault slot is not available on this map');
+    return false;
+  }
 
   const ok = sendInventorySwap(
     deps,
     c,
-    { objectId: vaultOid, slotId: vSlot, objectType: curVault >= 0 ? curVault : itemType },
+    {
+      objectId: physicalVaultSlot.objectId,
+      slotId: physicalVaultSlot.slotId,
+      objectType: curVault >= 0 ? curVault : itemType,
+    },
     { objectId: playerOid, slotId: invSlot, objectType: curInv >= 0 ? curInv : -1 },
   );
-  if (!ok) return false;
-
-  setVaultSlot(deps, p, vSlot, -1);
-  setSlot(p, invSlot, itemType);
-  return true;
+  return ok;
 }
 
 /**
@@ -261,9 +246,8 @@ export function depositToVault(
   }
   const p = c.playerData;
   const vaultStore = getVaultStore(c);
-  const vaultOid = vaultStore?.vault.objectId ?? -1;
-  if (vaultOid <= 0) {
-    Logger.warn('InventoryVault', 'deposit: vault chest objectId unknown (wait for VAULTCONTENT)');
+  if (!vaultStore?.active || !vaultStore.lastVaultUpdate || vaultStore.vault.objectId <= 0) {
+    Logger.warn('InventoryVault', 'deposit: vault baseline incomplete (wait for final VAULTCONTENT)');
     return false;
   }
   const playerOid = p.ownerObjectId || c.objectId;
@@ -316,16 +300,21 @@ export function depositToVault(
 
   const curInv = typeIdAtSlot(p, invSlot);
   const curVault = Math.trunc(vault[vSlot] ?? -1) | 0;
+  const physicalVaultSlot = resolveChestSlot(vaultStore.vault, vSlot);
+  if (!physicalVaultSlot || physicalVaultSlot.objectId <= 0) {
+    Logger.warn('InventoryVault', 'deposit: physical vault slot is not available on this map');
+    return false;
+  }
 
   const ok = sendInventorySwap(
     deps,
     c,
     { objectId: playerOid, slotId: invSlot, objectType: curInv >= 0 ? curInv : itemType },
-    { objectId: vaultOid, slotId: vSlot, objectType: curVault >= 0 ? curVault : -1 },
+    {
+      objectId: physicalVaultSlot.objectId,
+      slotId: physicalVaultSlot.slotId,
+      objectType: curVault >= 0 ? curVault : -1,
+    },
   );
-  if (!ok) return false;
-
-  setSlot(p, invSlot, -1);
-  setVaultSlot(deps, p, vSlot, itemType);
-  return true;
+  return ok;
 }

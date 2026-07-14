@@ -62,6 +62,7 @@ export interface HeadlessChatMessage {
 
 export interface HeadlessFleetEvents {
   changed: [sessions: HeadlessSessionSummary[]];
+  viewerTick: [accountId: string];
   damage: [accountId: string, snapshot: HeadlessDamageSnapshot];
   chat: [accountId: string, message: HeadlessChatMessage];
   packet: [accountId: string, traffic: PacketTraffic];
@@ -226,7 +227,10 @@ export class HeadlessFleet extends EventEmitter {
     client.on(ClientEvent.Connected, changed);
     client.on(ClientEvent.Ready, changed);
     client.on(ClientEvent.MapChange, changed);
-    client.on(ClientEvent.Tick, changed);
+    client.on(ClientEvent.Tick, () => {
+      changed();
+      this.emit('viewerTick', account.id);
+    });
     client.on(ClientEvent.Disconnect, () => {
       if (!entry.stopping) changed();
     });

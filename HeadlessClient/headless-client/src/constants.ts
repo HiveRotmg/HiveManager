@@ -50,7 +50,7 @@ export const GAME_ID = {
  * expect; if the server replies with a version-mismatch failure, bump this.
  * Sourced from the current working client (pyrelay).
  */
-export const BUILD_VERSION = '6.12.0.0.0';
+export const BUILD_VERSION = '6.12.0.1.0';
 
 /**
  * Constant client token baked into the current Unity build, sent as the

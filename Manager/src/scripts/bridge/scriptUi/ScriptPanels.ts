@@ -5,10 +5,22 @@ import type {
   ScriptPanelPatch,
 } from '../BridgeDeps.js';
 import type {
+  PanelConfigInfo,
+  PanelConfigScope,
   PanelDefinition,
   PanelHandle,
+  PanelPersistenceOptions,
+  SearchOption,
   PanelWidget,
 } from '@hive/sdk';
+import { ScriptPanelConfigStore } from './ScriptPanelConfigStore.js';
+
+interface WidgetHandlers {
+  onClick?: () => void;
+  onChange?: (value: unknown) => void;
+  onSubmit?: (value: string) => void;
+  onSelect?: (value: string) => void;
+}
 
 /**
  * Walks a widget tree, strips function-valued fields, and collects per-id
@@ -16,7 +28,7 @@ import type {
  */
 function extractHandlers(
   widgets: PanelWidget[],
-  handlers: Map<string, { onClick?: () => void; onChange?: (v: unknown) => void }>,
+  handlers: Map<string, WidgetHandlers>,
 ): PanelWidget[] {
   return widgets.map((w) => {
     const next: Record<string, unknown> = { ...(w as unknown as Record<string, unknown>) };
@@ -31,7 +43,15 @@ function extractHandlers(
         entry.onChange = (next as { onChange: (v: unknown) => void }).onChange;
         delete (next as { onChange?: unknown }).onChange;
       }
-      if (entry.onClick || entry.onChange) handlers.set(id, entry);
+      if (typeof (next as { onSubmit?: unknown }).onSubmit === 'function') {
+        entry.onSubmit = (next as { onSubmit: (v: string) => void }).onSubmit;
+        delete (next as { onSubmit?: unknown }).onSubmit;
+      }
+      if (typeof (next as { onSelect?: unknown }).onSelect === 'function') {
+        entry.onSelect = (next as { onSelect: (v: string) => void }).onSelect;
+        delete (next as { onSelect?: unknown }).onSelect;
+      }
+      if (entry.onClick || entry.onChange || entry.onSubmit || entry.onSelect) handlers.set(id, entry);
     }
     const children = (w as { children?: PanelWidget[] }).children;
     if (Array.isArray(children)) {
@@ -68,10 +88,76 @@ function findWidget(widgets: PanelWidget[] | undefined, id: string): PanelWidget
   return undefined;
 }
 
+const DEFAULT_PERSISTED_WIDGET_TYPES = new Set(['toggle', 'slider', 'number', 'text', 'select']);
+
+function visitWidgets(widgets: PanelWidget[] | undefined, visit: (widget: PanelWidget) => void): void {
+  for (const widget of widgets ?? []) {
+    visit(widget);
+    const children = (widget as { children?: PanelWidget[] }).children;
+    if (Array.isArray(children)) visitWidgets(children, visit);
+    const tabs = (widget as unknown as { tabs?: { children?: PanelWidget[] }[] }).tabs;
+    if (Array.isArray(tabs)) {
+      for (const tab of tabs) visitWidgets(tab.children, visit);
+    }
+  }
+}
+
+function isPersistedWidget(widget: PanelWidget): boolean {
+  const record = widget as unknown as Record<string, unknown>;
+  if (record.persist === false || typeof record.id !== 'string' || !('value' in record)) return false;
+  return record.persist === true || DEFAULT_PERSISTED_WIDGET_TYPES.has(String(record.type));
+}
+
+function safeConfigValue(value: unknown): unknown | undefined {
+  if (value === undefined || typeof value === 'function' || typeof value === 'symbol' || typeof value === 'bigint') {
+    return undefined;
+  }
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined || serialized.length > 262_144) return undefined;
+    return JSON.parse(serialized) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function collectConfigValues(widgets: PanelWidget[]): Record<string, unknown> {
+  const values: Record<string, unknown> = {};
+  visitWidgets(widgets, (widget) => {
+    if (!isPersistedWidget(widget)) return;
+    const record = widget as unknown as Record<string, unknown>;
+    const value = safeConfigValue(record.value);
+    if (value !== undefined) values[String(record.id)] = value;
+  });
+  return values;
+}
+
+interface NormalizedPersistence {
+  enabled: boolean;
+  autoSave: boolean;
+  autoLoad: boolean;
+  config: string;
+  scope: PanelConfigScope;
+}
+
+function normalizePersistence(options?: PanelPersistenceOptions): NormalizedPersistence {
+  return {
+    enabled: options !== undefined,
+    autoSave: options?.autoSave === true,
+    autoLoad: options?.autoLoad !== false,
+    config: String(options?.config || '').trim() || 'default',
+    scope: options?.scope === 'account' ? 'account' : 'script',
+  };
+}
+
 interface StoredPanel {
   scriptId: string;
+  accountId?: string;
   def: PanelDefinition;
-  handlers: Map<string, { onClick?: () => void; onChange?: (v: unknown) => void }>;
+  handlers: Map<string, WidgetHandlers>;
+  persistence: NormalizedPersistence;
+  activeConfig: string;
+  autoSaveTimer?: NodeJS.Timeout;
   isOpen: boolean;
 }
 
@@ -82,15 +168,17 @@ interface StoredPanel {
 export class ScriptPanelRegistry {
   private deps: BridgeDeps;
   private panels = new Map<string, StoredPanel>();
+  private configStore: ScriptPanelConfigStore;
 
   constructor(deps: BridgeDeps) {
     this.deps = deps;
+    this.configStore = new ScriptPanelConfigStore(deps.scriptPanelConfigDir);
   }
 
-  /** Resolve the script id at the moment the SDK call runs. */
-  private currentScriptId(): string | undefined {
-    const sid = this.deps.getScriptSession?.().scriptId ?? this.deps.scriptSession.scriptId;
-    return sid && String(sid).trim() ? String(sid).trim() : undefined;
+  private currentSession(): { scriptId: string; accountId?: string } | undefined {
+    const session = this.deps.getScriptSession?.() ?? this.deps.scriptSession;
+    const scriptId = String(session.scriptId || '').trim();
+    return scriptId ? { scriptId, accountId: session.accountId } : undefined;
   }
 
   private emit(msg: ScriptPanelOutboundMessage): void {
@@ -101,11 +189,96 @@ export class ScriptPanelRegistry {
     }
   }
 
+  private reportConfigError(stored: StoredPanel, action: string, error: unknown): void {
+    const detail = error instanceof Error ? error.message : String(error);
+    this.deps.emitScriptLog(stored.scriptId, `Panel config ${action} failed: ${detail}`, 'error');
+  }
+
+  private applyConfigValues(stored: StoredPanel, values: Record<string, unknown>): Record<string, unknown> {
+    const applied: Record<string, unknown> = {};
+    for (const [id, rawValue] of Object.entries(values)) {
+      const widget = findWidget(stored.def.widgets, id);
+      if (!widget || !isPersistedWidget(widget)) continue;
+      const value = safeConfigValue(rawValue);
+      if (value === undefined) continue;
+      (widget as unknown as { value?: unknown }).value = value;
+      applied[id] = value;
+    }
+    return applied;
+  }
+
+  private invokeConfigHandlers(stored: StoredPanel, values: Record<string, unknown>): void {
+    const invoke = () => {
+      for (const [id, value] of Object.entries(values)) {
+        try {
+          stored.handlers.get(id)?.onChange?.(value);
+        } catch (error) {
+          const detail = error instanceof Error ? error.stack || error.message : String(error);
+          this.deps.emitScriptLog(stored.scriptId, `Panel config handler error: ${detail}`, 'error');
+        }
+      }
+    };
+    const session = { scriptId: stored.scriptId, accountId: stored.accountId };
+    if (this.deps.runInScriptSession) this.deps.runInScriptSession(session, invoke);
+    else invoke();
+  }
+
+  private readConfig(stored: StoredPanel, name: string): Record<string, unknown> | null {
+    const config = this.configStore.load(
+      stored.scriptId,
+      stored.persistence.scope,
+      stored.accountId,
+      name,
+    );
+    if (!config) return null;
+    stored.activeConfig = config.name;
+    return this.applyConfigValues(stored, config.values);
+  }
+
+  private saveStoredConfig(stored: StoredPanel, name = stored.activeConfig): PanelConfigInfo {
+    const info = this.configStore.save(
+      stored.scriptId,
+      stored.persistence.scope,
+      stored.accountId,
+      name,
+      collectConfigValues(stored.def.widgets),
+    );
+    stored.activeConfig = info.name;
+    return info;
+  }
+
+  private scheduleAutoSave(stored: StoredPanel): void {
+    if (!stored.persistence.enabled || !stored.persistence.autoSave) return;
+    if (stored.autoSaveTimer) clearTimeout(stored.autoSaveTimer);
+    stored.autoSaveTimer = setTimeout(() => {
+      stored.autoSaveTimer = undefined;
+      try {
+        this.saveStoredConfig(stored);
+      } catch (error) {
+        this.reportConfigError(stored, 'autosave', error);
+      }
+    }, 150);
+  }
+
+  private flushAutoSave(stored: StoredPanel): void {
+    if (!stored.autoSaveTimer) return;
+    clearTimeout(stored.autoSaveTimer);
+    stored.autoSaveTimer = undefined;
+    try {
+      this.saveStoredConfig(stored);
+    } catch (error) {
+      this.reportConfigError(stored, 'autosave', error);
+    }
+  }
+
   private serializableDef(stored: StoredPanel): unknown {
     return {
       title: stored.def.title,
       subtitle: stored.def.subtitle,
       width: stored.def.width,
+      maxHeight: stored.def.maxHeight,
+      density: stored.def.density,
+      theme: stored.def.theme,
       autoOpen: stored.def.autoOpen,
       widgets: stored.def.widgets,
     };
@@ -113,23 +286,34 @@ export class ScriptPanelRegistry {
 
   /** Implementation of `Hive.ui.panel.define`. */
   define(def: PanelDefinition): PanelHandle {
-    const scriptId = this.currentScriptId();
-    if (!scriptId) {
+    const session = this.currentSession();
+    if (!session) {
       throw new Error(
         'Hive.ui.panel.define must be called from a script (onStart/onLoop/onStop).',
       );
     }
+    const { scriptId, accountId } = session;
 
-    const handlers = new Map<string, { onClick?: () => void; onChange?: (v: unknown) => void }>();
+    const previous = this.panels.get(scriptId);
+    if (previous) this.flushAutoSave(previous);
+
+    const handlers = new Map<string, WidgetHandlers>();
     const widgets = extractHandlers(def.widgets ?? [], handlers);
 
     const stored: StoredPanel = {
       scriptId,
+      accountId,
       def: { ...def, widgets },
       handlers,
+      persistence: normalizePersistence(def.persistence),
+      activeConfig: String(def.persistence?.config || '').trim() || 'default',
       isOpen: false,
     };
     this.panels.set(scriptId, stored);
+
+    const restoredValues = stored.persistence.enabled && stored.persistence.autoLoad
+      ? this.readConfig(stored, stored.activeConfig)
+      : null;
 
     this.emit({
       type: 'scriptPanelState',
@@ -143,9 +327,16 @@ export class ScriptPanelRegistry {
       this.emit({ type: 'scriptPanelOpen', scriptId });
     }
 
+    if (restoredValues && Object.keys(restoredValues).length > 0) {
+      queueMicrotask(() => {
+        if (this.panels.get(scriptId) === stored) this.invokeConfigHandlers(stored, restoredValues);
+      });
+    }
+
     const self = this;
     const handle: PanelHandle = {
       get isOpen() { return stored.isOpen; },
+      get activeConfig() { return stored.activeConfig; },
       open() {
         if (stored.isOpen) return;
         stored.isOpen = true;
@@ -158,6 +349,10 @@ export class ScriptPanelRegistry {
       },
       update(patch: Partial<PanelDefinition>) {
         const merged: PanelDefinition = { ...stored.def, ...patch };
+        if (patch.persistence !== undefined) {
+          stored.persistence = normalizePersistence(patch.persistence);
+          stored.activeConfig = stored.persistence.config;
+        }
         if (patch.widgets) {
           // Re-extract handlers from the new tree; preserve existing ones for ids
           // that still exist (entries get overwritten naturally by extractHandlers).
@@ -172,6 +367,7 @@ export class ScriptPanelRegistry {
           def: self.serializableDef(stored),
           isOpen: stored.isOpen,
         });
+        self.scheduleAutoSave(stored);
       },
       setValue(id, value) {
         const w = findWidget(stored.def.widgets, id) as { value?: unknown } | undefined;
@@ -185,6 +381,33 @@ export class ScriptPanelRegistry {
           }
         }
         self.emit({ type: 'scriptPanelPatches', scriptId, patches: [{ op: 'value', id, value } as ScriptPanelPatch] });
+        if (w && isPersistedWidget(w as unknown as PanelWidget)) self.scheduleAutoSave(stored);
+      },
+      getValue<T = unknown>(id: string): T | undefined {
+        const w = findWidget(stored.def.widgets, id) as unknown as Record<string, unknown> | undefined;
+        if (!w) return undefined;
+        if (w.type === 'item') return w.item as T;
+        if (w.type === 'itemGrid') return w.items as T;
+        return w.value as T | undefined;
+      },
+      setOptions(id, options) {
+        const normalized = Array.isArray(options)
+          ? options.map((option) => ({ ...option })) as SearchOption[]
+          : [];
+        const w = findWidget(stored.def.widgets, id) as unknown as { options?: unknown[] } | undefined;
+        if (w) w.options = normalized;
+        self.emit({ type: 'scriptPanelPatches', scriptId, patches: [{ op: 'options', id, value: normalized }] });
+      },
+      setProps(id, props) {
+        const safe: Record<string, unknown> = {};
+        for (const [key, value] of Object.entries(props ?? {})) {
+          if (key === 'id' || key === 'type' || key.startsWith('on') || typeof value === 'function') continue;
+          safe[key] = value;
+        }
+        const w = findWidget(stored.def.widgets, id) as unknown as Record<string, unknown> | undefined;
+        if (w) Object.assign(w, safe);
+        self.emit({ type: 'scriptPanelPatches', scriptId, patches: [{ op: 'props', id, value: safe }] });
+        if (w && 'value' in safe && isPersistedWidget(w as unknown as PanelWidget)) self.scheduleAutoSave(stored);
       },
       setImage(id, src) {
         const w = findWidget(stored.def.widgets, id) as { src?: string } | undefined;
@@ -227,6 +450,57 @@ export class ScriptPanelRegistry {
         if (w && w.type === 'log') w.lines = arr.slice();
         self.emit({ type: 'scriptPanelPatches', scriptId, patches: [{ op: 'log-set', id, value: arr }] });
       },
+      saveConfig(name) {
+        try {
+          return self.saveStoredConfig(stored, String(name || '').trim() || stored.activeConfig);
+        } catch (error) {
+          self.reportConfigError(stored, 'save', error);
+          throw error;
+        }
+      },
+      loadConfig(name) {
+        const requested = String(name || '').trim() || stored.activeConfig;
+        try {
+          const values = self.readConfig(stored, requested);
+          if (!values) return false;
+          self.emit({
+            type: 'scriptPanelState',
+            scriptId,
+            def: self.serializableDef(stored),
+            isOpen: stored.isOpen,
+          });
+          self.invokeConfigHandlers(stored, values);
+          return true;
+        } catch (error) {
+          self.reportConfigError(stored, 'load', error);
+          return false;
+        }
+      },
+      deleteConfig(name) {
+        const requested = String(name || '').trim();
+        if (!requested) return false;
+        try {
+          const deleted = self.configStore.delete(
+            stored.scriptId,
+            stored.persistence.scope,
+            stored.accountId,
+            requested,
+          );
+          if (deleted && stored.activeConfig === requested) stored.activeConfig = stored.persistence.config;
+          return deleted;
+        } catch (error) {
+          self.reportConfigError(stored, 'delete', error);
+          return false;
+        }
+      },
+      listConfigs() {
+        try {
+          return self.configStore.list(stored.scriptId, stored.persistence.scope, stored.accountId);
+        } catch (error) {
+          self.reportConfigError(stored, 'list', error);
+          return [];
+        }
+      },
     };
     return handle;
   }
@@ -241,19 +515,24 @@ export class ScriptPanelRegistry {
       return;
     }
 
+    // Mirror the value into the cached widget so future open() reflects it.
+    if (evt.kind === 'change' || evt.kind === 'select') {
+      const w = findWidget(stored.def.widgets, evt.widgetId);
+      if (w) {
+        (w as unknown as { value?: unknown }).value = evt.value;
+        if (isPersistedWidget(w)) this.scheduleAutoSave(stored);
+      }
+    }
+
     const entry = stored.handlers.get(evt.widgetId);
     if (!entry) return;
-
-    // Mirror the value into the cached widget so future open() reflects it.
-    if (evt.kind === 'change') {
-      const w = findWidget(stored.def.widgets, evt.widgetId) as { value?: unknown } | undefined;
-      if (w) w.value = evt.value;
-    }
 
     runInScript(evt.scriptId, () => {
       try {
         if (evt.kind === 'click') entry.onClick?.();
         else if (evt.kind === 'change') entry.onChange?.(evt.value);
+        else if (evt.kind === 'submit') entry.onSubmit?.(String(evt.value ?? ''));
+        else if (evt.kind === 'select') entry.onSelect?.(String(evt.value ?? ''));
       } catch (err) {
         // Don't let widget handlers tear down the bridge — surface via script log.
         const line = err instanceof Error ? err.stack || err.message : String(err);
@@ -264,7 +543,9 @@ export class ScriptPanelRegistry {
 
   /** Called when a script stops — removes its panel and notifies the dashboard. */
   destroyForScript(scriptId: string): void {
-    if (!this.panels.has(scriptId)) return;
+    const stored = this.panels.get(scriptId);
+    if (!stored) return;
+    this.flushAutoSave(stored);
     this.panels.delete(scriptId);
     this.emit({ type: 'scriptPanelState', scriptId, def: null, isOpen: false });
   }

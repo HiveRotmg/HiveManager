@@ -57,7 +57,103 @@ export class Self {
         throw new Error('Must be run inside Hive client');
     }
 
+    /** Current character level reported by the active player state. */
+    static getLevel(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Final stats after gear and exaltation bonuses. */
     static getStats(): Stats {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Base stats before gear and exaltation bonuses. */
+    static getBaseStats(): Stats {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Stats after gear bonuses but before exaltation bonuses. */
+    static getStatsWithGear(): Stats {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Base max HP before gear and exaltation bonuses. */
+    static getBaseMaxHP(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Max HP after gear bonuses but before exaltation bonuses. */
+    static getMaxHPWithGear(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Base max MP before gear and exaltation bonuses. */
+    static getBaseMaxMP(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Max MP after gear bonuses but before exaltation bonuses. */
+    static getMaxMPWithGear(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Base attack before gear and exaltation bonuses. */
+    static getBaseAtk(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Attack after gear bonuses but before exaltation bonuses. */
+    static getAtkWithGear(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Base defense before gear and exaltation bonuses. */
+    static getBaseDef(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Defense after gear bonuses but before exaltation bonuses. */
+    static getDefWithGear(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Base speed before gear and exaltation bonuses. */
+    static getBaseSpd(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Speed after gear bonuses but before exaltation bonuses. */
+    static getSpdWithGear(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Base dexterity before gear and exaltation bonuses. */
+    static getBaseDex(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Dexterity after gear bonuses but before exaltation bonuses. */
+    static getDexWithGear(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Base vitality before gear and exaltation bonuses. */
+    static getBaseVit(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Vitality after gear bonuses but before exaltation bonuses. */
+    static getVitWithGear(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Base wisdom before gear and exaltation bonuses. */
+    static getBaseWis(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Wisdom after gear bonuses but before exaltation bonuses. */
+    static getWisWithGear(): number {
         throw new Error('Must be run inside Hive client');
     }
 
@@ -205,6 +301,11 @@ export class Self {
         throw new Error('Must be run inside Hive client');
     }
 
+    /** Whether the current class can equip an item in one of its four gear slots. */
+    static canEquip(objectType: number): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
     static getName(): string {
         throw new Error('Must be run inside Hive client');
     }
@@ -240,6 +341,11 @@ export class Self {
 
     /** Power level from player stat **124**. */
     static getPowerLevel(): number {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Account star count from player stat **30**. */
+    static getStars(): number {
         throw new Error('Must be run inside Hive client');
     }
 }

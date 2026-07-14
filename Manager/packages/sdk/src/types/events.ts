@@ -50,7 +50,7 @@ export interface ShotFiredEvent {
 /** Local damage predicted before acknowledgement or confirmed by the server. */
 export interface DamageTakenEvent {
   amount: number;
-  source: 'server' | 'projectile' | 'aoe' | 'ground';
+  source: 'server' | 'projectile' | 'aoe' | 'ground' | 'condition';
   hp: number | null;
   maxHp: number | null;
   ownerId?: number;

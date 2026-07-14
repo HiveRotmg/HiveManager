@@ -7,15 +7,16 @@ import {
   type AutoNexusTrigger,
 } from '../src/auto-nexus';
 
-test('autonexus defaults off and retains the ProdMafia five-percent threshold', () => {
+test('autonexus defaults on at the Hive safety threshold', () => {
   const triggers: AutoNexusTrigger[] = [];
   const monitor = new AutoNexusMonitor((trigger) => triggers.push(trigger));
   monitor.setSafeMap(false);
-  monitor.reconcileServerHp(40, 1000, true);
+  monitor.reconcileServerHp(201, 1000, true);
+  monitor.reconcileServerHp(200, 1000);
 
-  assert.equal(triggers.length, 0);
-  assert.equal(monitor.getState().enabled, false);
-  assert.equal(monitor.getState().thresholdPercent, 5);
+  assert.equal(triggers.length, 1);
+  assert.equal(monitor.getState().enabled, true);
+  assert.equal(monitor.getState().thresholdPercent, 20);
 });
 
 test('authoritative HP at or below the configured percentage triggers once', () => {

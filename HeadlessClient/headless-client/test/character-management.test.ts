@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { Classes, ConvertSeasonalCharacterPacket, CreatePacket, Packet, PacketType } from 'realmlib';
+import {
+  Classes,
+  ConvertSeasonalCharacterPacket,
+  CreatePacket,
+  FailurePacket,
+  Packet,
+  PacketType,
+} from 'realmlib';
 import { Client } from '../src/client';
+import { ClientEvent } from '../src/events';
 
 test('Client.createCharacter sends configurable class and seasonal fields', () => {
   const client = makeClient();
@@ -56,6 +64,49 @@ test('Client supports positional creation and seasonal conversion helpers', () =
   assert.equal(sent[0].isSeasonal, true);
   assert.ok(sent[1] instanceof ConvertSeasonalCharacterPacket);
   assert.equal(sent[1].type, PacketType.CONVERT_SEASONAL_CHARACTER);
+});
+
+test('Client switches character selection and waits for CreateSuccess', async () => {
+  const client = makeClient({ charId: 3 });
+  let connectCalls = 0;
+  client.connect = () => {
+    connectCalls++;
+    queueMicrotask(() => client.emit(ClientEvent.Ready, 101));
+  };
+
+  await client.switchCharacter(8, 100);
+
+  assert.equal(client.getCharacterId(), 8);
+  assert.equal(connectCalls, 1);
+});
+
+test('Client restores the prior character after a failed switch', async () => {
+  const client = makeClient({ charId: 3 });
+  let connectCalls = 0;
+  client.connect = () => {
+    connectCalls++;
+    if (connectCalls !== 1) return;
+    queueMicrotask(() => {
+      const failure = new FailurePacket();
+      failure.errorId = 5;
+      failure.errorDescription = 'Character not found';
+      client.emit(ClientEvent.Failure, failure);
+    });
+  };
+
+  await assert.rejects(() => client.switchCharacter(999, 100), /Character not found/);
+
+  assert.equal(client.getCharacterId(), 3);
+  assert.equal(connectCalls, 2);
+});
+
+test('Client rejects invalid character ids without reconnecting', async () => {
+  const client = makeClient();
+  let connected = false;
+  client.connect = () => { connected = true; };
+
+  await assert.rejects(() => client.switchCharacter(0), /Invalid character id/);
+  assert.equal(connected, false);
 });
 
 function makeClient(overrides: Partial<ConstructorParameters<typeof Client>[0]> = {}): Client {

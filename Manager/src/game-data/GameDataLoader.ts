@@ -5,6 +5,12 @@ import { Logger } from '../util/Logger.js';
 
 export interface ProjectileDef {
   id: number;
+  /** Projectile visual object id from `<ObjectId>`. */
+  objectId: string;
+  /** Explicit projectile `<Size>`, or -1 to inherit the firing container size. */
+  visualSize: number;
+  faceDir: boolean;
+  noRotation: boolean;
   damage: number;
   speed: number;
   lifetimeMs: number;
@@ -66,6 +72,11 @@ export interface ObjectDef {
   objectClass: string;
   textureFile: string;
   textureIndex: number;
+  /** Default render size percentage. Live SIZE_STAT overrides this per instance. */
+  size: number;
+  /** Projectile texture rotation correction, in radians. */
+  angleCorrection: number;
+  rotation: number;
   projectiles: Map<number, ProjectileDef>;
   maxHp: number;
   defense: number;
@@ -95,6 +106,8 @@ export interface ObjectDef {
   isLoot: boolean;
   /** Raw `<Tier>` text from objects.xml (numeric tier, UT, ST, …). */
   tierStr: string;
+  /** Player-class inventory slot types from `<SlotTypes>`. */
+  slotTypes?: number[];
   /** `<DungeonName>` from portal objects — the dungeon this portal leads to. */
   dungeonName: string;
   bagType: number;
@@ -409,6 +422,7 @@ export interface GameWikiTileRow {
  */
 export class GameDataLoader {
   private objects = new Map<number, ObjectDef>();
+  private objectTypesById = new Map<string, number>();
   private enchantments = new Map<number, EnchantmentDef>();
   private tileSpeedMap = new Map<number, number>();
   private tileNameMap = new Map<number, string>();
@@ -439,6 +453,7 @@ export class GameDataLoader {
       const displayId = String(obj.DisplayId ?? '').trim();
       const objectClass = obj.Class ?? '';
       const objectTexture = obj.Texture ?? obj.AnimatedTexture ?? obj.RandomTexture?.Texture;
+      const objectSize = finiteOr(obj.Size ?? obj.MinSize, 100);
       const subattacks = readWeaponSubattacks(obj.Subattack, obj);
       const primaryPattern = subattacks[0]?.patterns[0];
       const fastestSubattackRate = subattacks.reduce(
@@ -453,6 +468,9 @@ export class GameDataLoader {
         objectClass,
         textureFile: readFirstTextureFile(objectTexture),
         textureIndex: readFirstTextureIndex(objectTexture),
+        size: objectSize === -1 ? 0 : objectSize,
+        angleCorrection: finiteOr(obj.AngleCorrection, 0) * Math.PI / 4,
+        rotation: finiteOr(obj.Rotation, 0),
         projectiles: new Map(),
         maxHp: Number(obj.MaxHitPoints ?? 0),
         defense: Number(obj.Defense ?? 0),
@@ -479,6 +497,9 @@ export class GameDataLoader {
         isContainer: obj.Container !== undefined,
         isLoot: obj.Loot !== undefined,
         tierStr: String(obj.Tier ?? '').trim(),
+        slotTypes: typeof obj.SlotTypes === 'string'
+          ? obj.SlotTypes.split(',').map((value: string) => Number(value.trim()))
+          : undefined,
         bagType: (() => {
           const v = Number(obj.BagType);
           return Number.isFinite(v) ? v : 0;
@@ -518,6 +539,10 @@ export class GameDataLoader {
 
           def.projectiles.set(projId, {
             id: projId,
+            objectId: String(proj.ObjectId ?? '').trim(),
+            visualSize: proj.Size === undefined ? -1 : Number(proj.Size),
+            faceDir: proj.FaceDir !== undefined,
+            noRotation: proj.NoRotation !== undefined,
             damage: Number(proj.Damage ?? 0),
             speed: Number(proj.Speed ?? 0),
             lifetimeMs: Number(proj.LifetimeMS ?? 0),
@@ -547,6 +572,7 @@ export class GameDataLoader {
       }
 
       this.objects.set(type, def);
+      if (id) this.objectTypesById.set(id.trim().toLowerCase(), type);
     }
 
     const projCount = [...this.objects.values()].reduce(
@@ -576,6 +602,11 @@ export class GameDataLoader {
 
   getObject(type: number): ObjectDef | undefined {
     return this.objects.get(type);
+  }
+
+  getObjectById(id: string): ObjectDef | undefined {
+    const type = this.objectTypesById.get(String(id || '').trim().toLowerCase());
+    return type === undefined ? undefined : this.objects.get(type);
   }
 
   loadEnchantments(xmlPath: string): void {
@@ -705,6 +736,17 @@ export class GameDataLoader {
     }
     out.sort((a, b) => a.name.localeCompare(b.name) || (a.objectType - b.objectType));
     return out;
+  }
+
+  /** True only for a destination object whose XML id begins with "Teleport Beacon". */
+  isTeleportBeacon(objectType: number): boolean {
+    const id = this.objects.get(objectType)?.id.trim() ?? '';
+    return /^teleport beacon(?:\s|$)/i.test(id);
+  }
+
+  /** Returns all known teleport destination beacon types, excluding other beacon-like objects. */
+  getTeleportBeaconTypes(): { objectType: number; name: string }[] {
+    return this.getBeaconTypes().filter(({ objectType }) => this.isTeleportBeacon(objectType));
   }
 
   /** Check if an object type is a boss (Quest tag + HP threshold). */

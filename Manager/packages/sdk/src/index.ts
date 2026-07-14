@@ -15,7 +15,7 @@ export type { Portal } from './types/world/Portal';
 export type { Projectile } from './types/world/Projectile';
 export type { ObjectCategory } from './types/world/ObjectCategory';
 export type { Item } from './types/items/Item';
-export type { VaultItem } from './types/items/VaultItem';
+export type { StorageItem } from './types/items/StorageItem';
 export type { GameObject } from './types/entities/GameObject';
 export type { Enemy } from './types/entities/Enemy';
 export type { PlayerEntity } from './types/entities/PlayerEntity';
@@ -90,7 +90,11 @@ export {
   INVENTORY_TOTAL_SLOT_COUNT,
   type InventoryStorageSide,
   type InventoryContainer,
+  type InventoryStorageContainer,
+  type InventoryStorageRange,
   type ContainerSlot,
+  type VaultStorageContainerSnapshot,
+  type VaultStorageSnapshot,
 } from './inventory';
 export { loot } from './loot';
 export { discord, DiscordWebhook } from './discord';
@@ -99,6 +103,7 @@ export { Self } from './self/Self';
 export { Pet } from './self/Pet';
 export { connection } from './connection';
 export { character } from './character';
+export type { CharacterInfo } from './character';
 export { AutoNexus } from './autoNexus/AutoNexus';
 export type {
   AutoNexusOptions,
@@ -106,7 +111,7 @@ export type {
   AutoNexusTriggerSource,
 } from './autoNexus/AutoNexus';
 export { Walking } from './walking/Walking';
-export type { AutoDodgeOptions, AutoDodgeState } from './walking/Walking';
+export type { AutoDodgeOptions, AutoDodgeState, TeleportBeaconDestination } from './walking/Walking';
 export { Combat } from './combat/Combat';
 export type {
   AutoAbilityOptions,
@@ -117,8 +122,6 @@ export type {
 } from './combat/Combat';
 export { Players } from './players/Players';
 export { Enemies } from './enemies/Enemies';
-export { Inventory } from './inventory/Inventory';
-export { Vault } from './vault/Vault';
 export { World } from './world/World';
 export { Tiles } from './world/tiles/Tiles';
 export { Objects } from './world/objects/Objects';
@@ -135,16 +138,40 @@ export type {
   PanelWidget,
   PanelButtonVariant,
   PanelHeadingLevel,
+  PanelTone,
+  PanelDensity,
+  PanelConfigScope,
+  PanelPersistenceOptions,
+  PanelConfigInfo,
+  PanelAlign,
+  PanelJustify,
+  PanelTextAlign,
+  PanelFontWeight,
+  PanelTheme,
+  PanelWidgetStyle,
+  BaseWidget,
   GroupWidget,
   RowWidget,
+  PanelTab,
+  TabsWidget,
   HeadingWidget,
   LabelWidget,
+  ImageWidget,
+  ItemSprite,
+  ItemWidget,
+  ItemGridWidget,
   ButtonWidget,
   ToggleWidget,
   SliderWidget,
   NumberWidget,
   TextWidget,
   SelectWidget,
+  SearchOption,
+  SearchWidget,
+  BadgeWidget,
+  MetricWidget,
+  DividerWidget,
+  CodeWidget,
   ProgressWidget,
   LogWidget,
   SpacerWidget,

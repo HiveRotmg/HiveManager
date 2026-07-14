@@ -73,7 +73,7 @@ export const events = {
     return noopUnsub;
   },
 
-  /** Fires for each new `Enemy`-category object in server `UPDATE` (`newObjs`). */
+  /** Fires for each newly tracked combat-targetable enemy; invincible controllers and spawners are excluded. */
   onEnemySpawned(handler: (e: EnemySpawnedEvent) => void): Unsubscribe {
     void handler;
     return noopUnsub;

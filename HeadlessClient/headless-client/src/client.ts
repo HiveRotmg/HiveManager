@@ -21,6 +21,7 @@ import {
   FailurePacket,
   ReconnectPacket,
   ServerPlayerShootPacket,
+  AllyShootPacket,
   PlayerShootPacket,
   EnemyShootPacket,
   ShowEffectPacket,
@@ -57,8 +58,15 @@ import {
   ConditionEffectBits,
   ConditionEffectBits2,
   VisualEffect,
+  IncomingPartyMemberInfoPacket,
+  PartyMemberAddedPacket,
+  PartyActionPacket,
 } from 'realmlib';
-import { deleteCharacter as deleteCharacterRequest } from './account-service';
+import {
+  deleteCharacter as deleteCharacterRequest,
+  getCharAndServers,
+  type CharInfo,
+} from './account-service';
 import {
   AutoCombatController,
   type AutoAbilityOptions,
@@ -77,7 +85,11 @@ import {
 } from './auto-nexus';
 import { ClientLifecycle, ClientLifecycleState } from './client-lifecycle';
 import { CommandSender, type SlotRef } from './command-sender';
-import { CombatTracker } from './combat-tracker';
+import {
+  CombatTracker,
+  type CombatProjectileDefinition,
+  type CombatProjectileSnapshot,
+} from './combat-tracker';
 import { BUILD_VERSION, GAME_ID, GAME_PORT, HELLO_TOKEN } from './constants';
 import { config } from './config';
 import { ClientEvent } from './events';
@@ -102,6 +114,10 @@ export const VAULT_CHEST_OBJECT_TYPE = 1284;
 export const POTION_VAULT_OBJECT_TYPE = 1859;
 export const MAIN_INVENTORY_SLOT_IDS = [4, 5, 6, 7, 8, 9, 10, 11] as const;
 export const BACKPACK_SLOT_IDS = [12, 13, 14, 15, 16, 17, 18, 19] as const;
+
+export interface ViewerProjectileSnapshot extends Omit<CombatProjectileSnapshot, 'side'> {
+  side: 'own' | 'enemy' | 'other';
+}
 
 enum AoeEffectId {
   Quiet = 2,
@@ -160,6 +176,12 @@ export interface ClientDamageTakenEvent {
   maxHp: number | null;
   ownerId?: number;
   bulletId?: number;
+}
+
+export interface ClientPartyMember {
+  playerId: number;
+  playerName: string;
+  classId: number;
 }
 
 export type ItemContainer =
@@ -243,6 +265,8 @@ export class Client extends EventEmitter {
   private readonly portalTracker = new PortalTracker();
   private readonly autoNexus: AutoNexusMonitor;
   private readonly combat: CombatTracker | undefined;
+  private viewerOtherProjectilesEnabled = false;
+  private readonly viewerOtherProjectiles = new Map<string, ViewerProjectileSnapshot>();
   private readonly autoCombat: AutoCombatController | undefined;
   private readonly commands = new CommandSender(() => ({
     io: this.io,
@@ -316,23 +340,27 @@ export class Client extends EventEmitter {
   private seasonal: boolean | undefined;
   private pos = { x: 0, y: 0 };
   private posKnown = false;
-  /** Latest authoritative self-position the server reported via NewTick. Drives movement so we never outrun the server. */
+  /** Latest authoritative self-position reported via NewTick, used for confirmation and range checks. */
   private serverPos: { x: number; y: number } | undefined;
   /** Gameplay-clock epoch. It intentionally survives every socket/map reconnect. */
   private connectStart = Date.now();
   private lastFrameTime = 0;
   private lastLocalMovementAt = 0;
   private lastGroundDamageAt = 0;
+  private conditionDamageRemainder = 0;
   private tickCount = 0;
   /** Tick id from the most recent NewTick, and the server-reported ms between the last two ticks. */
   private lastTickId = -1;
   private lastTickTime = 0;
   private readonly seenUnknown = new Set<number>();
   private player: PlayerData | undefined;
+  private partyId: number | null = null;
+  private readonly partyMembers = new Map<number, ClientPartyMember>();
   private inQueue = false;
   private mapName = 'Unknown';
   private mapWidth = 0;
   private mapHeight = 0;
+  private allowPlayerTeleport = false;
   private lastInvResult: InvResultSnapshot | undefined;
   private lastVaultContent: VaultContentSnapshot | undefined;
   /** Latest slot contents learned from successful INVRESULTs, keyed by container object id. */
@@ -360,6 +388,8 @@ export class Client extends EventEmitter {
   private lastUsePortalTick = -100;
   private usePortalAttempts = 0;
   private reconnectTimer: TimerHandle | undefined;
+  /** Target id while an SDK-requested character switch is waiting for CreateSuccess. */
+  private characterSwitchTarget: number | undefined;
 
   // Navigation to a non-vault portal (pet yard, guild hall, daily quest room).
   // The vault has its own bespoke path above (VAULT_CONTENT / inVault); this
@@ -376,7 +406,8 @@ export class Client extends EventEmitter {
   /** Latched on a fatal, non-recoverable failure so we stop auto-reconnecting until a manual connect. */
   private giveUp = false;
   private watchdogTimer: TimerHandle | undefined;
-  private combatTimer: TimerHandle | undefined;
+  /** ProdMafia-style local frame loop for continuous movement and combat simulation. */
+  private localFrameTimer: TimerHandle | undefined;
   /** Wall-clock of the last byte/packet received from the server; drives the liveness watchdog. */
   private lastActivityAt = 0;
   /** Wall-clock at which the current connect attempt began; drives the handshake timeout. */
@@ -516,10 +547,13 @@ export class Client extends EventEmitter {
 
   /** Optimistically pathfinds toward a position using streamed map knowledge. */
   pathfindingWalkTo(target: { x: number; y: number }, arriveThreshold = config.arriveThreshold): boolean {
+    const wasPathfinding = this.pathfinder.hasTarget();
     if (!this.pathfinder.setTarget(target, arriveThreshold)) {
       return false;
     }
-    this.movement.clear();
+    // Script loops commonly refresh the same target. Preserve the active
+    // waypoint so its authoritative stall timer can still trigger recovery.
+    if (!wasPathfinding) this.movement.clear();
     return true;
   }
 
@@ -540,13 +574,11 @@ export class Client extends EventEmitter {
   enableAutoDodge(options: AutoDodgeOptions = {}): boolean {
     if (!this.autoDodge) return false;
     this.autoDodge.setEnabled(true, options);
-    this.lastLocalMovementAt = this.time();
     return true;
   }
 
   disableAutoDodge(): void {
     this.autoDodge?.setEnabled(false);
-    this.lastLocalMovementAt = 0;
   }
 
   isAutoDodgeEnabled(): boolean {
@@ -567,7 +599,26 @@ export class Client extends EventEmitter {
     return this.player;
   }
 
-  /** Updates autonexus settings for this account. Autonexus defaults to off. */
+  /** Latest party roster, tracked from connection time rather than first SDK access. */
+  getPartyMembers(): ClientPartyMember[] {
+    return [...this.partyMembers.values()]
+      .sort((a, b) => a.playerId - b.playerId)
+      .map((member) => ({ ...member }));
+  }
+
+  getPartyId(): number | null {
+    return this.partyId;
+  }
+
+  getLocalPartyPlayerId(): number | null {
+    const localName = this.player?.name.trim().toLowerCase();
+    if (!localName) return null;
+    return this.getPartyMembers().find(
+      (member) => member.playerName.trim().toLowerCase() === localName,
+    )?.playerId ?? null;
+  }
+
+  /** Updates autonexus settings for this account. Autonexus defaults to on at 20%. */
   configureAutoNexus(options: Partial<AutoNexusConfig>): AutoNexusState {
     this.autoNexus.configure(options);
     return this.autoNexus.getState();
@@ -593,6 +644,34 @@ export class Client extends EventEmitter {
   /** Current estimated (dead-reckoned) player position. */
   getPosition(): { x: number; y: number } {
     return { x: this.pos.x, y: this.pos.y };
+  }
+
+  /** Current gameplay clock, matching the timestamps stored on projectile spawns. */
+  getGameTime(): number {
+    return this.time();
+  }
+
+  /** Enables render-only tracking for other players' shots while a viewer needs it. */
+  setViewerOtherProjectilesEnabled(enabled: boolean): void {
+    if (this.viewerOtherProjectilesEnabled === enabled) return;
+    this.viewerOtherProjectilesEnabled = enabled;
+    if (!enabled) this.viewerOtherProjectiles.clear();
+  }
+
+  /** Active analytic projectile trajectories for the viewer. */
+  getViewerProjectiles(): ViewerProjectileSnapshot[] {
+    const now = this.time();
+    for (const [key, projectile] of this.viewerOtherProjectiles) {
+      if (now - projectile.startTime > projectile.definition.lifetimeMs) {
+        this.viewerOtherProjectiles.delete(key);
+      }
+    }
+    const out: ViewerProjectileSnapshot[] = [];
+    for (const projectile of this.combat?.getActiveProjectiles() ?? []) {
+      out.push(projectile as ViewerProjectileSnapshot);
+    }
+    out.push(...this.viewerOtherProjectiles.values());
+    return out;
   }
 
   /** Latest position the server reported for us (authoritative), if any. */
@@ -678,6 +757,83 @@ export class Client extends EventEmitter {
   /** Character id selected during login. */
   getCharacterId(): number {
     return this.opts.charId;
+  }
+
+  /** Fetches every existing character on this account through `/char/list`. */
+  async listCharacters(): Promise<CharInfo[]> {
+    await this.ensureCredentials();
+    const { characters } = await getCharAndServers(
+      this.accessToken,
+      this.opts.proxy ? { proxy: this.opts.proxy } : undefined,
+    );
+    return characters.map((entry) => ({
+      ...entry,
+      equipment: entry.equipment ? [...entry.equipment] : undefined,
+    }));
+  }
+
+  /**
+   * Selects an existing character and reconnects this client through the Nexus.
+   * Resolves only after the selected character receives CreateSuccess.
+   */
+  async switchCharacter(characterId: number, timeoutMs = 30_000): Promise<void> {
+    if (!Number.isInteger(characterId) || characterId <= 0) {
+      throw new Error(`Invalid character id: ${characterId}`);
+    }
+    if (this.characterSwitchTarget !== undefined) {
+      throw new Error(`Already switching to character ${this.characterSwitchTarget}`);
+    }
+    if (characterId === this.opts.charId && this.isInWorld()) {
+      return;
+    }
+
+    const previousCharId = this.opts.charId;
+    const previousNeedsNewChar = this.opts.needsNewChar;
+    this.characterSwitchTarget = characterId;
+    this.opts.charId = characterId;
+    this.opts.needsNewChar = false;
+    this.wantVault = false;
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let timer: TimerHandle | undefined;
+        let settled = false;
+        const finish = (error?: Error): void => {
+          if (settled) return;
+          settled = true;
+          this.off(ClientEvent.Ready, onReady);
+          this.off(ClientEvent.Failure, onFailure);
+          this.timers.clear(timer);
+          if (error) reject(error);
+          else resolve();
+        };
+        const onReady = (): void => finish();
+        const onFailure = (packet: FailurePacket): void => {
+          finish(new Error(
+            `Could not switch to character ${characterId}: ${packet.errorDescription || `failure ${packet.errorId}`}`,
+          ));
+        };
+
+        this.once(ClientEvent.Ready, onReady);
+        this.once(ClientEvent.Failure, onFailure);
+        timer = this.timers.setTimeout(
+          () => finish(new Error(`Timed out switching to character ${characterId}`)),
+          Math.max(1, timeoutMs),
+        );
+        this.resetForNexus();
+        this.connect();
+      });
+    } catch (error) {
+      this.opts.charId = previousCharId;
+      this.opts.needsNewChar = previousNeedsNewChar;
+      if (!this.isInWorld()) {
+        this.resetForNexus();
+        this.connect();
+      }
+      throw error;
+    } finally {
+      this.characterSwitchTarget = undefined;
+    }
   }
 
   /** Current protocol game id (Nexus is -2). */
@@ -841,6 +997,16 @@ export class Client extends EventEmitter {
   /** Sends USE_PORTAL for a visible portal object id. */
   usePortal(objectId: number): void {
     this.commands.usePortal(objectId);
+  }
+
+  /** Whether the latest map metadata permits TELEPORT packets. */
+  canTeleport(): boolean {
+    return this.isInWorld() && this.allowPlayerTeleport;
+  }
+
+  /** Sends TELEPORT to an in-world target object when the map permits it. */
+  teleportTo(objectId: number): boolean {
+    return this.canTeleport() && this.commands.teleportTo(objectId);
   }
 
   /** Walks into range of a visible portal, then sends USE_PORTAL on arrival. */
@@ -1276,15 +1442,14 @@ export class Client extends EventEmitter {
   /** All currently known slots for a logical container, including empty slots. */
   getContainerSlots(container: ItemContainer): SlotObjectData[] {
     const objectId = this.getContainerObjectId(container);
-    if (objectId === -1) return [];
     if (container === 'inventory') {
       return (this.player?.inventory ?? []).map((itemType, slotId) => SlotObjectData.from(objectId, slotId, itemType));
     }
     const key = storageSectionKey(container);
     if (key) {
-      const contents = this.lastVaultContent?.sections.find((section) => section.key === key)?.contents ?? [];
-      return contents.map((itemType, slotId) => SlotObjectData.from(objectId, slotId, itemType));
+      return this.storageContainerSlots(container).map(({ slot }) => slot);
     }
+    if (objectId === -1) return [];
     // Some builds publish pet-bag inventory stats on the visible pet object
     // while INVSWAP expects PET_INSTANCEID. Preserve the authoritative slot
     // values but rewrite their object id to the container id used on the wire.
@@ -1308,6 +1473,10 @@ export class Client extends EventEmitter {
   /** A known slot in a logical container, including an empty slot. */
   getContainerSlot(container: ItemContainer, slotIndex: number): SlotObjectData | null {
     if (!Number.isInteger(slotIndex) || slotIndex < 0) return null;
+    if (storageSectionKey(container)) {
+      return this.storageContainerSlots(container)
+        .find((entry) => entry.logicalSlotId === slotIndex)?.slot ?? null;
+    }
     return this.getContainerSlots(container).find((slot) => slot.slotId === slotIndex) ?? null;
   }
 
@@ -1318,7 +1487,9 @@ export class Client extends EventEmitter {
 
   /** First known empty slot in a container. */
   getFirstEmptySlot(container: ItemContainer): SlotObjectData | null {
-    return this.getContainerSlots(container).find((slot) => slot.objectType === -1) ?? null;
+    return this.getContainerSlots(container).find(
+      (slot) => slot.objectType === -1 && (container !== 'inventory' || slot.slotId >= 4),
+    ) ?? null;
   }
 
   /**
@@ -1459,12 +1630,20 @@ export class Client extends EventEmitter {
       console.warn(`${this.tag} cannot INVSWAP ${ref.container}: invalid slot ${ref.slotId}`);
       return undefined;
     }
-    const objectId = this.getContainerObjectId(ref.container);
+    const storageKey = storageSectionKey(ref.container);
+    if (storageKey && this.lastVaultContent && !this.lastVaultContent.lastVaultPacket) {
+      console.warn(`${this.tag} cannot INVSWAP ${ref.container}: VAULT_CONTENT baseline is incomplete`);
+      return undefined;
+    }
+    const storageSlot = storageKey
+      ? this.storageContainerSlots(ref.container).find((entry) => entry.logicalSlotId === ref.slotId)?.slot
+      : undefined;
+    const objectId = storageSlot?.objectId ?? this.getContainerObjectId(ref.container);
     if (objectId === -1) {
       console.warn(`${this.tag} cannot INVSWAP ${ref.container}: container id is not known`);
       return undefined;
     }
-    const itemType = ref.itemType ?? this.containerItemType(ref.container, ref.slotId);
+    const itemType = ref.itemType ?? storageSlot?.objectType ?? this.containerItemType(ref.container, ref.slotId);
     if (itemType === undefined) {
       console.warn(
         `${this.tag} cannot INVSWAP ${ref.container} slot ${ref.slotId}: item type is not known; ` +
@@ -1472,7 +1651,7 @@ export class Client extends EventEmitter {
       );
       return undefined;
     }
-    return { objectId, slotId: ref.slotId, itemType };
+    return { objectId, slotId: storageSlot?.slotId ?? ref.slotId, itemType };
   }
 
   private containerItemType(container: ItemContainer, slotId: number): number | undefined {
@@ -1486,11 +1665,31 @@ export class Client extends EventEmitter {
     if (!key) {
       return undefined;
     }
-    return this.lastVaultContent?.sections.find((section) => section.key === key)?.contents[slotId];
+    return this.storageContainerSlots(container)
+      .find((entry) => entry.logicalSlotId === slotId)?.slot.objectType;
+  }
+
+  /** Flattened logical storage order paired with each physical wire-local slot. */
+  private storageContainerSlots(container: ItemContainer): Array<{
+    logicalSlotId: number;
+    slot: SlotObjectData;
+  }> {
+    const key = storageSectionKey(container);
+    if (!key) return [];
+    let logicalSlotId = 0;
+    return (this.lastVaultContent?.sections ?? [])
+      .filter((section) => section.key === key)
+      .flatMap((section) => section.contents.map((itemType, slotId) => ({
+        logicalSlotId: logicalSlotId++,
+        slot: SlotObjectData.from(section.objectId, slotId, itemType),
+      })));
   }
 
   private storageObjectId(sectionKey: 'vault' | 'potion', objectType: number): number {
-    const packetObjectId = this.lastVaultContent?.sections.find((section) => section.key === sectionKey)?.objectId;
+    if (this.lastVaultContent?.active === false) return -1;
+    const packetObjectId = this.lastVaultContent?.sections.find(
+      (section) => section.key === sectionKey && section.objectId > 0,
+    )?.objectId;
     if (packetObjectId !== undefined && packetObjectId !== -1) {
       return packetObjectId;
     }
@@ -1565,7 +1764,11 @@ export class Client extends EventEmitter {
     if (!this.combat) {
       return false;
     }
+    if (this.combat.isProjectileNoclipEnabled() === enabled) {
+      return true;
+    }
     this.combat.setProjectileNoclip(enabled);
+    console.log(`${this.tag} projectile noclip ${enabled ? 'enabled' : 'disabled'}`);
     return true;
   }
 
@@ -1601,18 +1804,56 @@ export class Client extends EventEmitter {
   }
 
   private storageSectionObjectId(sectionKey: 'material' | 'gift' | 'spoils'): number {
-    return this.lastVaultContent?.sections.find((section) => section.key === sectionKey)?.objectId ?? -1;
+    if (this.lastVaultContent?.active === false) return -1;
+    return this.lastVaultContent?.sections.find(
+      (section) => section.key === sectionKey && section.objectId > 0,
+    )?.objectId ?? -1;
   }
 
   /** Records inventory-shaped stats for any visible container object. */
   private captureContainerSlots(objectId: number, stats: StatData[]): void {
+    let vaultChanged = false;
     for (const stat of stats) {
+      const section = this.lastVaultContent?.sections.find((candidate) => candidate.objectId === objectId);
+      if (section && stat.statType === StatType.ENCHANTMENTS_STAT) {
+        const key = section.key === 'vault'
+          ? 'vaultChestEnchants'
+          : section.key === 'gift'
+            ? 'giftChestEnchants'
+            : section.key === 'spoils'
+              ? 'spoilsChestEnchants'
+              : null;
+        if (key && this.lastVaultContent && section.enchantments !== stat.stringStatValue) {
+          section.enchantments = stat.stringStatValue;
+          this.syncVaultEnchantSummary(section.key);
+          vaultChanged = true;
+        }
+        continue;
+      }
       const slotId = inventorySlotIndex(stat.statType);
       if (slotId === null) continue;
       const slots = this.containerSlotItems.get(objectId) ?? new Map<number, number>();
       slots.set(slotId, stat.statValue);
       this.containerSlotItems.set(objectId, slots);
+      if (section && section.contents[slotId] !== stat.statValue) {
+        section.contents[slotId] = stat.statValue;
+        vaultChanged = true;
+      }
     }
+    if (vaultChanged && this.lastVaultContent) {
+      this.lastVaultContent.updatedAt = new Date().toISOString();
+      this.lastVaultContent.revision += 1;
+    }
+  }
+
+  private syncVaultEnchantSummary(sectionKey: string): void {
+    if (!this.lastVaultContent) return;
+    const value = this.lastVaultContent.sections.find(
+      (section) => section.key === sectionKey && section.enchantments,
+    )?.enchantments ?? '';
+    if (sectionKey === 'vault') this.lastVaultContent.vaultChestEnchants = value;
+    else if (sectionKey === 'gift') this.lastVaultContent.giftChestEnchants = value;
+    else if (sectionKey === 'spoils') this.lastVaultContent.spoilsChestEnchants = value;
   }
 
   /** Bridges an io packet emission onto this client's emitter (for the current io). */
@@ -1749,7 +1990,12 @@ export class Client extends EventEmitter {
    */
   async deleteCharacter(charId: number): Promise<void> {
     console.log(`${this.tag} deleting character ${charId}`);
-    await deleteCharacterRequest(this.accessToken, charId);
+    await this.ensureCredentials();
+    await deleteCharacterRequest(
+      this.accessToken,
+      charId,
+      this.opts.proxy ? { proxy: this.opts.proxy } : undefined,
+    );
     console.log(`${this.tag} deleted character ${charId}`);
   }
 
@@ -1990,8 +2236,8 @@ export class Client extends EventEmitter {
     this.lifecycle.transition(ClientLifecycleState.Stopped);
     this.giveUp = true; // don't let an in-flight close schedule a reconnect
     this.stopWatchdog();
-    this.timers.clear(this.combatTimer);
-    this.combatTimer = undefined;
+    this.timers.clear(this.localFrameTimer);
+    this.localFrameTimer = undefined;
     this.timers.clear(this.reconnectTimer);
     this.reconnectTimer = undefined;
     this.reconnectAttempts = 0;
@@ -2045,6 +2291,12 @@ export class Client extends EventEmitter {
 
   /** Clears state tied to the current map; call on any map change. */
   private clearMapState(): void {
+    if (this.lastVaultContent) {
+      this.lastVaultContent.active = false;
+      this.lastVaultContent.updatedAt = new Date().toISOString();
+      this.lastVaultContent.revision += 1;
+      for (const section of this.lastVaultContent.sections) section.objectId = -1;
+    }
     this.objectId = -1;
     this.petObjectId = -1;
     this.petInstanceId = -1;
@@ -2053,9 +2305,11 @@ export class Client extends EventEmitter {
     this.posKnown = false;
     this.serverPos = undefined;
     this.player = undefined;
+    this.allowPlayerTeleport = false;
     this.lastFrameTime = 0;
     this.lastLocalMovementAt = 0;
     this.lastGroundDamageAt = 0;
+    this.conditionDamageRemainder = 0;
     this.objects.clear();
     this.tiles.clear();
     this.pathfinder.resetMap();
@@ -2069,6 +2323,7 @@ export class Client extends EventEmitter {
     this.autoNexus.reset();
     this.autoNexus.setSafeMap(true);
     this.combat?.clear();
+    this.viewerOtherProjectiles.clear();
     this.autoCombat?.clearMap();
     this.portalTracker.clear();
   }
@@ -2220,9 +2475,10 @@ export class Client extends EventEmitter {
     const generation = this.lifecycle.nextGeneration();
     this.lifecycle.transition(ClientLifecycleState.Connecting);
     this.stopWatchdog();
-    this.timers.clear(this.combatTimer);
-    this.combatTimer = undefined;
+    this.timers.clear(this.localFrameTimer);
+    this.localFrameTimer = undefined;
     this.combat?.clear();
+    this.viewerOtherProjectiles.clear();
     this.destroySocket();
     this.timers.clear(this.stallResumeTimer);
     this.stallResumeTimer = undefined;
@@ -2245,9 +2501,7 @@ export class Client extends EventEmitter {
     this.setupPacketTraffic();
     this.registerHandlers();
     this.setupDebug();
-    if (this.combat) {
-      this.combatTimer = this.timers.setInterval(() => this.updateLocalFrame(this.time()), 16);
-    }
+    this.localFrameTimer = this.timers.setInterval(() => this.updateLocalFrame(this.time()), 16);
 
     this.socket.on('close', () => {
       if (!this.lifecycle.isCurrent(generation)) {
@@ -2260,8 +2514,8 @@ export class Client extends EventEmitter {
         this.lifecycle.transition(ClientLifecycleState.Disconnected);
       }
       this.stopWatchdog();
-      this.timers.clear(this.combatTimer);
-      this.combatTimer = undefined;
+      this.timers.clear(this.localFrameTimer);
+      this.localFrameTimer = undefined;
       if (this.stalled) {
         this.unstall();
       }
@@ -2485,6 +2739,7 @@ export class Client extends EventEmitter {
     this.io.on(PacketType.NEWTICK, (p: NewTickPacket)                     => this.handleNewTick(p));
     this.io.on(PacketType.PING, (p: PingPacket)                           => this.handlePing(p));
     this.io.on(PacketType.SERVERPLAYERSHOOT, (p: ServerPlayerShootPacket) => this.handleServerPlayerShoot(p));
+    this.io.on(PacketType.ALLYSHOOT, (p: AllyShootPacket)                 => this.handleAllyShoot(p));
     this.io.on(PacketType.ENEMYSHOOT, (p: EnemyShootPacket)               => this.handleEnemyShoot(p));
     this.io.on(PacketType.SHOWEFFECT, (p: ShowEffectPacket)               => this.handleShowEffect(p));
     this.io.on(PacketType.AOE, (p: AoePacket)                             => this.handleAoe(p));
@@ -2492,6 +2747,9 @@ export class Client extends EventEmitter {
     this.io.on(PacketType.GOTO, (p: GotoPacket)                           => this.handleGoto(p));
     this.io.on(PacketType.VAULT_CONTENT,  (p: VaultContentPacket)         => this.handleVaultContent(p));
     this.io.on(PacketType.INVRESULT, (p: InvResultPacket)                 => this.handleInvResult(p));
+    this.io.on(PacketType.INCOMING_PARTY_MEMBER_INFO, (p: IncomingPartyMemberInfoPacket) => this.handlePartyRoster(p));
+    this.io.on(PacketType.PARTY_MEMBER_ADDED, (p: PartyMemberAddedPacket) => this.handlePartyMemberAdded(p));
+    this.io.on(PacketType.PARTY_ACTION, (p: PartyActionPacket)           => this.handlePartyAction(p));
     this.io.on(PacketType.QUEUE_INFORMATION, (p: QueueInfoPacket)         => this.handleQueueInformation(p));
     this.io.on(PacketType.RECONNECT, (p: ReconnectPacket)                 => this.handleReconnect(p));
     this.io.on(PacketType.FAILURE, (p: FailurePacket)                     => this.handleFailure(p));
@@ -2503,12 +2761,43 @@ export class Client extends EventEmitter {
     }
   }
 
+  private handlePartyRoster(packet: IncomingPartyMemberInfoPacket): void {
+    this.partyId = packet.partyId;
+    this.partyMembers.clear();
+    for (const member of packet.partyPlayers) {
+      this.partyMembers.set(member.playerId, {
+        playerId: member.playerId,
+        playerName: member.name,
+        classId: member.classId,
+      });
+    }
+  }
+
+  private handlePartyMemberAdded(packet: PartyMemberAddedPacket): void {
+    this.partyMembers.set(packet.playerId, {
+      playerId: packet.playerId,
+      playerName: packet.name,
+      classId: packet.classId,
+    });
+  }
+
+  private handlePartyAction(packet: PartyActionPacket): void {
+    if (packet.actionId !== 6) return;
+    if (packet.playerId === this.getLocalPartyPlayerId()) {
+      this.partyMembers.clear();
+      this.partyId = null;
+      return;
+    }
+    this.partyMembers.delete(packet.playerId);
+  }
+
   /** Handles map metadata, then creates or loads the configured character. */
   private handleMapInfo(p: MapInfoPacket): void {
     console.log(`${this.tag} ✓ MapInfo accepted: "${p.name}" (${p.width}x${p.height})`);
     this.mapName = p.name;
     this.mapWidth = p.width;
     this.mapHeight = p.height;
+    this.allowPlayerTeleport = p.allowPlayerTeleport;
     this.pathfinder.setMapBounds(p.width, p.height);
     this.dodgeWorld?.setMapBounds(p.width, p.height);
     this.enteringVault = false;
@@ -2581,7 +2870,7 @@ export class Client extends EventEmitter {
         this.pos = { x: obj.status.pos.x, y: obj.status.pos.y };
         this.posKnown = true;
         this.player = processObject(obj);
-        this.reconcilePlayerHealth(this.player, true);
+        if (this.reconcilePlayerHealth(this.player, true)) return;
         this.capturePetObjectId(obj.status.stats);
         this.captureContainerSlots(obj.status.objectId, obj.status.stats);
       } else {
@@ -2637,17 +2926,15 @@ export class Client extends EventEmitter {
     this.findPendingPortal();
   }
 
-  /** Drives each game tick: movement, status updates, portal use, and events. */
+  /** Applies authoritative state before reporting movement so autonexus can suppress the tick. */
   private handleNewTick(p: NewTickPacket): void {
     const now = this.time();
-    const dt = this.lastFrameTime > 0 ? now - this.lastFrameTime : 0;
     this.lastFrameTime = now;
     this.lastTickId = p.tickId;
     this.lastTickTime = p.tickTime;
     this.tickCount++;
-    if (!this.autoDodge?.isEnabled()) this.updateTarget(dt, false, now);
+    if (this.updateStatuses(p)) return;
     this.sendMove(p, now);
-    this.updateStatuses(p);
     this.updateCombat(now);
     this.tryUseVaultPortal();
     this.tryUsePendingPortal();
@@ -2655,14 +2942,18 @@ export class Client extends EventEmitter {
     this.emit(ClientEvent.Tick, this.player);
   }
 
-  /** Runs high-frequency local movement before projectile collision resolution. */
+  /** Mirrors ProdMafia's render-frame movement integration at roughly 60 Hz. */
   private updateLocalFrame(now: number): void {
-    if (this.autoDodge?.isEnabled() && this.posKnown && this.player) {
+    if (this.posKnown && this.player) {
       const dt = this.lastLocalMovementAt > 0
         ? Math.min(34, Math.max(0, now - this.lastLocalMovementAt))
         : 0;
       this.lastLocalMovementAt = now;
-      if (dt > 0) this.updateTarget(dt, true, now);
+      if (dt > 0 && this.updateConditionDamage(dt)) return;
+      const hasMovementIntent = this.movement.hasTarget()
+        || this.pathfinder.hasTarget()
+        || (this.autoDodge?.isEnabled() ?? false);
+      if (dt > 0 && hasMovementIntent) this.updateTarget(dt, true, now);
     } else {
       this.lastLocalMovementAt = 0;
     }
@@ -2673,7 +2964,7 @@ export class Client extends EventEmitter {
   private updateCombat(now: number): void {
     this.combat?.update(now, {
       playerId: this.objectId,
-      playerPos: this.autoDodge?.isEnabled() ? this.pos : this.serverPos ?? this.pos,
+      playerPos: this.pos,
       mapWidth: this.mapWidth,
       mapHeight: this.mapHeight,
       entities: this.objects.values(),
@@ -2834,7 +3125,9 @@ export class Client extends EventEmitter {
     move.tickId = p.tickId;
     move.time = p.serverRealTimeMS;
     const record = new MoveRecord();
-    record.time = now;
+    // ProdMafia stamps the record with the frame that integrated this position,
+    // not the slightly later time at which NEWTICK happened to arrive.
+    record.time = this.lastLocalMovementAt > 0 ? Math.min(now, this.lastLocalMovementAt) : now;
     record.x = this.pos.x;
     record.y = this.pos.y;
     move.records = [record]; // must send >= 1 record or the server drops us
@@ -2842,7 +3135,7 @@ export class Client extends EventEmitter {
   }
 
   /** Applies per-object status deltas from the tick to player and portal state. */
-  private updateStatuses(p: NewTickPacket): void {
+  private updateStatuses(p: NewTickPacket): boolean {
     let selfUpdated = false;
     for (const status of p.statuses) {
       if (status.objectId === this.objectId) {
@@ -2868,22 +3161,38 @@ export class Client extends EventEmitter {
       }
     }
     if (selfUpdated && this.player) {
-      this.reconcilePlayerHealth(this.player);
+      return this.reconcilePlayerHealth(this.player);
     }
+    return false;
   }
 
   /** Emits any authoritative HP loss not already covered by local damage prediction. */
-  private reconcilePlayerHealth(player: PlayerData, full = false): void {
+  private reconcilePlayerHealth(player: PlayerData, full = false): boolean {
     if (!full) {
       const state = this.autoNexus.getState();
       if (state.syncedHp !== null && state.predictedHp !== null) {
         const serverDrop = Math.max(0, state.syncedHp - player.hp);
         const predictedDamage = Math.max(0, state.syncedHp - state.predictedHp);
         const unreportedDamage = Math.max(0, serverDrop - predictedDamage);
-        if (unreportedDamage > 0) this.recordDamageTaken(unreportedDamage, 'server');
+        if (unreportedDamage > 0 && this.recordDamageTaken(unreportedDamage, 'server')) return true;
       }
     }
-    this.autoNexus.reconcileServerHp(player.hp, player.maxHP, full);
+    return this.autoNexus.reconcileServerHp(player.hp, player.maxHP, full);
+  }
+
+  /** Mirrors ProdMafia's local 20 HP/s bleeding prediction between server ticks. */
+  private updateConditionDamage(dt: number): boolean {
+    const bleeding = ((this.player?.condition ?? 0) & ConditionEffectBits.BLEEDING) !== 0;
+    if (!bleeding) {
+      this.conditionDamageRemainder = 0;
+      return false;
+    }
+
+    this.conditionDamageRemainder += 20 * dt / 1000;
+    const damage = Math.floor(this.conditionDamageRemainder);
+    if (damage <= 0) return false;
+    this.conditionDamageRemainder -= damage;
+    return this.recordDamageTaken(damage, 'condition');
   }
 
   /** Re-emits raw traffic from each fresh PacketIO for fleet diagnostics. */
@@ -3000,6 +3309,7 @@ export class Client extends EventEmitter {
   /** Acknowledges our own server-authoritative projectile events. */
   private handleServerPlayerShoot(p: ServerPlayerShootPacket): void {
     if (p.ownerId !== this.objectId) {
+      this.trackViewerOtherPlayerShoot(p);
       return;
     }
     const ack = new ShootAckPacket();
@@ -3007,6 +3317,56 @@ export class Client extends EventEmitter {
     ack.ackCount = 1;
     this.io.send(ack);
     this.combat?.trackOwnShoot(p, this.time());
+  }
+
+  private trackViewerOtherPlayerShoot(p: ServerPlayerShootPacket): void {
+    if (!this.viewerOtherProjectilesEnabled) return;
+    const definition = this.opts.combatData?.getProjectile(p.containerType, 0);
+    if (!definition || definition.lifetimeMs <= 0) return;
+    const startTime = this.time();
+    const shotCount = p.spellBomb && p.bulletCount > 0 ? p.bulletCount : 1;
+    for (let index = 0; index < shotCount; index++) {
+      const bulletId = (p.bulletId + index) & 0xffff;
+      const projectile: ViewerProjectileSnapshot = {
+        side: 'other',
+        bulletId,
+        bulletType: 0,
+        ownerId: p.ownerId,
+        containerType: p.containerType,
+        startX: p.startingPos.x,
+        startY: p.startingPos.y,
+        angle: p.angle + p.bulletAngle * index,
+        startTime,
+        definition: definition as CombatProjectileDefinition,
+        damage: p.damage,
+        hitObjects: new Set<number>(),
+      };
+      this.viewerOtherProjectiles.set(`${p.ownerId}:${bulletId}`, projectile);
+    }
+  }
+
+  /** Tracks the lower-detail ally projectile packet without any protocol response. */
+  private handleAllyShoot(p: AllyShootPacket): void {
+    if (!this.viewerOtherProjectilesEnabled) return;
+    const key = `${p.ownerId}:${p.bulletId}`;
+    if (this.viewerOtherProjectiles.has(key)) return;
+    const owner = this.objects.get(p.ownerId);
+    const definition = this.opts.combatData?.getProjectile(p.containerType, 0);
+    if (!owner || !definition || definition.lifetimeMs <= 0) return;
+    this.viewerOtherProjectiles.set(key, {
+      side: 'other',
+      bulletId: p.bulletId,
+      bulletType: 0,
+      ownerId: p.ownerId,
+      containerType: p.containerType,
+      startX: owner.x,
+      startY: owner.y,
+      angle: p.angle,
+      startTime: this.time(),
+      definition,
+      damage: 0,
+      hitObjects: new Set<number>(),
+    });
   }
 
   /** Acknowledges enemy projectile events so the server does not drop us. */
@@ -3130,8 +3490,24 @@ export class Client extends EventEmitter {
     return this.autoNexus.applyDamage(damage, source);
   }
 
-  /** Acknowledges server position corrections. */
-  private handleGoto(_p: GotoPacket): void {
+  /** Applies and acknowledges an authoritative server position correction. */
+  private handleGoto(p: GotoPacket): void {
+    const position = { x: p.position.x, y: p.position.y };
+    if (p.objectId === this.objectId) {
+      // TELEPORT is confirmed with a self-targeted GOTO. Rebase local movement
+      // as well as server state so SDK reads and the viewer move immediately.
+      this.pos = position;
+      this.serverPos = { ...position };
+      this.posKnown = true;
+    } else {
+      const tracked = this.objects.get(p.objectId);
+      if (tracked) {
+        tracked.x = position.x;
+        tracked.y = position.y;
+        this.pathfinder.upsertObject(tracked.objectId, tracked.type, tracked.x, tracked.y);
+        this.dodgeWorld?.upsertObject(tracked.objectId, tracked.type, tracked.x, tracked.y);
+      }
+    }
     const ack = new GotoAckPacket();
     ack.time = this.lastFrameTime;
     this.io.send(ack);
@@ -3140,23 +3516,86 @@ export class Client extends EventEmitter {
   /** Logs parsed vault storage sections and emits them for plugins. */
   private handleVaultContent(p: VaultContentPacket): void {
     this.inVault = true;
-    this.lastVaultContent = {
-      lastVaultPacket: p.lastVaultPacket,
-      vaultUpgradeCost: p.vaultUpgradeCost,
-      materialUpgradeCost: p.materialUpgradeCost,
-      potionUpgradeCost: p.potionUpgradeCost,
-      currentPotionMax: p.currentPotionMax,
-      nextPotionMax: p.nextPotionMax,
-      at: new Date().toISOString(),
-      sections: [
-        { key: 'vault', label: 'Vault', objectId: p.chestObjectId, contents: [...p.vaultContents] },
-        { key: 'material', label: 'Materials', objectId: p.materialObjectId, contents: [...p.materialContents] },
-        { key: 'gift', label: 'Gift Chest', objectId: p.giftObjectId, contents: [...p.giftContents] },
-        { key: 'potion', label: 'Potion Storage', objectId: p.potionObjectId, contents: [...p.potionContents] },
-        { key: 'spoils', label: 'Spoils Chest', objectId: p.spoilsObjectId, contents: [...p.spoilsContents] },
-      ],
-    };
-    for (const section of this.lastVaultContent.sections) {
+    const now = new Date().toISOString();
+    const previous = this.lastVaultContent;
+    const startsBaseline = !previous?.active || previous.lastVaultPacket;
+    if (startsBaseline && previous) {
+      for (const section of previous.sections) {
+        if (section.objectId > 0) this.containerSlotItems.delete(section.objectId);
+      }
+    }
+    const snapshot: VaultContentSnapshot = startsBaseline
+      ? {
+          capturedAt: now,
+          updatedAt: now,
+          revision: (previous?.revision ?? 0) + 1,
+          active: true,
+          lastVaultPacket: false,
+          vaultUpgradeCost: p.vaultUpgradeCost,
+          materialUpgradeCost: p.materialUpgradeCost,
+          seasonalSpoilUpgradeCost: p.seasonalSpoilUpgradeCost,
+          potionUpgradeCost: p.potionUpgradeCost,
+          currentPotionMax: p.currentPotionMax,
+          nextPotionMax: p.nextPotionMax,
+          vaultChestEnchants: '',
+          giftChestEnchants: '',
+          spoilsChestEnchants: '',
+          at: now,
+          sections: [],
+        }
+      : previous!;
+
+    if (!startsBaseline) snapshot.revision += 1;
+    snapshot.updatedAt = now;
+    snapshot.at = now;
+    snapshot.active = true;
+    snapshot.lastVaultPacket = p.lastVaultPacket;
+    snapshot.vaultUpgradeCost = p.vaultUpgradeCost;
+    snapshot.materialUpgradeCost = p.materialUpgradeCost;
+    snapshot.seasonalSpoilUpgradeCost = p.seasonalSpoilUpgradeCost;
+    snapshot.potionUpgradeCost = p.potionUpgradeCost;
+    snapshot.currentPotionMax = p.currentPotionMax;
+    snapshot.nextPotionMax = p.nextPotionMax;
+
+    const packetSections: VaultSectionSnapshot[] = [
+      {
+        key: 'vault', label: 'Vault', objectId: p.chestObjectId,
+        contents: [...p.vaultContents], enchantments: p.vaultChestEnchants,
+      },
+      {
+        key: 'material', label: 'Materials', objectId: p.materialObjectId,
+        contents: [...p.materialContents], enchantments: '',
+      },
+      {
+        key: 'gift', label: 'Gift Chest', objectId: p.giftObjectId,
+        contents: [...p.giftContents], enchantments: p.giftChestEnchants,
+      },
+      {
+        key: 'potion', label: 'Potion Storage', objectId: p.potionObjectId,
+        contents: [...p.potionContents], enchantments: '',
+      },
+      {
+        key: 'spoils', label: 'Spoils Chest', objectId: p.spoilsObjectId,
+        contents: [...p.spoilsContents], enchantments: p.spoilsChestEnchants,
+      },
+    ];
+    for (const section of packetSections) {
+      if (section.objectId <= 0 && section.contents.length === 0 && !section.enchantments) continue;
+      const existing = section.objectId > 0
+        ? snapshot.sections.findIndex(
+            (candidate) => candidate.key === section.key && candidate.objectId === section.objectId,
+          )
+        : -1;
+      if (existing >= 0) snapshot.sections[existing] = section;
+      else snapshot.sections.push(section);
+    }
+    this.lastVaultContent = snapshot;
+    this.syncVaultEnchantSummary('vault');
+    this.syncVaultEnchantSummary('gift');
+    this.syncVaultEnchantSummary('spoils');
+
+    for (const section of packetSections) {
+      if (section.objectId <= 0) continue;
       this.containerSlotItems.set(
         section.objectId,
         new Map(section.contents.map((itemType, slotId) => [slotId, itemType])),
@@ -3195,8 +3634,13 @@ export class Client extends EventEmitter {
       at: new Date().toISOString(),
     };
     if (p.success && !p.isUseItemAck()) {
-      this.applyInvResultSlot(p.fromSlot.objectId, p.fromSlot.slotId, p.fromSlot.objectType);
-      this.applyInvResultSlot(p.toSlot.objectId, p.toSlot.slotId, p.toSlot.objectType);
+      const vaultChanged =
+        this.applyInvResultSlot(p.fromSlot.objectId, p.fromSlot.slotId, p.fromSlot.objectType) |
+        this.applyInvResultSlot(p.toSlot.objectId, p.toSlot.slotId, p.toSlot.objectType);
+      if (vaultChanged && this.lastVaultContent) {
+        this.lastVaultContent.updatedAt = new Date().toISOString();
+        this.lastVaultContent.revision += 1;
+      }
     }
     const origin = p.isUseItemAck() ? 'USEITEM' : 'INVSWAP';
     console.log(
@@ -3208,7 +3652,8 @@ export class Client extends EventEmitter {
   }
 
   /** Applies the server-authoritative post-swap item value to local container state. */
-  private applyInvResultSlot(objectId: number, slotId: number, itemType: number): void {
+  private applyInvResultSlot(objectId: number, slotId: number, itemType: number): number {
+    if (objectId <= 0 || slotId < 0) return 0;
     const slots = this.containerSlotItems.get(objectId) ?? new Map<number, number>();
     slots.set(slotId, itemType);
     this.containerSlotItems.set(objectId, slots);
@@ -3216,9 +3661,11 @@ export class Client extends EventEmitter {
       this.player.inventory[slotId] = itemType;
     }
     const section = this.lastVaultContent?.sections.find((candidate) => candidate.objectId === objectId);
-    if (section) {
+    if (section && section.contents[slotId] !== itemType) {
       section.contents[slotId] = itemType;
+      return 1;
     }
+    return 0;
   }
 
   /** Tracks queue state while waiting for full maps. */
@@ -3433,12 +3880,20 @@ interface InvResultSnapshot {
 }
 
 interface VaultContentSnapshot {
+  capturedAt: string;
+  updatedAt: string;
+  revision: number;
+  active: boolean;
   lastVaultPacket: boolean;
   vaultUpgradeCost: number;
   materialUpgradeCost: number;
+  seasonalSpoilUpgradeCost: number;
   potionUpgradeCost: number;
   currentPotionMax: number;
   nextPotionMax: number;
+  vaultChestEnchants: string;
+  giftChestEnchants: string;
+  spoilsChestEnchants: string;
   at: string;
   sections: VaultSectionSnapshot[];
 }
@@ -3448,4 +3903,6 @@ interface VaultSectionSnapshot {
   label: string;
   objectId: number;
   contents: number[];
+  /** Raw enchantment metadata scoped to this physical container. */
+  enchantments?: string;
 }

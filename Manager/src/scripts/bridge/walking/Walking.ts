@@ -4,6 +4,7 @@ import type { Enemy } from '@hive/sdk';
 import type { BridgeDeps } from '../BridgeDeps.js';
 import { warnUnimplemented } from '../stubWarn.js';
 import { Logger } from '../../../util/Logger.js';
+import { resolveTeleportBeacon } from './TeleportBeacon.js';
 
 export class BridgeWalking {
   static install(deps: BridgeDeps): void {
@@ -22,8 +23,13 @@ export class BridgeWalking {
       return false;
     };
 
-    Walking.walkToEnemy = (_enemy: Enemy) => {
+    Walking.walkToEnemy = () => {
       warnUnimplemented('Walking.walkToEnemy');
+      return false;
+    };
+
+    Walking.pathfindingWalkToEnemy = () => {
+      warnUnimplemented('Walking.pathfindingWalkToEnemy');
       return false;
     };
 
@@ -152,6 +158,34 @@ export class BridgeWalking {
       }
     };
 
+    Walking.teleportBeacon = (destination: string): boolean => {
+      const c = deps.clientRef.current;
+      if (!c?.connected) return false;
+      if (!c.playerData.teleportAllowed) {
+        Logger.warn('Walking', 'teleportBeacon: teleport not allowed in this map');
+        return false;
+      }
+      const worldState = deps.getWorldStateForClient?.(c) ?? deps.worldState;
+      const candidates = worldState.getObjectsForDashboard(deps.gameData).beacons.flatMap((group) => (
+        group.entities.map((entity) => ({ ...entity, type: group.objectType }))
+      ));
+      const beacon = resolveTeleportBeacon(destination, candidates, deps.gameData, c.playerData.pos);
+      if (!beacon) {
+        Logger.warn('Walking', `teleportBeacon: no live teleport beacon matches "${destination}"`);
+        return false;
+      }
+      try {
+        const pkt = deps.proxy.packetFactory.createByName('TELEPORT');
+        pkt.data.objectId = beacon.objectId;
+        pkt.modified = true;
+        c.sendToServer(pkt);
+        return true;
+      } catch (err) {
+        Logger.warn('Walking', `teleportBeacon: send failed — ${(err as Error).message}`);
+        return false;
+      }
+    };
+
     Walking.teleportToBeacon = (objectId: number): boolean => {
       const c = deps.clientRef.current;
       if (!c?.connected) return false;
@@ -159,9 +193,16 @@ export class BridgeWalking {
         Logger.warn('Walking', 'teleportToBeacon: teleport not allowed in this map');
         return false;
       }
+      const id = Math.trunc(objectId);
+      const worldState = deps.getWorldStateForClient?.(c) ?? deps.worldState;
+      const entity = worldState.getEntity(id);
+      if (!entity || !deps.gameData.isTeleportBeacon(entity.objectType)) {
+        Logger.warn('Walking', `teleportToBeacon: object ${objectId} is not a live teleport beacon`);
+        return false;
+      }
       try {
         const pkt = deps.proxy.packetFactory.createByName('TELEPORT');
-        pkt.data.objectId = objectId;
+        pkt.data.objectId = id;
         pkt.modified = true;
         c.sendToServer(pkt);
         return true;

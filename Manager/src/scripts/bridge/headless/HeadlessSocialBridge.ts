@@ -69,16 +69,18 @@ function tradeItem(item: { item: number; slotType: number; tradeable: boolean; i
 }
 
 function syncLocalPartyId(client: Client, state: PartyState): void {
-  const self = client.getPlayer()?.name.trim().toLowerCase();
-  state.localPlayerId = self
-    ? [...state.members.values()].find((member) => member.playerName.trim().toLowerCase() === self)?.playerId ?? null
-    : null;
+  state.localPlayerId = client.getLocalPartyPlayerId();
 }
 
 function partyState(client: Client): PartyState {
   let state = partyStates.get(client);
   if (state) return state;
-  state = { members: new Map(), localPlayerId: null, partyId: null, joinListeners: new Set() };
+  state = {
+    members: new Map(client.getPartyMembers().map((member) => [member.playerId, { ...member }])),
+    localPlayerId: client.getLocalPartyPlayerId(),
+    partyId: client.getPartyId(),
+    joinListeners: new Set(),
+  };
   partyStates.set(client, state);
 
   client.onPacket<IncomingPartyMemberInfoPacket>(PacketType.INCOMING_PARTY_MEMBER_INFO, (packet) => {
@@ -189,6 +191,7 @@ export function installHeadlessSocialBridge(deps: BridgeDeps): void {
   party.createParty = (params: CreatePartyParams) => {
     const client = active(deps);
     if (!client) return;
+    partyState(client);
     const packet = new CreatePartyMessagePacket();
     packet.description = String(params.description ?? '');
     packet.minPowerLevel = Math.max(-32768, Math.min(32767, Math.trunc(params.minPowerLevel)));
@@ -218,6 +221,7 @@ export function installHeadlessSocialBridge(deps: BridgeDeps): void {
   party.join = (partyId) => {
     const client = active(deps);
     if (!client || !Number.isInteger(partyId) || partyId <= 0) return;
+    partyState(client);
     const packet = new PartyJoinRequestPacket();
     packet.partyId = partyId >>> 0;
     packet.unknownByte = 0;
@@ -226,6 +230,7 @@ export function installHeadlessSocialBridge(deps: BridgeDeps): void {
   party.kick = (playerId) => {
     const client = active(deps);
     if (!client || !Number.isInteger(playerId) || playerId < 0 || playerId > 0xffff) return;
+    partyState(client);
     const packet = new PartyActionResultPacket();
     packet.playerId = playerId;
     packet.actionId = 2;

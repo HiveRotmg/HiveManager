@@ -1,4 +1,6 @@
 import type { InventoryItem, InventoryBackpackTier } from './types/inventory';
+import type { LootItemEnchantments } from './types/loot';
+import type { StorageItem } from './types/items/StorageItem';
 
 /**
  * Which side of the transfer `target` refers to.
@@ -6,10 +8,76 @@ import type { InventoryItem, InventoryBackpackTier } from './types/inventory';
  */
 export type InventoryStorageSide = 'container' | 'inventory';
 export type InventoryContainer = 'inventory' | 'petBag' | 'vault' | 'materialVault' | 'giftChest' | 'potionVault' | 'spoilsChest';
+export type InventoryStorageContainer = Exclude<InventoryContainer, 'inventory' | 'petBag'>;
+export interface InventoryStorageRange {
+  /** First logical slot in the flattened storage section. Defaults to zero. */
+  startSlot?: number;
+  /** Number of logical slots to include. Defaults to the rest of the section. */
+  slotCount?: number;
+}
 export interface ContainerSlot {
   objectId: number;
+  /** Logical container index; account storage is flattened across physical chests. */
   slotId: number;
   objectType: number;
+}
+
+/** One physical map object backing a range in a flattened storage section. */
+export interface VaultStorageContainerSnapshot {
+  objectId: number;
+  /** First logical slot represented by this physical container. */
+  startSlot: number;
+  slotCount: number;
+  /** Raw per-slot enchantment blob for this physical container. */
+  enchantments: string;
+}
+
+/** Last known account-storage state, refreshed on vault entry and patched live while inside. */
+export interface VaultStorageSnapshot {
+  /** Timestamp of the latest full VAULT_CONTENT baseline. */
+  capturedAt: number;
+  /** Timestamp of the latest baseline or authoritative live slot update. */
+  updatedAt: number;
+  /** Monotonic snapshot version. */
+  revision: number;
+  /** True when the map-scoped container ids belong to the current Vault visit. */
+  active: boolean;
+  /** True when the server marked the multi-packet baseline complete. */
+  complete: boolean;
+  /** First active physical object id for each section. See `containers` for all ids. */
+  objectIds: {
+    vault: number;
+    material: number;
+    gift: number;
+    potion: number;
+    seasonalSpoils: number;
+  };
+  /** Physical container ranges used to build each flattened section. */
+  containers: {
+    vault: VaultStorageContainerSnapshot[];
+    material: VaultStorageContainerSnapshot[];
+    gift: VaultStorageContainerSnapshot[];
+    potion: VaultStorageContainerSnapshot[];
+    seasonalSpoils: VaultStorageContainerSnapshot[];
+  };
+  vault: number[];
+  material: number[];
+  gift: number[];
+  potion: number[];
+  seasonalSpoils: number[];
+  upgradeCosts: {
+    vault: number;
+    material: number;
+    potion: number;
+    seasonalSpoils: number;
+  };
+  potionCapacity: { current: number; next: number };
+  /** First non-empty raw enchantment blob per section. See `containers` for every physical blob. */
+  enchantments: {
+    vault: string;
+    gift: string;
+    seasonalSpoils: string;
+  };
 }
 
 /** Main inventory stat slots 8–19 → indices 0–11 (weapon … last bag). */
@@ -44,7 +112,49 @@ export const inventory = {
   swapInventoryWithVault(_inventorySlot: number, _vaultSlot: number): boolean { throw new Error('Must be run inside Hive client'); },
   swapInventoryWithPotionVault(_inventorySlot: number, _potionSlot: number): boolean { throw new Error('Must be run inside Hive client'); },
 
+  /** Structured items in an account storage section. Empty cells are returned as `null`. */
+  getStorageItems(_container: InventoryStorageContainer, _range?: InventoryStorageRange): (StorageItem | null)[] {
+    throw new Error('Must be run inside Hive client');
+  },
+
+  /** Find the first matching item in an account storage section. */
+  findStorageItem(_container: InventoryStorageContainer, _query: number | string, _range?: InventoryStorageRange): StorageItem | null {
+    throw new Error('Must be run inside Hive client');
+  },
+
+  storageContains(_container: InventoryStorageContainer, _query: number | string, _range?: InventoryStorageRange): boolean {
+    throw new Error('Must be run inside Hive client');
+  },
+
+  /** Move the first matching storage item into the first free carried slot. */
+  withdrawStorageItem(_container: InventoryStorageContainer, _query: number | string, _range?: InventoryStorageRange): boolean {
+    throw new Error('Must be run inside Hive client');
+  },
+
+  /** Move as many selected storage items as possible into carried inventory. */
+  withdrawAllStorageItems(_container: InventoryStorageContainer, _range?: InventoryStorageRange): boolean {
+    throw new Error('Must be run inside Hive client');
+  },
+
+  /** Move the first matching carried item into the first free selected storage slot. */
+  depositStorageItem(_container: InventoryStorageContainer, _query: number | string, _range?: InventoryStorageRange): boolean {
+    throw new Error('Must be run inside Hive client');
+  },
+
+  getStorageFreeSlots(_container: InventoryStorageContainer, _range?: InventoryStorageRange): number {
+    throw new Error('Must be run inside Hive client');
+  },
+
+  isStorageFull(_container: InventoryStorageContainer, _range?: InventoryStorageRange): boolean {
+    throw new Error('Must be run inside Hive client');
+  },
+
   getSlot(_index: number): InventoryItem | null {
+    return null;
+  },
+
+  /** Parsed enchantments for an inventory/equipment slot, or `null` when none were published. */
+  getEnchantments(_slotIndex: number): LootItemEnchantments | null {
     return null;
   },
 
@@ -85,7 +195,8 @@ export const inventory = {
   },
 
   /**
-   * Item type ids in the main vault chest, `-1` = empty. Throws if the vault has not been entered yet.
+   * Item type ids across all main-vault chests in logical order, `-1` = empty.
+   * Throws if the vault has not been entered yet.
    *
    * ```ts
    * const slots = Hive.inventory.getVault();
@@ -97,7 +208,7 @@ export const inventory = {
   },
 
   /**
-   * Full snapshot of every chest from the last `VAULTCONTENT` packet, patched live by `INVRESULT`.
+   * Full snapshot accumulated through the final `VAULTCONTENT` packet, patched live by `INVRESULT`.
    * Throws if the vault has not been entered yet.
    *
    * ```ts
@@ -110,14 +221,12 @@ export const inventory = {
    * console.log(v.capturedAt);      // timestamp of last VAULTCONTENT
    * ```
    */
-  getEntireVault(): {
-    capturedAt: number;
-    vault: number[];
-    material: number[];
-    gift: number[];
-    potion: number[];
-    seasonalSpoils: number[];
-  } {
+  getEntireVault(): VaultStorageSnapshot {
+    throw new Error('Must be run inside Hive client');
+  },
+
+  /** Alias with an explicit name for consumers that retain and compare revisions. */
+  getVaultSnapshot(): VaultStorageSnapshot {
     throw new Error('Must be run inside Hive client');
   },
 

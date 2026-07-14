@@ -7,6 +7,7 @@ import type {
   PickupOptions,
 } from './types/loot';
 import type { Unsubscribe } from './types/events';
+import type { Item } from './types/items/Item';
 
 const noopUnsub: Unsubscribe = () => {};
 
@@ -60,6 +61,11 @@ export const loot = {
     return false;
   },
 
+  /** Swap a bag item directly with a specific player inventory/equipment slot. */
+  pickupToSlot(_bag: LootBag, _slotIndex: number, _inventorySlotIndex: number): boolean {
+    return false;
+  },
+
   /**
    * Send a USEITEM packet to use (drink/apply) the item directly from the bag slot.
    * Use this for stat potions — they are consumed in place rather than moved to inventory.
@@ -91,6 +97,9 @@ export const loot = {
   shouldPickup(_objectType: number, _opts?: PickupOptions): boolean {
     return false;
   },
+
+  /** Static item metadata for a ground/inventory object type. */
+  getItemInfo(_objectType: number): Item | null { return null; },
 
   /** Returns `true` if the objectType is a UT-tier gear item. */
   isUT(_objectType: number): boolean { return false; },

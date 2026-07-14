@@ -109,6 +109,12 @@ export class ExplorativePathfinder {
     if (!this.inBounds(tileX, tileY)) {
       return false;
     }
+    if (this.target
+      && this.target.x === target.x
+      && this.target.y === target.y
+      && this.target.threshold === threshold) {
+      return true;
+    }
     this.target = { x: target.x, y: target.y, threshold };
     this.plan = undefined;
     this.waypointIndex = 0;
