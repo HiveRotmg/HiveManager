@@ -98,6 +98,8 @@ export interface ObjectDef {
   enemyOccupySquare: boolean;
   protectFromGroundDamage: boolean;
   isEnemy: boolean;     // true if object has <Enemy> tag
+  /** True when the object owns at least one parsed projectile definition. */
+  hasProjectiles: boolean;
   invincible: boolean;  // permanent XML <Invincible />; never a combat target
   isPet: boolean;
   isPlayer: boolean;
@@ -491,6 +493,7 @@ export class GameDataLoader {
         enemyOccupySquare: obj.EnemyOccupySquare !== undefined,
         protectFromGroundDamage: obj.ProtectFromGroundDamage !== undefined,
         isEnemy: obj.Enemy !== undefined,
+        hasProjectiles: false,
         invincible: obj.Invincible !== undefined,
         isPet: obj.Pet !== undefined,
         isPlayer: obj.Player !== undefined,
@@ -564,6 +567,7 @@ export class GameDataLoader {
           });
         }
       }
+      def.hasProjectiles = def.projectiles.size > 0;
 
       if (def.isPlayer) {
         def.playerStatMaxes = parsePlayerClassStatMaxes(

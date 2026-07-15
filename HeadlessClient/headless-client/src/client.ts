@@ -93,7 +93,11 @@ import {
 import { BUILD_VERSION, GAME_ID, GAME_PORT, HELLO_TOKEN } from './constants';
 import { config } from './config';
 import { ClientEvent } from './events';
-import { ExplorativePathfinder, type CombatPathfindingRange } from './explorative-pathfinder';
+import {
+  ExplorativePathfinder,
+  MAX_LOCAL_GOAL_DISTANCE,
+  type CombatPathfindingRange,
+} from './explorative-pathfinder';
 import { DodgeCollisionWorld } from './dodge-collision-world';
 import { MovementController, movementSpeed, type MovementSnapshot } from './movement-controller';
 import {
@@ -561,6 +565,17 @@ export class Client extends EventEmitter {
     return true;
   }
 
+  /** Enables dodge ownership and starts exploratory pathfinding to one world coordinate. */
+  navigateTo(
+    target: { x: number; y: number },
+    arriveThreshold = config.arriveThreshold,
+    options: AutoDodgeOptions = {},
+  ): boolean {
+    if (!this.autoDodge || !this.pathfindingWalkTo(target, arriveThreshold)) return false;
+    this.autoDodge.setEnabled(true, { ...options, safeWalk: options.safeWalk ?? true });
+    return true;
+  }
+
   /** Maintains a reachable firing band around a moving combat target. */
   combatPathfindingWalkTo(
     target: { x: number; y: number },
@@ -569,6 +584,17 @@ export class Client extends EventEmitter {
     const wasPathfinding = this.pathfinder.hasTarget();
     if (!this.pathfinder.setCombatTarget(target, range)) return false;
     if (!wasPathfinding) this.movement.clear();
+    return true;
+  }
+
+  /** Enables dodge ownership and maintains a reachable firing band around a combat target. */
+  navigateToCombatTarget(
+    target: { x: number; y: number },
+    range: CombatPathfindingRange,
+    options: AutoDodgeOptions = {},
+  ): boolean {
+    if (!this.autoDodge || !this.combatPathfindingWalkTo(target, range)) return false;
+    this.autoDodge.setEnabled(true, { ...options, safeWalk: options.safeWalk ?? true });
     return true;
   }
 
@@ -3139,12 +3165,17 @@ export class Client extends EventEmitter {
     const intentVelocity = movementLocked
       ? { x: 0, y: 0 }
       : this.movement.getIntendedVelocity(snapshot, integrateFromLocal);
+    const movementGoal = this.movement.getTarget();
+    const dodgeGoal = movementGoal
+      ? boundedMovementGoal(this.pos, movementGoal, MAX_LOCAL_GOAL_DISTANCE)
+      : undefined;
     this.dodgeWorld?.setExplorativeUnknown(this.pathfinder.hasTarget());
     const dodgeState = this.autoDodge?.isEnabled() && this.combat && this.dodgeWorld && this.thrownAoes
       ? this.autoDodge.evaluate({
           time: now,
           playerId: this.objectId,
           position: this.pos,
+          goal: dodgeGoal,
           moveSpeed: movementSpeed(snapshot),
           intentVelocity,
           movementLeadMs: dt,
@@ -3158,7 +3189,13 @@ export class Client extends EventEmitter {
     if (movementLocked) return;
     if (!this.movement.hasTarget() && !velocityOverride) return;
 
-    const update = this.movement.update(snapshot, dt, { integrateFromLocal, velocityOverride });
+    const update = this.movement.update(snapshot, dt, {
+      integrateFromLocal,
+      velocityOverride,
+      trackTargetProgress: dodgeState?.decision === 'follow_goal'
+        || dodgeState?.decision === 'goal_blocked'
+        || dodgeState?.decision === 'goal_path' && dodgeState.threatCount === 0,
+    });
     this.pos = update.pos;
     if (update.stalled && this.serverPos) {
       if (usingPathfinding) {
@@ -3457,6 +3494,8 @@ export class Client extends EventEmitter {
     ack.time = this.lastFrameTime;
     ack.ackCount = 1;
     this.io.send(ack);
+    this.pathfinder.markEnemyThreat(p.ownerId);
+    this.dodgeWorld?.markEnemyThreat(p.ownerId);
     const ownerType = this.objects.get(p.ownerId)?.type ?? this.recentObjectTypes.get(p.ownerId);
     this.combat?.trackEnemyShoot(p, ownerType, this.time());
   }
@@ -3909,6 +3948,23 @@ export function backoffDelay(attempt: number, baseMs: number, maxMs: number): nu
   // Full jitter: a random point in [base, exponential] keeps a sane floor while
   // de-synchronizing many clients reconnecting at once.
   return baseMs + Math.random() * Math.max(0, exponential - baseMs);
+}
+
+function boundedMovementGoal(
+  position: { x: number; y: number },
+  goal: { x: number; y: number; threshold: number },
+  maximumDistance: number,
+): { x: number; y: number; threshold: number } {
+  const dx = goal.x - position.x;
+  const dy = goal.y - position.y;
+  const distance = Math.hypot(dx, dy);
+  if (distance <= maximumDistance || distance === 0) return { ...goal };
+  const ratio = maximumDistance / distance;
+  return {
+    x: position.x + dx * ratio,
+    y: position.y + dy * ratio,
+    threshold: Math.min(goal.threshold, 0.25),
+  };
 }
 
 type GameIdConnectMode = 'ticket' | 'unkeyed';

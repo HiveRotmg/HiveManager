@@ -32,6 +32,8 @@ export interface MovementUpdateOptions {
   integrateFromLocal?: boolean;
   /** Temporarily replaces navigation velocity without changing its target. */
   velocityOverride?: MovementVelocity;
+  /** Continue target-progress stall detection while applying the override. */
+  trackTargetProgress?: boolean;
 }
 
 const SPEED_MIN = 0.004;
@@ -75,7 +77,9 @@ export class MovementController {
       ? this.stepWithVelocity(snapshot, dt, options.velocityOverride, !!options.integrateFromLocal)
       : this.stepToward(snapshot, dt, !!options.integrateFromLocal);
     if (!this.target) return { pos };
-    const stalled = options.velocityOverride ? undefined : this.detectStall(snapshot.serverPos, dt);
+    const stalled = options.velocityOverride && !options.trackTargetProgress
+      ? undefined
+      : this.detectStall(snapshot.serverPos, dt);
     const confirmedPos = snapshot.serverPos ?? pos;
     if (Math.hypot(this.target.x - confirmedPos.x, this.target.y - confirmedPos.y) < this.target.threshold) {
       const reached = { x: this.target.x, y: this.target.y };

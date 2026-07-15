@@ -2,14 +2,48 @@ import type { CombatDataProvider, CombatProjectileSnapshot } from './combat-trac
 
 interface DodgeObjectRecord {
   key: string;
+  x: number;
+  y: number;
   occupySquare: boolean;
   fullOccupy: boolean;
   enemyOccupySquare: boolean;
+  enemyCandidate: boolean;
 }
 
 const INVALID_TILE_TYPE = 0xffff;
-export const ENEMY_AVOID_RADIUS = 1.3;
+export const ENEMY_AVOID_RADIUS = 1;
 const DISTANCE_EPSILON = 1e-9;
+
+interface EnemyThreatDataProvider {
+  getObject(type: number): {
+    isEnemy?: boolean;
+    hasProjectiles?: boolean;
+    subattacks?: ReadonlyArray<{
+      patterns: ReadonlyArray<{ projectileId: number }>;
+    }>;
+  } | undefined;
+  getProjectile?(objectType: number, projectileId: number): unknown;
+}
+
+/** Distinguishes projectile-capable monsters from inert enemy-tagged map objects. */
+export function isEnemyProximityThreat(
+  data: EnemyThreatDataProvider,
+  objectType: number,
+): boolean {
+  const definition = data.getObject(objectType);
+  if (!definition?.isEnemy) return false;
+  if (definition.hasProjectiles !== undefined) return definition.hasProjectiles;
+  if (!data.getProjectile) return false;
+
+  const projectileIds = new Set<number>([0]);
+  for (const subattack of definition.subattacks ?? []) {
+    for (const pattern of subattack.patterns) projectileIds.add(pattern.projectileId);
+  }
+  for (const projectileId of projectileIds) {
+    if (data.getProjectile(objectType, projectileId)) return true;
+  }
+  return false;
+}
 
 /** Incrementally maintained collision view used by predictive auto-dodge. */
 export class DodgeCollisionWorld {
@@ -22,6 +56,7 @@ export class DodgeCollisionWorld {
   private readonly occupyCounts = new Map<string, number>();
   private readonly fullOccupyCounts = new Map<string, number>();
   private readonly enemyOccupyCounts = new Map<string, number>();
+  private readonly confirmedCombatEnemies = new Set<number>();
   private readonly combatEnemies = new Map<number, { x: number; y: number }>();
 
   constructor(private readonly data: CombatDataProvider) {}
@@ -36,6 +71,7 @@ export class DodgeCollisionWorld {
     this.occupyCounts.clear();
     this.fullOccupyCounts.clear();
     this.enemyOccupyCounts.clear();
+    this.confirmedCombatEnemies.clear();
     this.combatEnemies.clear();
   }
 
@@ -59,25 +95,48 @@ export class DodgeCollisionWorld {
   }
 
   upsertObject(objectId: number, objectType: number, x: number, y: number): void {
-    this.removeObject(objectId);
+    this.removeObjectRecord(objectId);
     const definition = this.data.getObject(objectType);
-    if (!definition) return;
-    const isCombatEnemy = !!definition.isEnemy && !definition.invincible;
+    if (!definition) {
+      this.confirmedCombatEnemies.delete(objectId);
+      return;
+    }
+    const enemyCandidate = !!definition.isEnemy;
+    if (!enemyCandidate) this.confirmedCombatEnemies.delete(objectId);
     const record: DodgeObjectRecord = {
       key: tileKey(Math.floor(x), Math.floor(y)),
+      x,
+      y,
       occupySquare: !!definition.occupySquare,
       fullOccupy: !!definition.fullOccupy,
       enemyOccupySquare: !!definition.enemyOccupySquare,
+      enemyCandidate,
     };
-    if (!record.occupySquare && !record.fullOccupy && !record.enemyOccupySquare && !isCombatEnemy) return;
+    if (!record.occupySquare && !record.fullOccupy && !record.enemyOccupySquare && !enemyCandidate) return;
     this.objects.set(objectId, record);
-    if (isCombatEnemy) this.combatEnemies.set(objectId, { x, y });
+    if (enemyCandidate && (isEnemyProximityThreat(this.data, objectType)
+      || this.confirmedCombatEnemies.has(objectId))) {
+      this.combatEnemies.set(objectId, { x, y });
+    }
     this.adjust(this.occupyCounts, record.key, record.occupySquare ? 1 : 0);
     this.adjust(this.fullOccupyCounts, record.key, record.fullOccupy ? 1 : 0);
     this.adjust(this.enemyOccupyCounts, record.key, record.enemyOccupySquare ? 1 : 0);
   }
 
+  /** Promotes an enemy-tagged object after an authoritative EnemyShoot packet. */
+  markEnemyThreat(objectId: number): void {
+    const record = this.objects.get(objectId);
+    if (!record?.enemyCandidate) return;
+    this.confirmedCombatEnemies.add(objectId);
+    this.combatEnemies.set(objectId, { x: record.x, y: record.y });
+  }
+
   removeObject(objectId: number): void {
+    this.removeObjectRecord(objectId);
+    this.confirmedCombatEnemies.delete(objectId);
+  }
+
+  private removeObjectRecord(objectId: number): void {
     const record = this.objects.get(objectId);
     if (!record) return;
     this.objects.delete(objectId);

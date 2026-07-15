@@ -58,6 +58,8 @@ export interface CombatWeaponSubattackDefinition {
 
 export interface CombatObjectDefinition {
   isEnemy: boolean;
+  /** True when this object type owns at least one projectile definition. */
+  hasProjectiles?: boolean;
   invincible?: boolean;
   isPlayer?: boolean;
   occupySquare: boolean;

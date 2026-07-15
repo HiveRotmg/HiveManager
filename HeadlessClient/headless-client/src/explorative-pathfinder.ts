@@ -1,11 +1,16 @@
-import { ENEMY_AVOID_RADIUS } from './dodge-collision-world';
+import { ENEMY_AVOID_RADIUS, isEnemyProximityThreat } from './dodge-collision-world';
 
 export interface PathfindingDataProvider {
   getObject(type: number): {
     occupySquare: boolean;
     isEnemy?: boolean;
+    hasProjectiles?: boolean;
     invincible?: boolean;
+    subattacks?: ReadonlyArray<{
+      patterns: ReadonlyArray<{ projectileId: number }>;
+    }>;
   } | undefined;
+  getProjectile?(objectType: number, projectileId: number): unknown;
   tileIsBlockingWalk?(tileType: number): boolean;
   getTileDamage?(tileType: number): number | undefined;
 }
@@ -64,8 +69,8 @@ interface OpenNode extends GridPoint {
 const INVALID_TILE_TYPE = 0xffff;
 const DIAGONAL_COST = Math.SQRT2;
 const INTERMEDIATE_THRESHOLD = 0.25;
+export const MAX_LOCAL_GOAL_DISTANCE = 5;
 const BLOCKED_TARGET_SEARCH_RADIUS = 4;
-const MAX_EXPANDED_NODES = 200_000;
 const COMBAT_TARGET_REPLAN_DISTANCE = 0.35;
 const ENEMY_POSITION_REPLAN_DISTANCE = 0.25;
 const DISTANCE_EPSILON = 1e-9;
@@ -92,6 +97,8 @@ export class ExplorativePathfinder {
   private readonly learnedBlocked = new Set<string>();
   private readonly objectTiles = new Map<number, string>();
   private readonly objectBlockCounts = new Map<string, number>();
+  private readonly enemyCandidates = new Map<number, PathPoint>();
+  private readonly confirmedCombatEnemies = new Set<number>();
   private readonly combatEnemies = new Map<number, PathPoint>();
   private target: PathTarget | undefined;
   private combatRange: CombatPathfindingRange | undefined;
@@ -110,6 +117,8 @@ export class ExplorativePathfinder {
     this.learnedBlocked.clear();
     this.objectTiles.clear();
     this.objectBlockCounts.clear();
+    this.enemyCandidates.clear();
+    this.confirmedCombatEnemies.clear();
     this.combatEnemies.clear();
     this.clearTarget();
     this.revision++;
@@ -225,16 +234,28 @@ export class ExplorativePathfinder {
     }
 
     const oldEnemy = this.combatEnemies.get(objectId);
-    const isCombatEnemy = !!definition?.isEnemy && !definition.invincible;
-    if (!isCombatEnemy) {
+    const enemyCandidate = !!definition?.isEnemy;
+    if (!enemyCandidate) {
+      this.enemyCandidates.delete(objectId);
+      this.confirmedCombatEnemies.delete(objectId);
       if (oldEnemy) {
         this.combatEnemies.delete(objectId);
         changed = changed || !!this.combatRange;
       }
-    } else if (!oldEnemy || !this.combatRange
-      || distance(oldEnemy, { x, y }) >= ENEMY_POSITION_REPLAN_DISTANCE) {
-      this.combatEnemies.set(objectId, { x, y });
-      changed = changed || !!this.combatRange;
+    } else {
+      this.enemyCandidates.set(objectId, { x, y });
+      const isCombatThreat = isEnemyProximityThreat(this.data!, objectType)
+        || this.confirmedCombatEnemies.has(objectId);
+      if (!isCombatThreat) {
+        if (oldEnemy) {
+          this.combatEnemies.delete(objectId);
+          changed = changed || !!this.combatRange;
+        }
+      } else if (!oldEnemy || !this.combatRange
+        || distance(oldEnemy, { x, y }) >= ENEMY_POSITION_REPLAN_DISTANCE) {
+        this.combatEnemies.set(objectId, { x, y });
+        changed = changed || !!this.combatRange;
+      }
     }
 
     if (changed) this.invalidate();
@@ -248,13 +269,28 @@ export class ExplorativePathfinder {
       this.adjustObjectBlockCount(key, -1);
       changed = true;
     }
+    this.enemyCandidates.delete(objectId);
+    this.confirmedCombatEnemies.delete(objectId);
     if (this.combatEnemies.delete(objectId) && this.combatRange) changed = true;
     if (changed) this.invalidate();
+  }
+
+  /** Promotes an enemy-tagged object after an authoritative EnemyShoot packet. */
+  markEnemyThreat(objectId: number): void {
+    const enemy = this.enemyCandidates.get(objectId);
+    if (!enemy) return;
+    this.confirmedCombatEnemies.add(objectId);
+    if (this.combatEnemies.has(objectId)) return;
+    this.combatEnemies.set(objectId, { ...enemy });
+    if (this.combatRange) this.invalidate();
   }
 
   next(position: PathPoint): PathfindingStep {
     const target = this.target;
     if (!target) return {};
+    // MAPINFO supplies finite bounds before navigation can prove reachability.
+    // Keeping the target pending avoids treating a search budget as "no path".
+    if (this.width <= 0 || this.height <= 0) return {};
     if (this.combatRange && withinCombatRange(position, target, this.combatRange)) {
       this.plan = undefined;
       this.waypointIndex = 0;
@@ -444,7 +480,7 @@ export class ExplorativePathfinder {
       }
 
       const selected = candidates[selectedIndex]!;
-      result.push({ ...selected });
+      appendBoundedWaypoints(result, anchor, selected, MAX_LOCAL_GOAL_DISTANCE);
       anchor = selected;
       candidateIndex = selectedIndex + 1;
     }
@@ -563,8 +599,7 @@ export class ExplorativePathfinder {
     const startH = heuristic(start, goals);
     open.push({ ...start, g: 0, h: startH, f: startH, order: order++ });
 
-    let expanded = 0;
-    while (open.size > 0 && expanded++ < MAX_EXPANDED_NODES) {
+    while (open.size > 0) {
       const current = open.pop()!;
       const currentKey = tileKey(current.x, current.y);
       if (current.g !== bestG.get(currentKey)) continue;
@@ -641,6 +676,22 @@ export class ExplorativePathfinder {
 
   private invalidate(): void {
     this.revision++;
+  }
+}
+
+function appendBoundedWaypoints(
+  result: PathPoint[],
+  from: PathPoint,
+  to: PathPoint,
+  maximumDistance: number,
+): void {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const segmentDistance = Math.hypot(dx, dy);
+  const segmentCount = Math.max(1, Math.ceil(segmentDistance / maximumDistance));
+  for (let segment = 1; segment <= segmentCount; segment++) {
+    const ratio = segment / segmentCount;
+    result.push({ x: from.x + dx * ratio, y: from.y + dy * ratio });
   }
 }
 

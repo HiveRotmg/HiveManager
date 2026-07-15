@@ -75,6 +75,140 @@ test('predictive auto-dodge preserves a movement intent that already clears the 
   assert.deepEqual(state.velocity, { x: 0.0096, y: 0 });
 });
 
+test('enabled auto-dodge owns safe movement and derives velocity from the goal', () => {
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  const state = controller.evaluate({
+    time: 0,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    goal: { x: 10, y: 5, threshold: 0.1 },
+    moveSpeed: 0.004,
+    intentVelocity: { x: -0.004, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [],
+    aoes: [],
+    environment: openEnvironment,
+  });
+
+  assert.equal(state.overrideActive, true);
+  assert.equal(state.decision, 'goal_path');
+  assert.ok(Math.abs(state.velocity.x - 0.004) < 1e-12);
+  assert.equal(state.velocity.y, 0);
+  assert.deepEqual(state.target, state.path[0]);
+  assert.ok(state.path.at(-1)!.x > state.path[0]!.x);
+  assert.ok(state.path.every((point) => point.y === 5));
+});
+
+test('goal-owned dodge stops instead of bypassing local collision when no route exists', () => {
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  const state = controller.evaluate({
+    time: 0,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    goal: { x: 8, y: 5, threshold: 0.1 },
+    moveSpeed: 0.004,
+    intentVelocity: { x: 0.004, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [],
+    aoes: [],
+    environment: {
+      canOccupy: () => false,
+      isProjectileSegmentOpen: () => true,
+    },
+  });
+
+  assert.equal(state.overrideActive, true);
+  assert.equal(state.decision, 'goal_blocked');
+  assert.deepEqual(state.velocity, { x: 0, y: 0 });
+});
+
+test('goal-aware auto-dodge takes a lateral detour and resumes toward the waypoint', () => {
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  const state = controller.evaluate({
+    time: 0,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    goal: { x: 10, y: 5 },
+    moveSpeed: 0.004,
+    intentVelocity: { x: 0.004, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [],
+    aoes: [{ x: 6.25, y: 5, radius: 0.6, landingTime: 300 }],
+    environment: openEnvironment,
+  });
+
+  assert.equal(state.overrideActive, true);
+  assert.equal(state.decision, 'goal_path');
+  assert.ok(state.velocity.x > 0, `expected forward progress, got ${state.velocity.x}`);
+  assert.ok(Math.abs(state.velocity.y) > 0.001, `expected a lateral detour, got ${state.velocity.y}`);
+  assert.deepEqual(state.goal, { x: 10, y: 5 });
+  assert.ok(state.path.length >= 2);
+  assert.ok(state.path.at(-1)!.x > state.path[0]!.x, 'route should turn back toward the waypoint');
+  assert.ok(routeTurnCount({ x: 5, y: 5 }, state.path) >= 1, 'route should contain a real turn');
+});
+
+test('goal-aware auto-dodge plans around a moving projectile crossing the route', () => {
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  const projectile: CombatProjectileSnapshot = {
+    ...hostileProjectile(),
+    startX: 6.25,
+    startY: 0,
+    angle: Math.PI / 2,
+  };
+  const state = controller.evaluate({
+    time: 300,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    goal: { x: 10, y: 5 },
+    moveSpeed: 0.004,
+    intentVelocity: { x: 0.004, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [projectile],
+    aoes: [],
+    environment: openEnvironment,
+  });
+
+  assert.equal(state.overrideActive, true);
+  assert.equal(state.decision, 'goal_path');
+  assert.ok(state.velocity.x > 0, `expected forward progress, got ${state.velocity.x}`);
+  assert.ok(Math.abs(state.velocity.y) > 0.001, `expected a lateral detour, got ${state.velocity.y}`);
+  assert.ok(state.path.length >= 2);
+});
+
+test('goal path searches around threats without crossing static collision', () => {
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  let rejectedStaticCandidates = 0;
+  const state = controller.evaluate({
+    time: 0,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    goal: { x: 10, y: 5 },
+    moveSpeed: 0.004,
+    intentVelocity: { x: 0.004, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [],
+    aoes: [{ x: 6.25, y: 5, radius: 0.6, landingTime: 300 }],
+    environment: {
+      canOccupy: (_x, y, safeWalk) => {
+        assert.equal(safeWalk, true);
+        if (y < 5) rejectedStaticCandidates++;
+        return y >= 5;
+      },
+      isProjectileSegmentOpen: () => true,
+    },
+  });
+
+  assert.equal(state.decision, 'goal_path');
+  assert.ok(rejectedStaticCandidates > 0);
+  assert.ok(state.path.every((point) => point.y >= 5));
+  assert.ok(state.path.some((point) => point.y > 5.2));
+});
+
 test('predictive auto-dodge moves out of a thrown AOE before landing', () => {
   const controller = new PredictiveAutoDodgeController();
   controller.setEnabled(true);
@@ -249,13 +383,15 @@ test('dodge collision world treats unknown cells as open only for exploratory pa
   assert.equal(world.canOccupy(4.5, 4.5, true), false);
 });
 
-test('dodge collision world keeps candidates 1.3 tiles from combat enemies', () => {
+test('dodge collision world keeps candidates one tile from projectile-capable enemies', () => {
   const data: CombatDataProvider = {
-    getObject: (type) => type === 3
-      ? { isEnemy: true, occupySquare: false }
-      : type === 4
-        ? { isEnemy: true, invincible: true, occupySquare: false }
-        : undefined,
+    getObject: (type) => {
+      if (type === 3) return { isEnemy: true, hasProjectiles: true, occupySquare: false };
+      if (type === 4) return { isEnemy: true, invincible: true, occupySquare: false };
+      if (type === 5) return { isEnemy: true, occupySquare: false };
+      if (type === 6) return { isEnemy: true, occupySquare: true };
+      return undefined;
+    },
     getProjectile: () => undefined,
   };
   const world = new DodgeCollisionWorld(data);
@@ -272,6 +408,18 @@ test('dodge collision world keeps candidates 1.3 tiles from combat enemies', () 
   assert.equal(world.canOccupy(5.5, 5.5, true), true);
   world.upsertObject(31, 4, 5.5, 5.5);
   assert.equal(world.canOccupy(5.5, 5.5, true), true);
+
+  world.removeObject(31);
+  world.upsertObject(32, 5, 5.5, 5.5);
+  assert.equal(world.canOccupy(5.5, 5.5, true), true);
+  world.markEnemyThreat(32);
+  assert.equal(world.canOccupy(5.5, 5.5, true), false);
+  world.upsertObject(32, 5, 6.5, 5.5);
+  assert.equal(world.canOccupy(6.5, 5.5, true), false);
+
+  world.removeObject(32);
+  world.upsertObject(33, 6, 5.5, 5.5);
+  assert.equal(world.canOccupy(6.25, 5.5, true), true);
 });
 
 test('dodge collision world stops non-passing projectiles at cover', () => {
@@ -305,4 +453,27 @@ function hostileProjectile(): CombatProjectileSnapshot {
     damage: 100,
     hitObjects: new Set(),
   };
+}
+
+function routeTurnCount(
+  start: { x: number; y: number },
+  path: Array<{ x: number; y: number }>,
+): number {
+  let previousPoint = start;
+  let previousDirection: { x: number; y: number } | undefined;
+  let turns = 0;
+  for (const point of path) {
+    const dx = point.x - previousPoint.x;
+    const dy = point.y - previousPoint.y;
+    const length = Math.hypot(dx, dy);
+    previousPoint = point;
+    if (length <= 0.000001) continue;
+    const direction = { x: dx / length, y: dy / length };
+    if (previousDirection
+      && direction.x * previousDirection.x + direction.y * previousDirection.y < 0.995) {
+      turns++;
+    }
+    previousDirection = direction;
+  }
+  return turns;
 }

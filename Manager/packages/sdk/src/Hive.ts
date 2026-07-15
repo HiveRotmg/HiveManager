@@ -39,6 +39,7 @@ export const Hive = {
         isVault: World.isVault,
         isPetYard: World.isPetYard,
         getName: World.getName,
+        getDimensions: World.getDimensions,
         getServerHost: World.getServerHost,
         getRealmPortals: World.getRealmPortals,
         getVisibleObjects: World.getVisibleObjects,

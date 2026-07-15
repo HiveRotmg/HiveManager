@@ -18,8 +18,18 @@ export class BridgeWalking {
       return false;
     };
 
+    Walking.navigateTo = (_x, _y, _options) => {
+      warnUnimplemented('Walking.navigateTo');
+      return false;
+    };
+
     Walking.pathfindingWalkToCombatTarget = (_x, _y, _options) => {
       warnUnimplemented('Walking.pathfindingWalkToCombatTarget');
+      return false;
+    };
+
+    Walking.navigateToCombatTarget = (_x, _y, _options) => {
+      warnUnimplemented('Walking.navigateToCombatTarget');
       return false;
     };
 

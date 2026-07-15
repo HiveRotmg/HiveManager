@@ -3059,10 +3059,12 @@ export class DevServer {
     const dodgeState = options.includeDodgePath ? client.getAutoDodgeState() : null;
     const dodgePath = options.includeDodgePath
       ? dodgeState?.overrideActive
-        ? [{
-            x: center.x + dodgeState.velocity.x * VIEWER_DODGE_PATH_HORIZON_MS,
-            y: center.y + dodgeState.velocity.y * VIEWER_DODGE_PATH_HORIZON_MS,
-          }]
+        ? dodgeState.path.length > 0
+          ? dodgeState.path
+          : [{
+              x: center.x + dodgeState.velocity.x * VIEWER_DODGE_PATH_HORIZON_MS,
+              y: center.y + dodgeState.velocity.y * VIEWER_DODGE_PATH_HORIZON_MS,
+            }]
         : []
       : undefined;
     return {

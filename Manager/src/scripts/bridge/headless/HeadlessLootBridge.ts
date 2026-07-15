@@ -182,8 +182,9 @@ export function installHeadlessLootBridge(deps: BridgeDeps): void {
     if (!object) return false;
     const source = client.getWorldContainerSlot(object.objectId, slotIndex);
     const destination = client.getContainerSlot('inventory', inventorySlotIndex);
-    return !!source && source.objectType > 0 && !!destination && destination.objectType < 0
-      && client.getCarriedInventorySlotIds().includes(inventorySlotIndex)
+    const validDestination = inventorySlotIndex <= 3
+      || client.getCarriedInventorySlotIds().includes(inventorySlotIndex);
+    return !!source && source.objectType > 0 && !!destination && validDestination
       && client.swapSlots(source, destination);
   };
 

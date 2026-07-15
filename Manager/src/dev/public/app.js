@@ -165,7 +165,7 @@
       'settings.viewer.pathfindingPath': 'Pathfinding path',
       'settings.viewer.pathfindingPathDesc': 'Draw the current vectorized navigation route.',
       'settings.viewer.dodgePath': 'Dodge path',
-      'settings.viewer.dodgePathDesc': 'Draw the active predictive dodge direction.',
+      'settings.viewer.dodgePathDesc': 'Draw the active locally planned dodge route.',
       'settings.tab.developer': 'Developer',
       'settings.tab.plugins': 'Plugins',
       'comingSoon.title': 'Coming soon',

@@ -3,6 +3,7 @@ import {
   predictProjectilePosition,
   type CombatProjectileSnapshot,
 } from './combat-tracker';
+import { ENEMY_AVOID_RADIUS } from './dodge-collision-world';
 
 export interface AutoDodgeOptions {
   /** Avoid ground with positive XML damage while selecting escape paths. */
@@ -32,6 +33,8 @@ export interface AutoDodgeSnapshot {
   time: number;
   playerId: number;
   position: { x: number; y: number };
+  /** Current local navigation waypoint supplied by direct walking or pathfinding. */
+  goal?: { x: number; y: number; threshold?: number };
   moveSpeed: number;
   intentVelocity: { x: number; y: number };
   movementLeadMs: number;
@@ -46,6 +49,9 @@ export interface AutoDodgeState {
   overrideActive: boolean;
   velocity: { x: number; y: number };
   target: { x: number; y: number } | null;
+  goal: { x: number; y: number } | null;
+  /** Absolute world-space points in the active short-horizon dodge route. */
+  path: Array<{ x: number; y: number }>;
   threatCount: number;
   earliestImpactMs: number | null;
   selectedCandidate: number;
@@ -68,7 +74,45 @@ const EMERGENCY_OVERRIDE_MS = 100;
 const HYSTERESIS_MS = 100;
 const HYSTERESIS_SCORE_GAIN = 0.25;
 const CORRIDOR_NEIGHBORS = 3;
+const LOCAL_PLAN_STEP_MS = 60;
+const LOCAL_PLAN_BEAM_WIDTH = 40;
+const LOCAL_PLAN_DIRECTION_STRIDE = 4;
+const LOCAL_PLAN_CELL_SIZE = 0.25;
+const GOAL_PROGRESS_TOLERANCE = 0.25;
+const GOAL_PATH_POINT_EPSILON = 0.02;
 const MAX_TIME = 0x7fffffff;
+
+interface GoalDodgePlan {
+  candidate: number;
+  velocityX: number;
+  velocityY: number;
+  speedScale: number;
+  path: Array<{ x: number; y: number }>;
+}
+
+interface LocalPlanNode {
+  x: number;
+  y: number;
+  timeMs: number;
+  headingX: number;
+  headingY: number;
+  firstCandidate: number;
+  firstVelocityX: number;
+  firstVelocityY: number;
+  minThreatClearance: number;
+  minEnemyClearance: number;
+  turnCost: number;
+  parent?: LocalPlanNode;
+}
+
+interface LocalProjectileTrack {
+  points: Array<{ x: number; y: number }>;
+}
+
+interface LocalEdgeSafety {
+  minThreatClearance: number;
+  minEnemyClearance: number;
+}
 
 /** Port of ProdMafia's short-horizon predictive auto-dodge controller. */
 export class PredictiveAutoDodgeController {
@@ -119,6 +163,8 @@ export class PredictiveAutoDodgeController {
       ...this.state,
       velocity: { ...this.state.velocity },
       target: this.state.target ? { ...this.state.target } : null,
+      goal: this.state.goal ? { ...this.state.goal } : null,
+      path: this.state.path.map((point) => ({ ...point })),
     };
   }
 
@@ -128,6 +174,7 @@ export class PredictiveAutoDodgeController {
       return this.state;
     }
 
+    snapshot = this.withGoalIntent(snapshot);
     this.resetFrame();
     const intentLength = Math.hypot(snapshot.intentVelocity.x, snapshot.intentVelocity.y);
     this.candidateX[INTENT_CANDIDATE] = intentLength > 0.000001
@@ -217,9 +264,11 @@ export class PredictiveAutoDodgeController {
       }
     }
 
-    if (directProjectileThreats === 0 && !directAoeThreat) {
-      return this.finish(snapshot, snapshot.intentVelocity.x, snapshot.intentVelocity.y,
-        false, 0, 1, 0, MAX_TIME, 'no_threat');
+    const hasGoal = !!snapshot.goal
+      && Number.isFinite(snapshot.goal.x)
+      && Number.isFinite(snapshot.goal.y);
+    if (directProjectileThreats === 0 && !directAoeThreat && !hasGoal) {
+      return this.finishGoalOrIntent(snapshot, 0, 1, 0, MAX_TIME, 'no_threat');
     }
 
     this.candidateEnemyClearance[0] = snapshot.environment.enemyClearance?.(
@@ -374,17 +423,67 @@ export class PredictiveAutoDodgeController {
     proposedCandidate: number,
     aoes: readonly AutoDodgeAoeThreat[],
   ): AutoDodgeState {
-    if (threatCount === 0 || snapshot.moveSpeed <= 0 || snapshot.movementLocked) {
+    if (snapshot.moveSpeed <= 0 || snapshot.movementLocked) {
       if (snapshot.time >= this.selectedUntil) this.selectedCandidate = 0;
-      return this.finish(snapshot, snapshot.intentVelocity.x, snapshot.intentVelocity.y,
-        false, this.selectedCandidate, 1, threatCount, earliestImpactMs,
-        threatCount === 0 ? 'no_threat' : 'movement_locked');
+      return this.finishGoalOrIntent(
+        snapshot,
+        this.selectedCandidate,
+        1,
+        threatCount,
+        earliestImpactMs,
+        'movement_locked',
+      );
     }
     const intendedScore = this.candidateScore[INTENT_CANDIDATE];
+    const goalPlan = this.findGoalPath(snapshot, aoes);
+    if (goalPlan) {
+      this.selectedCandidate = goalPlan.candidate;
+      this.selectedUntil = snapshot.time + HYSTERESIS_MS;
+      return this.finish(
+        snapshot,
+        goalPlan.velocityX,
+        goalPlan.velocityY,
+        true,
+        goalPlan.candidate,
+        goalPlan.speedScale,
+        threatCount,
+        earliestImpactMs,
+        'goal_path',
+        goalPlan.path,
+      );
+    }
+    if (threatCount === 0) {
+      if (snapshot.goal && Number.isFinite(snapshot.goal.x) && Number.isFinite(snapshot.goal.y)) {
+        return this.finish(
+          snapshot,
+          0,
+          0,
+          true,
+          0,
+          0,
+          0,
+          earliestImpactMs,
+          'goal_blocked',
+        );
+      }
+      return this.finishGoalOrIntent(
+        snapshot,
+        this.selectedCandidate,
+        1,
+        0,
+        earliestImpactMs,
+        'no_threat',
+      );
+    }
     if (intendedScore >= INTENT_SAFE_CLEARANCE) {
-      return this.finish(snapshot, snapshot.intentVelocity.x, snapshot.intentVelocity.y,
-        false, this.selectedCandidate, 1, threatCount, earliestImpactMs,
-        'preserve_safe_intent');
+      return this.finishGoalOrIntent(
+        snapshot,
+        this.selectedCandidate,
+        1,
+        threatCount,
+        earliestImpactMs,
+        'preserve_safe_intent',
+      );
     }
 
     let choice = proposedCandidate;
@@ -470,6 +569,398 @@ export class PredictiveAutoDodgeController {
       threatCount,
       earliestImpactMs,
       decision,
+    );
+  }
+
+  /**
+   * Beam-searches a time-expanded local movement lattice. Each edge is checked
+   * against static collision, enemy clearance, timed AOEs, and continuous
+   * projectile segments. Only the first velocity is executed before replanning.
+   */
+  private findGoalPath(
+    snapshot: AutoDodgeSnapshot,
+    aoes: readonly AutoDodgeAoeThreat[],
+  ): GoalDodgePlan | undefined {
+    const goal = snapshot.goal;
+    if (!goal || !Number.isFinite(goal.x) || !Number.isFinite(goal.y)) return undefined;
+    const initialGoalDistance = Math.hypot(goal.x - snapshot.position.x, goal.y - snapshot.position.y);
+    if (initialGoalDistance <= GOAL_PATH_POINT_EPSILON) return undefined;
+
+    const goalThreshold = Number.isFinite(goal.threshold)
+      ? Math.max(0, Number(goal.threshold))
+      : 0;
+    const projectileTracks = this.buildLocalProjectileTracks(snapshot);
+    const directPlan = this.directLocalGoalPlan(
+      snapshot,
+      goal,
+      goalThreshold,
+      projectileTracks,
+      aoes,
+    );
+    if (directPlan) return directPlan;
+
+    let frontier: LocalPlanNode[] = [{
+      x: snapshot.position.x,
+      y: snapshot.position.y,
+      timeMs: 0,
+      headingX: 0,
+      headingY: 0,
+      firstCandidate: 0,
+      firstVelocityX: 0,
+      firstVelocityY: 0,
+      minThreatClearance: Infinity,
+      minEnemyClearance: snapshot.environment.enemyClearance?.(
+        snapshot.position.x,
+        snapshot.position.y,
+      ) ?? Infinity,
+      turnCost: 0,
+    }];
+
+    for (let timeMs = 0; timeMs < HORIZON_MS; timeMs += LOCAL_PLAN_STEP_MS) {
+      const nextByKey = new Map<string, LocalPlanNode>();
+      for (const node of frontier) {
+        const nodeGoalDistance = Math.hypot(goal.x - node.x, goal.y - node.y);
+        const atGoal = nodeGoalDistance <= Math.max(goalThreshold, GOAL_PATH_POINT_EPSILON);
+        const moves: Array<{ candidate: number; x: number; y: number; exactGoal: boolean }> = [
+          { candidate: 0, x: 0, y: 0, exactGoal: false },
+        ];
+        if (!atGoal) {
+          for (let direction = 0; direction < DIRECTION_COUNT; direction += LOCAL_PLAN_DIRECTION_STRIDE) {
+            const candidate = direction + 1;
+            moves.push({
+              candidate,
+              x: this.candidateX[candidate],
+              y: this.candidateY[candidate],
+              exactGoal: false,
+            });
+          }
+          if (this.selectedCandidate > 0 && this.selectedCandidate <= DIRECTION_COUNT
+            && !moves.some((move) => move.candidate === this.selectedCandidate)) {
+            moves.push({
+              candidate: this.selectedCandidate,
+              x: this.candidateX[this.selectedCandidate],
+              y: this.candidateY[this.selectedCandidate],
+              exactGoal: false,
+            });
+          }
+          moves.push({
+            candidate: INTENT_CANDIDATE,
+            x: (goal.x - node.x) / nodeGoalDistance,
+            y: (goal.y - node.y) / nodeGoalDistance,
+            exactGoal: true,
+          });
+        }
+
+        for (const move of moves) {
+          const maximumTravel = snapshot.moveSpeed * LOCAL_PLAN_STEP_MS;
+          const travel = move.exactGoal ? Math.min(maximumTravel, nodeGoalDistance) : maximumTravel;
+          const nextX = node.x + move.x * travel;
+          const nextY = node.y + move.y * travel;
+          const edgeSafety = this.evaluateLocalEdge(
+            snapshot,
+            node,
+            { x: nextX, y: nextY },
+            timeMs,
+            timeMs + LOCAL_PLAN_STEP_MS,
+            projectileTracks,
+            aoes,
+          );
+          if (!edgeSafety) continue;
+
+          const moveVelocityX = (nextX - node.x) / LOCAL_PLAN_STEP_MS;
+          const moveVelocityY = (nextY - node.y) / LOCAL_PLAN_STEP_MS;
+          const moving = intentLengthSquared(move.x, move.y) > 0.000001;
+          const wasMoving = intentLengthSquared(node.headingX, node.headingY) > 0.000001;
+          const turnCost = moving && wasMoving
+            ? Math.max(0, 1 - (move.x * node.headingX + move.y * node.headingY))
+            : moving === wasMoving ? 0 : 0.15;
+          const child: LocalPlanNode = {
+            x: nextX,
+            y: nextY,
+            timeMs: timeMs + LOCAL_PLAN_STEP_MS,
+            headingX: move.x,
+            headingY: move.y,
+            firstCandidate: node.timeMs === 0 ? move.candidate : node.firstCandidate,
+            firstVelocityX: node.timeMs === 0 ? moveVelocityX : node.firstVelocityX,
+            firstVelocityY: node.timeMs === 0 ? moveVelocityY : node.firstVelocityY,
+            minThreatClearance: Math.min(node.minThreatClearance, edgeSafety.minThreatClearance),
+            minEnemyClearance: Math.min(node.minEnemyClearance, edgeSafety.minEnemyClearance),
+            turnCost: node.turnCost + turnCost,
+            parent: node,
+          };
+          const key = this.localNodeKey(child);
+          const existing = nextByKey.get(key);
+          if (!existing || this.localNodeScore(child, goal, goalThreshold, snapshot)
+            < this.localNodeScore(existing, goal, goalThreshold, snapshot)) {
+            nextByKey.set(key, child);
+          }
+        }
+      }
+
+      frontier = [...nextByKey.values()]
+        .sort((left, right) => this.localNodeScore(left, goal, goalThreshold, snapshot)
+          - this.localNodeScore(right, goal, goalThreshold, snapshot))
+        .slice(0, LOCAL_PLAN_BEAM_WIDTH);
+      if (frontier.length === 0) return undefined;
+    }
+
+    const best = frontier
+      .filter((node) => Math.hypot(goal.x - node.x, goal.y - node.y)
+        <= initialGoalDistance + GOAL_PROGRESS_TOLERANCE)
+      .sort((left, right) => this.localNodeScore(left, goal, goalThreshold, snapshot)
+        - this.localNodeScore(right, goal, goalThreshold, snapshot))[0];
+    if (!best) return undefined;
+
+    const path: Array<{ x: number; y: number }> = [];
+    let cursor: LocalPlanNode | undefined = best;
+    while (cursor?.parent) {
+      path.push({ x: cursor.x, y: cursor.y });
+      cursor = cursor.parent;
+    }
+    path.reverse();
+    const firstSpeed = Math.hypot(best.firstVelocityX, best.firstVelocityY);
+    return {
+      candidate: best.firstCandidate,
+      velocityX: best.firstVelocityX,
+      velocityY: best.firstVelocityY,
+      speedScale: snapshot.moveSpeed > 0 ? firstSpeed / snapshot.moveSpeed : 0,
+      path,
+    };
+  }
+
+  private directLocalGoalPlan(
+    snapshot: AutoDodgeSnapshot,
+    goal: { x: number; y: number },
+    goalThreshold: number,
+    projectileTracks: readonly LocalProjectileTrack[],
+    aoes: readonly AutoDodgeAoeThreat[],
+  ): GoalDodgePlan | undefined {
+    let current = { x: snapshot.position.x, y: snapshot.position.y };
+    const path: Array<{ x: number; y: number }> = [];
+    let firstVelocityX = 0;
+    let firstVelocityY = 0;
+    for (let timeMs = 0; timeMs < HORIZON_MS; timeMs += LOCAL_PLAN_STEP_MS) {
+      const dx = goal.x - current.x;
+      const dy = goal.y - current.y;
+      const distance = Math.hypot(dx, dy);
+      let next = current;
+      if (distance > Math.max(goalThreshold, GOAL_PATH_POINT_EPSILON)) {
+        const travel = Math.min(snapshot.moveSpeed * LOCAL_PLAN_STEP_MS, distance);
+        next = { x: current.x + dx / distance * travel, y: current.y + dy / distance * travel };
+      }
+      if (!this.evaluateLocalEdge(
+        snapshot,
+        current,
+        next,
+        timeMs,
+        timeMs + LOCAL_PLAN_STEP_MS,
+        projectileTracks,
+        aoes,
+      )) return undefined;
+      if (timeMs === 0) {
+        firstVelocityX = (next.x - current.x) / LOCAL_PLAN_STEP_MS;
+        firstVelocityY = (next.y - current.y) / LOCAL_PLAN_STEP_MS;
+      }
+      if (path.length === 0 || Math.hypot(
+        next.x - path[path.length - 1]!.x,
+        next.y - path[path.length - 1]!.y,
+      ) > GOAL_PATH_POINT_EPSILON) {
+        path.push({ ...next });
+      }
+      current = next;
+    }
+    const firstSpeed = Math.hypot(firstVelocityX, firstVelocityY);
+    return {
+      candidate: INTENT_CANDIDATE,
+      velocityX: firstVelocityX,
+      velocityY: firstVelocityY,
+      speedScale: snapshot.moveSpeed > 0 ? firstSpeed / snapshot.moveSpeed : 0,
+      path,
+    };
+  }
+
+  private buildLocalProjectileTracks(snapshot: AutoDodgeSnapshot): LocalProjectileTrack[] {
+    const tracks: LocalProjectileTrack[] = [];
+    for (const projectile of this.relevantProjectiles) {
+      const points: Array<{ x: number; y: number }> = [];
+      let previous: { x: number; y: number } | undefined;
+      for (let offset = 0; offset <= HORIZON_MS; offset += SAMPLE_MS) {
+        const sampleTime = snapshot.time + offset;
+        if (!isProjectileAliveAt(projectile, sampleTime)) break;
+        predictProjectilePosition(projectile, sampleTime, this.projectilePosition);
+        if (previous && !snapshot.environment.isProjectileSegmentOpen(
+          previous.x,
+          previous.y,
+          this.projectilePosition.x,
+          this.projectilePosition.y,
+          projectile,
+        )) break;
+        const point = { ...this.projectilePosition };
+        points.push(point);
+        previous = point;
+      }
+      if (points.length > 0) tracks.push({ points });
+    }
+    return tracks;
+  }
+
+  private evaluateLocalEdge(
+    snapshot: AutoDodgeSnapshot,
+    from: { x: number; y: number },
+    to: { x: number; y: number },
+    startTimeMs: number,
+    endTimeMs: number,
+    projectileTracks: readonly LocalProjectileTrack[],
+    aoes: readonly AutoDodgeAoeThreat[],
+  ): LocalEdgeSafety | undefined {
+    let minThreatClearance = Infinity;
+    let minEnemyClearance = Infinity;
+    const startEnemyClearance = snapshot.environment.enemyClearance?.(from.x, from.y) ?? Infinity;
+    for (let timeMs = startTimeMs + SAMPLE_MS; timeMs <= endTimeMs; timeMs += SAMPLE_MS) {
+      const ratio = (timeMs - startTimeMs) / (endTimeMs - startTimeMs);
+      const x = from.x + (to.x - from.x) * ratio;
+      const y = from.y + (to.y - from.y) * ratio;
+      if (!snapshot.environment.canOccupy(x, y, this.safeWalk, false)) return undefined;
+      const enemyClearance = snapshot.environment.enemyClearance?.(x, y) ?? Infinity;
+      if (startEnemyClearance >= ENEMY_AVOID_RADIUS
+        ? enemyClearance < ENEMY_AVOID_RADIUS
+        : enemyClearance + 1e-9 < startEnemyClearance) {
+        return undefined;
+      }
+      minEnemyClearance = Math.min(minEnemyClearance, enemyClearance);
+    }
+
+    const startIndex = Math.trunc(startTimeMs / SAMPLE_MS);
+    const endIndex = Math.trunc(endTimeMs / SAMPLE_MS);
+    for (const track of projectileTracks) {
+      if (startIndex >= track.points.length) continue;
+      let previousProjectile = track.points[startIndex]!;
+      let previousPlayer = { x: from.x, y: from.y };
+      let clearance = chebyshev(
+        previousProjectile.x - previousPlayer.x,
+        previousProjectile.y - previousPlayer.y,
+      ) - HIT_HALF_SIZE;
+      if (clearance < INTENT_SAFE_CLEARANCE) return undefined;
+      minThreatClearance = Math.min(minThreatClearance, clearance);
+
+      for (let index = startIndex + 1; index <= endIndex && index < track.points.length; index++) {
+        const projectile = track.points[index]!;
+        const ratio = (index * SAMPLE_MS - startTimeMs) / (endTimeMs - startTimeMs);
+        const player = {
+          x: from.x + (to.x - from.x) * ratio,
+          y: from.y + (to.y - from.y) * ratio,
+        };
+        clearance = minimumChebyshevOnSegment(
+          previousProjectile.x - previousPlayer.x,
+          previousProjectile.y - previousPlayer.y,
+          projectile.x - player.x,
+          projectile.y - player.y,
+        ) - HIT_HALF_SIZE;
+        if (clearance < INTENT_SAFE_CLEARANCE) return undefined;
+        minThreatClearance = Math.min(minThreatClearance, clearance);
+        previousProjectile = projectile;
+        previousPlayer = player;
+      }
+    }
+
+    for (const aoe of aoes) {
+      const landingTimeMs = aoe.landingTime - snapshot.time;
+      if (landingTimeMs <= startTimeMs || landingTimeMs > endTimeMs) continue;
+      const ratio = (landingTimeMs - startTimeMs) / (endTimeMs - startTimeMs);
+      const playerX = from.x + (to.x - from.x) * ratio;
+      const playerY = from.y + (to.y - from.y) * ratio;
+      const clearance = Math.hypot(aoe.x - playerX, aoe.y - playerY) - aoe.radius;
+      if (clearance < INTENT_SAFE_CLEARANCE) return undefined;
+      minThreatClearance = Math.min(minThreatClearance, clearance);
+    }
+    return { minThreatClearance, minEnemyClearance };
+  }
+
+  private localNodeKey(node: LocalPlanNode): string {
+    const x = Math.round(node.x / LOCAL_PLAN_CELL_SIZE);
+    const y = Math.round(node.y / LOCAL_PLAN_CELL_SIZE);
+    const heading = intentLengthSquared(node.headingX, node.headingY) <= 0.000001
+      ? 'w'
+      : Math.round((Math.atan2(node.headingY, node.headingX) + Math.PI) * 8 / Math.PI);
+    return `${x},${y},${heading}`;
+  }
+
+  private localNodeScore(
+    node: LocalPlanNode,
+    goal: { x: number; y: number },
+    goalThreshold: number,
+    snapshot: AutoDodgeSnapshot,
+  ): number {
+    const goalDistance = Math.max(0, Math.hypot(goal.x - node.x, goal.y - node.y) - goalThreshold);
+    const threatClearance = Math.min(node.minThreatClearance, 0.75);
+    const enemyClearance = Math.min(node.minEnemyClearance, 3);
+    const continuity = snapshot.time < this.selectedUntil
+      && node.firstCandidate === this.selectedCandidate ? 0.2 : 0;
+    return goalDistance * 4
+      + node.turnCost * 0.12
+      - threatClearance * 0.5
+      - enemyClearance * 0.03
+      - continuity;
+  }
+
+  /** Goal coordinates, rather than pathfinder velocity, own normal movement while dodge is enabled. */
+  private withGoalIntent(snapshot: AutoDodgeSnapshot): AutoDodgeSnapshot {
+    const goal = snapshot.goal;
+    if (!goal || !Number.isFinite(goal.x) || !Number.isFinite(goal.y)) return snapshot;
+    if (snapshot.movementLocked) {
+      return { ...snapshot, intentVelocity: { x: 0, y: 0 } };
+    }
+
+    const dx = goal.x - snapshot.position.x;
+    const dy = goal.y - snapshot.position.y;
+    const distance = Math.hypot(dx, dy);
+    const threshold = Number.isFinite(goal.threshold)
+      ? Math.max(0, Number(goal.threshold))
+      : 0;
+    if (distance <= threshold || distance <= GOAL_PATH_POINT_EPSILON) {
+      return { ...snapshot, intentVelocity: { x: 0, y: 0 } };
+    }
+
+    // Clamp the last movement frame inside the arrival radius instead of
+    // overshooting now that the dodge controller owns safe movement too.
+    const targetTravel = Math.max(0, distance - threshold * 0.5);
+    const speed = Math.min(
+      snapshot.moveSpeed,
+      targetTravel / Math.max(1, snapshot.movementLeadMs),
+    );
+    return {
+      ...snapshot,
+      intentVelocity: {
+        x: dx / distance * speed,
+        y: dy / distance * speed,
+      },
+    };
+  }
+
+  private finishGoalOrIntent(
+    snapshot: AutoDodgeSnapshot,
+    selectedCandidate: number,
+    speedScale: number,
+    threatCount: number,
+    earliestImpactMs: number,
+    fallbackDecision: string,
+  ): AutoDodgeState {
+    const goal = snapshot.goal;
+    const ownsMovement = !!goal
+      && Number.isFinite(goal.x)
+      && Number.isFinite(goal.y)
+      && !snapshot.movementLocked;
+    return this.finish(
+      snapshot,
+      snapshot.intentVelocity.x,
+      snapshot.intentVelocity.y,
+      ownsMovement,
+      selectedCandidate,
+      speedScale,
+      threatCount,
+      earliestImpactMs,
+      ownsMovement ? 'follow_goal' : fallbackDecision,
+      ownsMovement ? [{ x: goal.x, y: goal.y }] : [],
     );
   }
 
@@ -625,15 +1116,31 @@ export class PredictiveAutoDodgeController {
     threatCount: number,
     earliestImpactMs: number,
     decision: string,
+    plannedPath: readonly { x: number; y: number }[] = [],
   ): AutoDodgeState {
+    const path = overrideActive
+      ? plannedPath.length > 0
+        ? plannedPath.map((point) => ({ ...point }))
+        : [{
+            x: snapshot.position.x + velocityX * (snapshot.movementLeadMs + HORIZON_MS),
+            y: snapshot.position.y + velocityY * (snapshot.movementLeadMs + HORIZON_MS),
+          }]
+      : [];
+    const target = plannedPath[0]
+      ? { ...plannedPath[0] }
+      : {
+          x: snapshot.position.x + velocityX * snapshot.movementLeadMs,
+          y: snapshot.position.y + velocityY * snapshot.movementLeadMs,
+        };
     this.state = {
       enabled: this.enabled,
       overrideActive,
       velocity: { x: velocityX, y: velocityY },
-      target: overrideActive ? {
-        x: snapshot.position.x + velocityX * snapshot.movementLeadMs,
-        y: snapshot.position.y + velocityY * snapshot.movementLeadMs,
-      } : null,
+      target: overrideActive ? target : null,
+      goal: snapshot.goal && Number.isFinite(snapshot.goal.x) && Number.isFinite(snapshot.goal.y)
+        ? { x: snapshot.goal.x, y: snapshot.goal.y }
+        : null,
+      path,
       threatCount,
       earliestImpactMs: earliestImpactMs === MAX_TIME ? null : earliestImpactMs,
       selectedCandidate,
@@ -714,6 +1221,8 @@ function emptyState(enabled: boolean, velocity = { x: 0, y: 0 }): AutoDodgeState
     overrideActive: false,
     velocity: { ...velocity },
     target: null,
+    goal: null,
+    path: [],
     threatCount: 0,
     earliestImpactMs: null,
     selectedCandidate: 0,

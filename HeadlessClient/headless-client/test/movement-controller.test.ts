@@ -85,6 +85,28 @@ test('MovementController applies a local dodge velocity without clearing navigat
   assert.deepEqual(movement.getTarget(), { x: 10, y: 0, threshold: 0.1 });
 });
 
+test('MovementController can track path stalls while dodge owns safe goal movement', () => {
+  const movement = new MovementController();
+  movement.setTarget({ x: 10, y: 0 }, 0.1);
+  const snapshot = {
+    localPos: { x: 0, y: 0 },
+    serverPos: { x: 0, y: 0 },
+    playerSpeed: 75,
+    playerSpeedBoost: 0,
+  };
+
+  const initial = movement.update(snapshot, 100, {
+    velocityOverride: { x: 0.0096, y: 0 },
+    trackTargetProgress: true,
+  });
+  assert.equal(initial.stalled, undefined);
+  const stalled = movement.update(snapshot, 3100, {
+    velocityOverride: { x: 0.0096, y: 0 },
+    trackTargetProgress: true,
+  });
+  assert.deepEqual(stalled.stalled, { distance: 10 });
+});
+
 test('MovementController can dodge from standstill without creating a walk target', () => {
   const movement = new MovementController();
   const update = movement.update(

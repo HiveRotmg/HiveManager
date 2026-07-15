@@ -45,7 +45,7 @@ const STORAGE_CONTAINERS = new Set<InventoryContainer>([
 
 const DEFAULT_WEAPON_RANGE = 8;
 const DEFAULT_COMBAT_RANGE_RATIO = 0.75;
-const DEFAULT_ENEMY_EXCLUSION = 1.3;
+const DEFAULT_ENEMY_EXCLUSION = 1;
 
 function finitePositive(value: unknown): number | undefined {
   const number = Number(value);
@@ -388,6 +388,7 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
   };
   World.isDungeon = () => false;
   World.getName = () => optional(deps)?.getMapName() ?? 'Unknown';
+  World.getDimensions = () => optional(deps)?.getMapDimensions() ?? { width: 0, height: 0 };
   World.getServerHost = () => optional(deps)?.getServerHost() ?? '';
   World.getRealmPortals = () => optional(deps)?.realmPortals() ?? [];
   World.getVisibleObjects = () => optional(deps)?.visibleObjects() ?? [];
@@ -401,6 +402,7 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
   Hive.world.isRealm = World.isRealm;
   Hive.world.isDungeon = World.isDungeon;
   Hive.world.getName = World.getName;
+  Hive.world.getDimensions = World.getDimensions;
   Hive.world.getServerHost = World.getServerHost;
   Hive.world.getRealmPortals = World.getRealmPortals;
   Hive.world.getVisibleObjects = World.getVisibleObjects;
@@ -419,6 +421,13 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
     stopFollowing(client);
     return client.pathfindingWalkTo({ x, y }, arriveThreshold);
   };
+  Walking.navigateTo = (x: number, y: number, options = {}) => {
+    const client = active(deps);
+    stopFollowing(client);
+    return client.navigateTo({ x, y }, options.arriveThreshold, {
+      safeWalk: options.safeWalk,
+    });
+  };
   Walking.pathfindingWalkToCombatTarget = (x: number, y: number, options = {}) => {
     const client = active(deps);
     stopFollowing(client);
@@ -428,6 +437,18 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
       return false;
     }
     return client.combatPathfindingWalkTo({ x, y }, range);
+  };
+  Walking.navigateToCombatTarget = (x: number, y: number, options = {}) => {
+    const client = active(deps);
+    stopFollowing(client);
+    const range = resolveCombatPathfindingRange(deps, client, options);
+    if (!range) {
+      Logger.warn('Walking', 'navigateToCombatTarget: equipped weapon range is too short');
+      return false;
+    }
+    return client.navigateToCombatTarget({ x, y }, range, {
+      safeWalk: options.safeWalk,
+    });
   };
   Walking.walkToPosition = (position: Position) => {
     const client = active(deps);
@@ -440,7 +461,7 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
     const enemy = client.visibleObjects()
       .filter((object) => deps.gameData.isCombatEnemy(object.type))
       .sort((a, b) => client.distanceTo(a) - client.distanceTo(b))[0];
-    return enemy ? client.moveToObject(enemy.objectId, 1.3) : false;
+    return enemy ? client.moveToObject(enemy.objectId, DEFAULT_ENEMY_EXCLUSION) : false;
   };
   Walking.pathfindingWalkToEnemy = () => {
     const client = active(deps);
@@ -448,7 +469,9 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
     const enemy = client.visibleObjects()
       .filter((object) => deps.gameData.isCombatEnemy(object.type))
       .sort((a, b) => client.distanceTo(a) - client.distanceTo(b))[0];
-    return enemy ? client.pathfindingWalkTo({ x: enemy.x, y: enemy.y }, 1.3) : false;
+    return enemy
+      ? client.pathfindingWalkTo({ x: enemy.x, y: enemy.y }, DEFAULT_ENEMY_EXCLUSION)
+      : false;
   };
   Walking.walkToPortal = (name: string) => {
     const client = active(deps);

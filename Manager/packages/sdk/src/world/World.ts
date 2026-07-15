@@ -59,4 +59,9 @@ export class World {
     static getName(): string {
         throw new Error('Must be run inside Hive client');
     }
+
+    /** Current map dimensions in tiles. */
+    static getDimensions(): { width: number; height: number } {
+        throw new Error('Must be run inside Hive client');
+    }
 }

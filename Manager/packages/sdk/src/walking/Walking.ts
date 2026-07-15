@@ -11,6 +11,10 @@ export interface AutoDodgeState {
     overrideActive: boolean;
     velocity: { x: number; y: number };
     target: { x: number; y: number } | null;
+    /** Current direct-walk target or local pathfinding waypoint supplied to dodge. */
+    goal: { x: number; y: number } | null;
+    /** Absolute points in the active short-horizon dodge route. */
+    path: Array<{ x: number; y: number }>;
     threatCount: number;
     earliestImpactMs: number | null;
     selectedCandidate: number;
@@ -18,18 +22,25 @@ export interface AutoDodgeState {
     decision: string;
 }
 
+export interface NavigationOptions extends AutoDodgeOptions {
+    /** Distance from the destination at which navigation stops. */
+    arriveThreshold?: number;
+}
+
 export interface CombatPathfindingOptions {
     /** Weapon range in tiles. Zero or omitted derives it from the equipped weapon. */
     weaponRange?: number;
     /** Preferred fraction of weapon range. Defaults to 0.75. */
     preferredRangeRatio?: number;
-    /** Hard enemy exclusion floor. Defaults to 1.3 tiles. */
+    /** Hard enemy exclusion floor. Defaults to 1 tile. */
     minimumEnemyDistance?: number;
     /** Distance reserved inside the weapon's maximum range. Defaults to max(0.5, range * 0.1). */
     shotRangeMargin?: number;
     /** Half-width of the acceptable firing band around the preferred distance. */
     rangeBandWidth?: number;
 }
+
+export interface CombatNavigationOptions extends CombatPathfindingOptions, AutoDodgeOptions {}
 
 /**
  * A Realm teleport-beacon destination. Canonical region names and common
@@ -82,6 +93,14 @@ export class Walking {
     }
 
     /**
+     * Exploratively pathfind to one world coordinate while the predictive dodge
+     * planner owns every movement step, including steps with no active shots.
+     */
+    static navigateTo(x: number, y: number, options?: NavigationOptions): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /**
      * Pathfind to a reachable firing band around a combat target. The equipped
      * weapon determines the range unless `weaponRange` is supplied.
      */
@@ -89,6 +108,15 @@ export class Walking {
         x: number,
         y: number,
         options?: CombatPathfindingOptions,
+    ): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Pathfind to a firing band while the predictive dodge planner owns movement. */
+    static navigateToCombatTarget(
+        x: number,
+        y: number,
+        options?: CombatNavigationOptions,
     ): boolean {
         throw new Error('Must be run inside Hive client');
     }
@@ -102,7 +130,7 @@ export class Walking {
         throw new Error('Must be run inside Hive client');
     }
 
-    /** Pathfind to within 1.3 tiles of the nearest visible combat enemy. */
+    /** Pathfind to within 1 tile of the nearest visible combat enemy. */
     static pathfindingWalkToEnemy(): boolean {
         throw new Error('Must be run inside Hive client');
     }
