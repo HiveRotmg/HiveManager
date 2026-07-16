@@ -540,12 +540,14 @@ export interface TrackedThrownAoe extends AutoDodgeAoeThreat {
 export class ThrownAoeTracker {
   private readonly throws: TrackedThrownAoe[] = [];
   private readonly learnedRadius = new Map<number, number>();
+  private readonly learnedBlastDuration = new Map<number, number>();
   private readonly active: TrackedThrownAoe[] = [];
   private nextId = 1;
 
   clear(): void {
     this.throws.length = 0;
     this.learnedRadius.clear();
+    this.learnedBlastDuration.clear();
     this.active.length = 0;
     this.nextId = 1;
   }
@@ -555,9 +557,13 @@ export class ThrownAoeTracker {
     end: { x: number; y: number },
     durationSeconds: number,
     now: number,
+    blastDurationSeconds?: number,
   ): void {
     const durationMs = Math.max(0, durationSeconds * 1000);
     const normalizedType = effectType >>> 0;
+    const blastMs = blastDurationSeconds !== undefined
+      ? Math.max(0, blastDurationSeconds * 1000)
+      : this.learnedBlastDuration.get(normalizedType);
     this.throws.push({
       id: this.nextId++,
       effectType: normalizedType,
@@ -565,10 +571,16 @@ export class ThrownAoeTracker {
       y: end.y,
       radius: this.learnedRadius.get(normalizedType) ?? 1,
       landingTime: now + durationMs,
+      blastDurationMs: blastMs,
     });
   }
 
-  recordAoe(position: { x: number; y: number }, radius: number, now: number): void {
+  recordAoe(
+    position: { x: number; y: number },
+    radius: number,
+    now: number,
+    blastDurationSeconds?: number,
+  ): void {
     let best: TrackedThrownAoe | undefined;
     let bestIndex = -1;
     let bestDistance = 1;
@@ -583,6 +595,12 @@ export class ThrownAoeTracker {
     }
     if (!best) return;
     this.learnedRadius.set(best.effectType, radius);
+    if (blastDurationSeconds !== undefined) {
+      this.learnedBlastDuration.set(
+        best.effectType,
+        Math.max(0, blastDurationSeconds * 1000),
+      );
+    }
     if (bestIndex >= 0) this.throws.splice(bestIndex, 1);
   }
 
@@ -590,12 +608,15 @@ export class ThrownAoeTracker {
     this.active.length = 0;
     for (let index = this.throws.length - 1; index >= 0; index--) {
       const thrown = this.throws[index]!;
-      if (now > thrown.landingTime + 750) {
+      const dwell = thrown.blastDurationMs ?? 0;
+      if (now > thrown.landingTime + Math.max(750, dwell)) {
         this.throws.splice(index, 1);
         continue;
       }
       if (now < thrown.landingTime) {
         thrown.radius = this.learnedRadius.get(thrown.effectType) ?? thrown.radius;
+        const learnedBlast = this.learnedBlastDuration.get(thrown.effectType);
+        if (learnedBlast !== undefined) thrown.blastDurationMs = learnedBlast;
         this.active.push(thrown);
       }
     }

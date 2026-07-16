@@ -607,6 +607,61 @@ test('thrown AOE tracker learns a radius for later matching effects', () => {
   assert.equal(active[0]?.landingTime, 500);
 });
 
+test('thrown AOE tracker learns a blast duration for later matching effects', () => {
+  const tracker = new ThrownAoeTracker();
+  tracker.track(456, { x: 5, y: 5 }, 0.2, 0);
+  tracker.recordAoe({ x: 5.1, y: 5 }, 2, 200, 0.5);
+  tracker.track(456, { x: 8, y: 8 }, 0.2, 300);
+
+  const active = tracker.getActive(350);
+  assert.equal(active.length, 1);
+  assert.equal(active[0]?.radius, 2);
+  assert.equal(active[0]?.blastDurationMs, 500);
+});
+
+test('predictive auto-dodge steers around an AOE that dwells after landing', () => {
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  // Player at (5,5) moving east. AoE at (9,5) radius 0.5 lands at t=200 with a
+  // 400ms dwell. Player is ~1.93 tiles clear at landing (safe under the old
+  // single-instant model) but transits through the blast around t=400 during
+  // the dwell — only detectable when blastDurationMs is honoured.
+  const withDwell = controller.evaluate({
+    time: 0,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    moveSpeed: 0.0096,
+    intentVelocity: { x: 0.0096, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [],
+    aoes: [{ x: 9, y: 5, radius: 0.5, landingTime: 200, blastDurationMs: 400 }],
+    environment: openEnvironment,
+  });
+
+  const bareController = new PredictiveAutoDodgeController();
+  bareController.setEnabled(true);
+  const withoutDwell = bareController.evaluate({
+    time: 0,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    moveSpeed: 0.0096,
+    intentVelocity: { x: 0.0096, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [],
+    aoes: [{ x: 9, y: 5, radius: 0.5, landingTime: 200 }],
+    environment: openEnvironment,
+  });
+
+  assert.equal(withoutDwell.earliestImpactMs, null,
+    'baseline single-frame AoE should not flag the transit');
+  assert.equal(withoutDwell.decision, 'preserve_safe_intent');
+
+  assert.notEqual(withDwell.earliestImpactMs, null,
+    'dwell AoE should be flagged as an impending impact');
+  assert.notEqual(withDwell.decision, 'preserve_safe_intent',
+    'dwell AoE should invalidate the intent-preserved path');
+});
+
 test('dodge collision world rejects damaging and occupied tiles', () => {
   const data: CombatDataProvider = {
     getObject: (type) => type === 1

@@ -33,6 +33,8 @@ export interface DodgePlanningAoe {
   y: number;
   radius: number;
   landingTime: number;
+  /** Milliseconds the blast stays dangerous after landing. Falsy = single-frame. */
+  blastDurationMs?: number;
 }
 
 export interface TimedDodgeWaypoint {
@@ -145,6 +147,7 @@ const DEFAULT_PROJECTILE_STEP_MS = 20;
 // metadata or prediction margins that would silently turn 0.5 into 0.55+.
 const DODGE_HITBOX_HALF_SIZE = 0.5;
 const AOE_SAFETY_MARGIN = 0.08;
+const AOE_DWELL_SAMPLE_MS = 30;
 const PROJECTILE_NEAR_BAND = 0.9;
 const AOE_NEAR_BAND = 0.75;
 const PROJECTILE_INDEX_CELL_SIZE = 2;
@@ -975,24 +978,31 @@ export class SpaceTimeDodgePlanner {
 
     for (const aoe of context.input.aoes) {
       const landingMs = aoe.landingTime - context.input.time;
-      if (landingMs < startMs || landingMs > endMs) continue;
-      const ratio = clamp((landingMs - startMs) / durationMs, 0, 1);
-      const x = from.x + dx * ratio;
-      const y = from.y + dy * ratio;
-      const clearance = Math.hypot(x - aoe.x, y - aoe.y)
-        - Math.max(0, aoe.radius) - AOE_SAFETY_MARGIN;
-      minimumProjectileClearance = Math.min(minimumProjectileClearance, clearance);
-      if (clearance <= 0) {
-        collision = true;
-        if (!allowProjectileCollision) {
-          context.counters.candidatesRejectedByProjectiles++;
-          return undefined;
+      const dwellMs = Math.max(0, aoe.blastDurationMs ?? 0);
+      const dangerEndMs = landingMs + dwellMs;
+      if (dangerEndMs < startMs || landingMs > endMs) continue;
+      const windowStart = Math.max(landingMs, startMs);
+      const windowEnd = Math.min(dangerEndMs, endMs);
+      for (let sampleMs = windowStart; sampleMs <= windowEnd; sampleMs += AOE_DWELL_SAMPLE_MS) {
+        const ratio = clamp((sampleMs - startMs) / durationMs, 0, 1);
+        const x = from.x + dx * ratio;
+        const y = from.y + dy * ratio;
+        const clearance = Math.hypot(x - aoe.x, y - aoe.y)
+          - Math.max(0, aoe.radius) - AOE_SAFETY_MARGIN;
+        minimumProjectileClearance = Math.min(minimumProjectileClearance, clearance);
+        if (clearance <= 0) {
+          collision = true;
+          if (!allowProjectileCollision) {
+            context.counters.candidatesRejectedByProjectiles++;
+            return undefined;
+          }
         }
-      }
-      if (clearance < AOE_NEAR_BAND) {
-        const normalized = clamp((AOE_NEAR_BAND - clearance) / AOE_NEAR_BAND, 0, 1);
-        projectileCost += this.weights.projectileRiskPerSecond
-          * 0.05 * normalized * normalized;
+        if (clearance < AOE_NEAR_BAND) {
+          const normalized = clamp((AOE_NEAR_BAND - clearance) / AOE_NEAR_BAND, 0, 1);
+          projectileCost += this.weights.projectileRiskPerSecond
+            * 0.05 * normalized * normalized;
+        }
+        if (dwellMs === 0) break;
       }
     }
 
@@ -1363,12 +1373,20 @@ export class SpaceTimeDodgePlanner {
       });
       for (const aoe of input.aoes) {
         const landingMs = aoe.landingTime - input.time;
-        if (landingMs < startMs || landingMs > endMs) continue;
-        const ratio = (landingMs - startMs) / durationMs;
-        const x = current.x + (next.x - current.x) * ratio;
-        const y = current.y + (next.y - current.y) * ratio;
-        if (Math.hypot(x - aoe.x, y - aoe.y) <= aoe.radius + AOE_SAFETY_MARGIN) {
-          earliest = Math.min(earliest, landingMs);
+        const dwellMs = Math.max(0, aoe.blastDurationMs ?? 0);
+        const dangerEndMs = landingMs + dwellMs;
+        if (dangerEndMs < startMs || landingMs > endMs) continue;
+        const windowStart = Math.max(landingMs, startMs);
+        const windowEnd = Math.min(dangerEndMs, endMs);
+        for (let sampleMs = windowStart; sampleMs <= windowEnd; sampleMs += AOE_DWELL_SAMPLE_MS) {
+          const ratio = (sampleMs - startMs) / durationMs;
+          const x = current.x + (next.x - current.x) * ratio;
+          const y = current.y + (next.y - current.y) * ratio;
+          if (Math.hypot(x - aoe.x, y - aoe.y) <= aoe.radius + AOE_SAFETY_MARGIN) {
+            earliest = Math.min(earliest, sampleMs);
+            break;
+          }
+          if (dwellMs === 0) break;
         }
       }
       current = next;
