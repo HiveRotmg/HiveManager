@@ -128,6 +128,10 @@ export interface DodgePlanningResult {
 export interface DodgeTrajectoryAssessment {
   safe: boolean;
   score: number;
+  cumulativeCost: number;
+  terminalCost: number;
+  intentCost: number;
+  comparisonHorizonMs: number;
   remainingMs: number;
   firstUnsafeOffsetMs: number | null;
 }
@@ -181,11 +185,13 @@ export interface DodgeCostWeights {
   speedChange: number;
   pathIntentDeviationPerSecond: number;
   unnecessaryWaitPerSecond: number;
+  unnecessaryMotionPerSecond: number;
   combatTooClosePerSecond: number;
   combatTooFarPerSecond: number;
   terminalGoalDistance: number;
   terminalCombatTooClose: number;
   terminalCombatTooFar: number;
+  terminalUnnecessarySpeed: number;
   terminalHeadingMismatch: number;
   terminalFutureExposure: number;
   terminalEnemyProximity: number;
@@ -213,6 +219,8 @@ export const DODGE_COST_WEIGHTS: Readonly<DodgeCostWeights> = Object.freeze({
   pathIntentDeviationPerSecond: 0.8,
   // Per-second cost for waiting while a movement goal remains outstanding.
   unnecessaryWaitPerSecond: 1.2,
+  // Per-second cost for moving when no navigation or range correction is needed.
+  unnecessaryMotionPerSecond: 0.8,
   // Strong per-second pressure away from the selected target's hard range.
   combatTooClosePerSecond: 10,
   // Softer per-second pressure back toward weapon range; scaled down during danger.
@@ -222,6 +230,8 @@ export const DODGE_COST_WEIGHTS: Readonly<DodgeCostWeights> = Object.freeze({
   // Terminal range errors around the selected combat target.
   terminalCombatTooClose: 6,
   terminalCombatTooFar: 2,
+  // Normalized terminal-speed cost when the current intent calls for holding position.
+  terminalUnnecessarySpeed: 0.6,
   // Terminal heading mismatch relative to the local waypoint.
   terminalHeadingMismatch: 0.35,
   // Terminal penalty for ending with close predicted projectile exposure.
@@ -439,41 +449,102 @@ export class SpaceTimeDodgePlanner {
   assessTrajectory(
     input: DodgePlanningInput,
     trajectory: DodgeTrajectory,
+    comparisonHorizonMs?: number,
   ): DodgeTrajectoryAssessment {
-    const elapsed = input.time - trajectory.createdAt;
-    const future = trajectory.waypoints.filter((waypoint) => waypoint.timeOffsetMs > elapsed + 1e-9);
-    if (future.length === 0) {
-      return { safe: false, score: Infinity, remainingMs: 0, firstUnsafeOffsetMs: 0 };
-    }
-    const remainingMs = future[future.length - 1]!.timeOffsetMs - elapsed;
+    const elapsed = Math.max(0, input.time - trajectory.createdAt);
+    const finalOffsetMs = trajectory.waypoints.at(-1)?.timeOffsetMs ?? 0;
+    const remainingMs = Math.max(0, finalOffsetMs - elapsed);
+    const requestedHorizon = Number.isFinite(comparisonHorizonMs)
+      ? Math.max(0, Number(comparisonHorizonMs))
+      : remainingMs;
+    const horizonMs = Math.min(remainingMs, requestedHorizon);
+    if (horizonMs <= 0) return unsafeAssessment(remainingMs, 0, 0);
+
     const counters = emptyCounters();
-    const context = this.createContext(input, remainingMs, counters);
-    let previous = input.position;
+    const context = this.createContext(input, horizonMs, counters);
+    let previous = { ...input.position };
     let previousOffsetMs = 0;
-    let score = 0;
-    for (const waypoint of future) {
-      const offsetMs = waypoint.timeOffsetMs - elapsed;
+    let previousVelocity = input.previousVelocity ?? input.intentVelocity;
+    let cumulativeCost = 0;
+    let intentCost = 0;
+    let minimumProjectileClearance = Infinity;
+    let minimumEnemyClearance = context.startEnemyDistance;
+    for (const waypoint of trajectory.waypoints) {
+      const sourceOffsetMs = waypoint.timeOffsetMs - elapsed;
+      if (sourceOffsetMs <= 1e-9) continue;
+      let offsetMs = sourceOffsetMs;
+      let endpoint = { x: waypoint.x, y: waypoint.y };
+      if (offsetMs > horizonMs) {
+        const span = offsetMs - previousOffsetMs;
+        const ratio = span <= 0 ? 1 : (horizonMs - previousOffsetMs) / span;
+        endpoint = {
+          x: previous.x + (waypoint.x - previous.x) * ratio,
+          y: previous.y + (waypoint.y - previous.y) * ratio,
+        };
+        offsetMs = horizonMs;
+      }
+      const durationMs = offsetMs - previousOffsetMs;
+      if (durationMs <= 0) continue;
+      const velocity = {
+        x: (endpoint.x - previous.x) / durationMs,
+        y: (endpoint.y - previous.y) / durationMs,
+      };
       const safety = this.evaluateEdge(
         context,
         previous,
-        waypoint,
+        endpoint,
         previousOffsetMs,
         offsetMs,
         false,
       );
-      if (!safety) {
-        return {
-          safe: false,
-          score: Infinity,
-          remainingMs,
-          firstUnsafeOffsetMs: previousOffsetMs,
-        };
-      }
-      score += safety.softCost;
-      previous = waypoint;
+      if (!safety) return unsafeAssessment(remainingMs, horizonMs, previousOffsetMs);
+      cumulativeCost += this.transitionCost(
+        context,
+        previous,
+        velocity,
+        previousVelocity,
+        durationMs,
+        safety,
+        offsetMs,
+      );
+      intentCost += this.calculateIntentTransitionCost(
+        context,
+        previous,
+        velocity,
+        durationMs,
+        offsetMs,
+      );
+      minimumProjectileClearance = Math.min(
+        minimumProjectileClearance,
+        safety.minimumProjectileClearance,
+      );
+      minimumEnemyClearance = Math.min(minimumEnemyClearance, safety.minimumEnemyClearance);
+      previous = endpoint;
+      previousVelocity = velocity;
       previousOffsetMs = offsetMs;
+      if (offsetMs >= horizonMs - 1e-9) break;
     }
-    return { safe: true, score, remainingMs, firstUnsafeOffsetMs: null };
+    if (previousOffsetMs < horizonMs - 1e-9) {
+      return unsafeAssessment(remainingMs, horizonMs, previousOffsetMs);
+    }
+    const terminalCost = this.terminalCost(
+      context,
+      previous,
+      previousVelocity,
+      minimumProjectileClearance,
+      minimumEnemyClearance,
+      horizonMs,
+    );
+    return {
+      safe: true,
+      score: cumulativeCost + terminalCost,
+      cumulativeCost,
+      terminalCost,
+      intentCost,
+      comparisonHorizonMs: horizonMs,
+      remainingMs,
+      firstUnsafeOffsetMs: null,
+    };
   }
 
   findEmergencyJump(input: DodgePlanningInput, allowance: number): EmergencyJumpPlan | undefined {
@@ -1133,9 +1204,11 @@ export class SpaceTimeDodgePlanner {
 
     cost += this.calculateIntentTransitionCost(context, from, velocity, durationMs, endMs);
     const desired = desiredDirectionAt(context, from, endMs - durationMs);
-    if (speed <= 1e-9
-      && (desired || context.projectileSegments.length > 0 || context.input.aoes.length > 0)) {
+    if (speed <= 1e-9 && desired) {
       cost += this.weights.unnecessaryWaitPerSecond * durationSeconds;
+    } else if (speed > 1e-9 && !desired && context.input.moveSpeed > 1e-9) {
+      cost += this.weights.unnecessaryMotionPerSecond
+        * durationSeconds * speed / context.input.moveSpeed;
     }
     if (desired) {
       if (speed > 1e-9) {
@@ -1234,6 +1307,12 @@ export class SpaceTimeDodgePlanner {
         this.weights.terminalCombatTooClose,
         this.weights.terminalCombatTooFar * context.retreatPenaltyScale,
       );
+    }
+    const terminalSpeed = Math.hypot(velocity.x, velocity.y);
+    if (!desiredDirectionAt(context, position, safeThroughMs)
+      && terminalSpeed > 1e-9 && context.input.moveSpeed > 1e-9) {
+      cost += this.weights.terminalUnnecessarySpeed
+        * Math.min(1, terminalSpeed / context.input.moveSpeed);
     }
     if (Number.isFinite(projectileClearance) && projectileClearance < PROJECTILE_NEAR_BAND) {
       const normalized = clamp((PROJECTILE_NEAR_BAND - projectileClearance) / PROJECTILE_NEAR_BAND, 0, 1);
@@ -2031,6 +2110,23 @@ function emptyCounters(): PlanCounters {
     statesMerged: 0,
     statesPrunedByBeam: 0,
     activeProjectilesConsidered: 0,
+  };
+}
+
+function unsafeAssessment(
+  remainingMs: number,
+  comparisonHorizonMs: number,
+  firstUnsafeOffsetMs: number,
+): DodgeTrajectoryAssessment {
+  return {
+    safe: false,
+    score: Infinity,
+    cumulativeCost: Infinity,
+    terminalCost: Infinity,
+    intentCost: Infinity,
+    comparisonHorizonMs,
+    remainingMs,
+    firstUnsafeOffsetMs,
   };
 }
 

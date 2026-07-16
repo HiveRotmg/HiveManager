@@ -105,6 +105,7 @@ const TRAJECTORY_DRIFT_TOLERANCE = 0.45;
 const GOAL_CHANGE_TOLERANCE = 0.5;
 const GOAL_DIRECTION_CHANGE_COSINE = Math.cos(12 * Math.PI / 180);
 const RANGE_CHANGE_TOLERANCE = 0.05;
+const PLAN_COMPARISON_HORIZON_MS = 350;
 const COMMAND_LOOKAHEAD_MS = 60;
 const PLAN_SCORE_ABSOLUTE_GAIN = 0.35;
 const PLAN_SCORE_RELATIVE_GAIN = 0.08;
@@ -310,7 +311,6 @@ export class PredictiveAutoDodgeController {
     };
 
     let currentUnsafe = this.urgentReplanPending;
-    let currentAssessmentScore = this.committed?.result.terminalScore ?? Infinity;
     let remainingMs = this.committed
       ? trajectoryRemainingMs(this.committed.result.trajectory, snapshot.time)
       : 0;
@@ -327,7 +327,6 @@ export class PredictiveAutoDodgeController {
         const assessment = this.planner.assessTrajectory(input, this.committed.result.trajectory);
         currentUnsafe = !assessment.safe;
         this.urgentReplanPending = currentUnsafe;
-        currentAssessmentScore = assessment.score;
         remainingMs = assessment.remainingMs;
         if (currentUnsafe || drifted) this.planner.recordTrajectoryInvalidation();
       }
@@ -354,15 +353,37 @@ export class PredictiveAutoDodgeController {
       const proposed = this.planner.plan(input, replanReason);
       this.lastPlanAt = snapshot.time;
       if (replanReason === 'urgent') this.lastUrgentPlanAt = snapshot.time;
+      const proposedRemainingMs = trajectoryRemainingMs(proposed.trajectory, snapshot.time);
+      const comparisonHorizonMs = Math.min(
+        PLAN_COMPARISON_HORIZON_MS,
+        remainingMs || proposedRemainingMs,
+        proposedRemainingMs,
+      );
+      const currentComparable = this.committed
+        ? this.planner.assessTrajectory(
+            input,
+            this.committed.result.trajectory,
+            comparisonHorizonMs,
+          )
+        : undefined;
+      const proposedComparable = this.planner.assessTrajectory(
+        input,
+        proposed.trajectory,
+        comparisonHorizonMs,
+      );
+      if (currentComparable && !currentComparable.safe) currentUnsafe = true;
       const forceReplace = !this.committed
         || currentUnsafe
         || intentChanged
         || routeChanged
         || drifted
         || remainingMs <= MINIMUM_REMAINING_HORIZON_MS;
-      const meaningfulGain = proposed.terminalScore + PLAN_SCORE_ABSOLUTE_GAIN
-        < currentAssessmentScore * (1 - PLAN_SCORE_RELATIVE_GAIN);
-      if (forceReplace || meaningfulGain) {
+      const meaningfulGain = !!currentComparable
+        && proposedComparable.safe
+        && proposedComparable.score + PLAN_SCORE_ABSOLUTE_GAIN
+          < currentComparable.score * (1 - PLAN_SCORE_RELATIVE_GAIN);
+      const safeReplacement = !this.committed || proposedComparable.safe || currentUnsafe;
+      if (safeReplacement && (forceReplace || meaningfulGain)) {
         this.committed = {
           result: proposed,
           start: { ...snapshot.position },

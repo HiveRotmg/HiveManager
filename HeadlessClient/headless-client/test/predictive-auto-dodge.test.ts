@@ -55,6 +55,45 @@ test('predictive auto-dodge escapes an imminent projectile from standstill', () 
   assert.ok(state.trajectory?.waypoints.some((waypoint) => waypoint.speed > 0));
 });
 
+test('a full-speed escape stops promptly after its danger has passed', () => {
+  const controller = new PredictiveAutoDodgeController({ maxStatesPerLayer: 64 });
+  controller.setEnabled(true);
+  const shot = {
+    ...hostileProjectile(),
+    startX: 4,
+    definition: { ...definition, lifetimeMs: 120 },
+  };
+  const base = {
+    playerId: 10,
+    moveSpeed: 0.0096,
+    intentVelocity: { x: 0, y: 0 },
+    movementLeadMs: 0,
+    projectiles: [shot],
+    aoes: [],
+    environment: openEnvironment,
+  };
+  let position = { x: 5, y: 5 };
+  let state = controller.evaluate({ ...base, time: 0, position });
+
+  assert.ok(Math.abs(Math.hypot(state.velocity.x, state.velocity.y) - base.moveSpeed) < 1e-9);
+
+  let stoppedAt: number | null = null;
+  for (let time = 20; time <= 400; time += 20) {
+    position = {
+      x: position.x + state.velocity.x * 20,
+      y: position.y + state.velocity.y * 20,
+    };
+    state = controller.evaluate({ ...base, time, position });
+    if (Math.hypot(state.velocity.x, state.velocity.y) < 1e-9) {
+      stoppedAt = time;
+      break;
+    }
+  }
+
+  assert.ok(stoppedAt !== null && stoppedAt <= 350, `escape continued until ${stoppedAt}`);
+  assert.ok(state.trajectory?.waypoints.some((waypoint) => waypoint.speed === 0));
+});
+
 test('predictive auto-dodge uses an exact 0.5 projectile collision box', () => {
   const controller = new PredictiveAutoDodgeController();
   controller.setEnabled(true);

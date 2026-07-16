@@ -259,6 +259,60 @@ test('6. moving controls use the computed maximum speed rather than fractions', 
   assert.equal(planner.assessTrajectory(input, result.trajectory).safe, true);
 });
 
+test('current and proposed trajectories use the same clipped score breakdown', () => {
+  const planner = testPlanner();
+  const input = planningInput({
+    time: 100,
+    position: { x: 5.4, y: 5 },
+    moveSpeed: 0.004,
+    intentVelocity: { x: 0.004, y: 0 },
+    previousVelocity: { x: 0.004, y: 0 },
+  });
+  const current = {
+    createdAt: 0,
+    waypoints: [
+      { timeOffsetMs: 100, x: 5.4, y: 5, speed: 4 },
+      { timeOffsetMs: 450, x: 6.8, y: 5, speed: 4 },
+    ],
+  };
+  const proposed = {
+    createdAt: 100,
+    waypoints: [
+      { timeOffsetMs: 350, x: 6.8, y: 5, speed: 4 },
+    ],
+  };
+
+  const currentScore = planner.assessTrajectory(input, current, 350);
+  const proposedScore = planner.assessTrajectory(input, proposed, 350);
+
+  assert.equal(currentScore.safe, true);
+  assert.equal(proposedScore.safe, true);
+  assert.equal(currentScore.comparisonHorizonMs, 350);
+  assert.equal(proposedScore.comparisonHorizonMs, 350);
+  assert.ok(Math.abs(currentScore.score - proposedScore.score) < 1e-9);
+  assert.ok(Math.abs(currentScore.cumulativeCost - proposedScore.cumulativeCost) < 1e-9);
+  assert.ok(Math.abs(currentScore.terminalCost - proposedScore.terminalCost) < 1e-9);
+  assert.ok(Math.abs(currentScore.intentCost - proposedScore.intentCost) < 1e-9);
+});
+
+test('a harmless projectile does not make safe waiting artificially expensive', () => {
+  const result = plan(planningInput({
+    goal: undefined,
+    intent: null,
+    intentVelocity: { x: 0, y: 0 },
+    previousVelocity: { x: 0, y: 0 },
+    projectiles: [projectile({
+      startX: 5,
+      startY: 8,
+      angle: 0,
+    })],
+  }));
+
+  assert.equal(result.activeProjectileCount, 1);
+  assert.equal(result.reachesHorizon, true);
+  assert.ok(result.trajectory.waypoints.every((waypoint) => waypoint.speed === 0));
+});
+
 test('7. the planner temporarily retreats when forward movement is lethal', () => {
   const result = plan(retreatInput());
 
