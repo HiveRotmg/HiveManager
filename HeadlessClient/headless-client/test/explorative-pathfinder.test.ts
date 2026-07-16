@@ -374,6 +374,12 @@ test('Client combined navigation enables dodge and never gives it a goal farther
 
   assert.equal(client.navigateTo({ x: 20.5, y: 0.5 }), true);
   assert.equal(client.isAutoDodgeEnabled(), true);
+  assert.deepEqual(client.getDodgeMovementIntent(), {
+    mode: 'goal',
+    goalX: 20.5,
+    goalY: 0.5,
+    arriveThreshold: 0.5,
+  });
   state.updateTarget(16, false, 1000);
 
   const dodge = client.getAutoDodgeState();
@@ -381,6 +387,20 @@ test('Client combined navigation enables dodge and never gives it a goal farther
   assert.ok(dodge?.goal);
   assert.ok(Math.hypot(dodge.goal.x - start.x, dodge.goal.y - start.y)
     <= MAX_LOCAL_GOAL_DISTANCE + 1e-9);
+
+  assert.equal(client.navigateToCombatTarget(
+    { x: 20.5, y: 0.5 },
+    { minimumDistance: 2.5, preferredDistance: 3, maximumDistance: 3.5 },
+  ), true);
+  assert.deepEqual(client.getDodgeMovementIntent(), {
+    mode: 'combat_range',
+    targetId: 0,
+    targetX: 20.5,
+    targetY: 0.5,
+    hardMinimumRange: 1.3,
+    preferredMinimumRange: 2.5,
+    preferredMaximumRange: 3.5,
+  });
 });
 
 test('Client pathfinding refresh preserves the active waypoint stall state', () => {

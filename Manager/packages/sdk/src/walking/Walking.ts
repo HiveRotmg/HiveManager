@@ -1,6 +1,29 @@
 import { Position } from '../types/world/Position';
 import { Enemy } from '../types/entities/Enemy';
 
+export type DodgeMovementIntentMode = 'goal' | 'combat_range';
+export type DodgeMovementIntentId = string | number;
+
+export interface GoalDodgeIntent {
+    mode: 'goal';
+    goalX: number;
+    goalY: number;
+    goalId?: DodgeMovementIntentId;
+    arriveThreshold?: number;
+}
+
+export interface CombatRangeDodgeIntent {
+    mode: 'combat_range';
+    targetId: number;
+    targetX: number;
+    targetY: number;
+    hardMinimumRange: number;
+    preferredMinimumRange: number;
+    preferredMaximumRange: number;
+}
+
+export type DodgeMovementIntent = GoalDodgeIntent | CombatRangeDodgeIntent;
+
 export interface AutoDodgeOptions {
     /** Avoid tiles that deal ground damage. Defaults to true. */
     safeWalk?: boolean;
@@ -42,9 +65,13 @@ export interface AutoDodgeState {
 export interface NavigationOptions extends AutoDodgeOptions {
     /** Distance from the destination at which navigation stops. */
     arriveThreshold?: number;
+    /** Stable identity for repeated updates of the same destination. */
+    goalId?: DodgeMovementIntentId;
 }
 
 export interface CombatPathfindingOptions {
+    /** Stable runtime identity of the selected combat target. */
+    targetId?: number;
     /** Weapon range in tiles. Zero or omitted derives it from the equipped weapon. */
     weaponRange?: number;
     /** Preferred fraction of weapon range. Defaults to 0.75. */
@@ -223,6 +250,14 @@ export class Walking {
     }
 
     static getAutoDodgeState(): AutoDodgeState | null {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static setDodgeMovementIntent(intent: DodgeMovementIntent | null): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static getDodgeMovementIntent(): DodgeMovementIntent | null {
         throw new Error('Must be run inside Hive client');
     }
 

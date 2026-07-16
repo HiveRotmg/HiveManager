@@ -98,7 +98,13 @@ import {
   MAX_LOCAL_GOAL_DISTANCE,
   type CombatPathfindingRange,
 } from './explorative-pathfinder';
-import { DodgeCollisionWorld } from './dodge-collision-world';
+import { DodgeCollisionWorld, ENEMY_AVOID_RADIUS } from './dodge-collision-world';
+import {
+  cloneDodgeMovementIntent,
+  normalizeDodgeMovementIntent,
+  type DodgeMovementIntent,
+  type DodgeMovementIntentId,
+} from './dodge-movement-intent';
 import { DodgeJumpLimiter } from './dodge-jump-limiter';
 import { MovementController, movementSpeed, type MovementSnapshot } from './movement-controller';
 import {
@@ -290,6 +296,7 @@ export class Client extends EventEmitter {
   private readonly pathfinder: ExplorativePathfinder;
   private readonly dodgeWorld: DodgeCollisionWorld | undefined;
   private readonly autoDodge: PredictiveAutoDodgeController | undefined;
+  private dodgeMovementIntent: DodgeMovementIntent | null = null;
   private readonly dodgeJumpLimiter = new DodgeJumpLimiter();
   private readonly thrownAoes: ThrownAoeTracker | undefined;
   private readonly portalTracker = new PortalTracker();
@@ -594,9 +601,16 @@ export class Client extends EventEmitter {
   navigateTo(
     target: { x: number; y: number },
     arriveThreshold = config.arriveThreshold,
-    options: AutoDodgeOptions = {},
+    options: AutoDodgeOptions & { goalId?: DodgeMovementIntentId } = {},
   ): boolean {
     if (!this.autoDodge || !this.pathfindingWalkTo(target, arriveThreshold)) return false;
+    this.setDodgeMovementIntent({
+      mode: 'goal',
+      goalX: target.x,
+      goalY: target.y,
+      goalId: options.goalId,
+      arriveThreshold,
+    });
     this.autoDodge.setEnabled(true, { ...options, safeWalk: options.safeWalk ?? true });
     return true;
   }
@@ -616,9 +630,18 @@ export class Client extends EventEmitter {
   navigateToCombatTarget(
     target: { x: number; y: number },
     range: CombatPathfindingRange,
-    options: AutoDodgeOptions = {},
+    options: AutoDodgeOptions & { targetId?: number } = {},
   ): boolean {
     if (!this.autoDodge || !this.combatPathfindingWalkTo(target, range)) return false;
+    this.setDodgeMovementIntent({
+      mode: 'combat_range',
+      targetId: options.targetId ?? 0,
+      targetX: target.x,
+      targetY: target.y,
+      hardMinimumRange: ENEMY_AVOID_RADIUS,
+      preferredMinimumRange: range.minimumDistance,
+      preferredMaximumRange: range.maximumDistance,
+    });
     this.autoDodge.setEnabled(true, { ...options, safeWalk: options.safeWalk ?? true });
     return true;
   }
@@ -626,6 +649,7 @@ export class Client extends EventEmitter {
   stopMoving(): void {
     this.pathfinder.clearTarget();
     this.movement.clear();
+    this.dodgeMovementIntent = null;
   }
 
   isMoving(): boolean {
@@ -653,6 +677,21 @@ export class Client extends EventEmitter {
 
   getAutoDodgeState(): AutoDodgeState | null {
     return this.autoDodge?.getState() ?? null;
+  }
+
+  setDodgeMovementIntent(intent: DodgeMovementIntent | null): boolean {
+    if (intent === null) {
+      this.dodgeMovementIntent = null;
+      return true;
+    }
+    const normalized = normalizeDodgeMovementIntent(intent);
+    if (!normalized) return false;
+    this.dodgeMovementIntent = normalized;
+    return true;
+  }
+
+  getDodgeMovementIntent(): DodgeMovementIntent | null {
+    return cloneDodgeMovementIntent(this.dodgeMovementIntent);
   }
 
   /** Short account label used in logs and console commands. */

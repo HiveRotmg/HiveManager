@@ -11,6 +11,7 @@ import {
   inventory,
   type InventoryContainer,
   type CombatPathfindingOptions,
+  type DodgeMovementIntent,
   type Stats,
 } from '@hive/sdk';
 import { ClientEvent, type Client } from 'headless-client';
@@ -428,6 +429,7 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
       safeWalk: options.safeWalk,
       projectileJump: options.projectileJump,
       maxJumpDistance: options.maxJumpDistance,
+      goalId: options.goalId,
     });
   };
   Walking.pathfindingWalkToCombatTarget = (x: number, y: number, options = {}) => {
@@ -452,6 +454,7 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
       safeWalk: options.safeWalk,
       projectileJump: options.projectileJump,
       maxJumpDistance: options.maxJumpDistance,
+      targetId: options.targetId,
     });
   };
   Walking.walkToPosition = (position: Position) => {
@@ -568,6 +571,10 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
   Walking.disableAutoDodge = () => active(deps).disableAutoDodge();
   Walking.isAutoDodgeEnabled = () => optional(deps)?.isAutoDodgeEnabled() ?? false;
   Walking.getAutoDodgeState = () => optional(deps)?.getAutoDodgeState() ?? null;
+  Walking.setDodgeMovementIntent = (intent: DodgeMovementIntent | null) => (
+    active(deps).setDodgeMovementIntent(intent)
+  );
+  Walking.getDodgeMovementIntent = () => optional(deps)?.getDodgeMovementIntent() ?? null;
   Walking.getDodgePosition = () => {
     const target = optional(deps)?.getAutoDodgeState()?.target;
     return target ? new Position(target.x, target.y) : null;

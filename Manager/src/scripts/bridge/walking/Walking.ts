@@ -127,6 +127,13 @@ export class BridgeWalking {
 
     Walking.getAutoDodgeState = () => null;
 
+    Walking.setDodgeMovementIntent = () => {
+      warnUnimplemented('Walking.setDodgeMovementIntent');
+      return false;
+    };
+
+    Walking.getDodgeMovementIntent = () => null;
+
     Walking.getDodgePosition = (): Position | null => {
       warnUnimplemented('Walking.getDodgePosition');
       return null;

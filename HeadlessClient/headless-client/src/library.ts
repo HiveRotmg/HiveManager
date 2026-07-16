@@ -76,6 +76,17 @@ export {
 } from './dodge-jump-limiter';
 export type { DodgeJumpLimiterState, DodgeJumpStatus } from './dodge-jump-limiter';
 export {
+  cloneDodgeMovementIntent,
+  normalizeDodgeMovementIntent,
+} from './dodge-movement-intent';
+export type {
+  CombatRangeDodgeIntent,
+  DodgeMovementIntent,
+  DodgeMovementIntentId,
+  DodgeMovementIntentMode,
+  GoalDodgeIntent,
+} from './dodge-movement-intent';
+export {
   DODGE_COST_WEIGHTS,
   SpaceTimeDodgePlanner,
   sweptRelativeMotion,

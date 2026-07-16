@@ -114,8 +114,13 @@ export { Walking } from './walking/Walking';
 export type {
   AutoDodgeOptions,
   AutoDodgeState,
+  CombatRangeDodgeIntent,
   CombatNavigationOptions,
   CombatPathfindingOptions,
+  DodgeMovementIntent,
+  DodgeMovementIntentId,
+  DodgeMovementIntentMode,
+  GoalDodgeIntent,
   NavigationOptions,
   TeleportBeaconDestination,
 } from './walking/Walking';
