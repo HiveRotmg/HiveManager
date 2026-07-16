@@ -4668,14 +4668,15 @@ export class DevServer {
             res.end(JSON.stringify({ ok: false, error: 'Script host not available.' }));
             return;
           }
-          const parsed = JSON.parse(body || '{}') as { id?: string };
+          const parsed = JSON.parse(body || '{}') as { id?: string; accountId?: string };
           const id = String(parsed.id ?? '').trim();
           if (!id) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: 'id is required.' }));
             return;
           }
-          const result = this.scriptHost.stop(id);
+          const accountId = String(parsed.accountId ?? '').trim() || undefined;
+          const result = this.scriptHost.stop(id, accountId);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(result));
         } catch (err) {
@@ -5095,6 +5096,7 @@ export class DevServer {
           this.scheduleAutosave();
         } else if (msg.type === 'scriptPanelEvent') {
           const scriptId = String((msg as { scriptId?: unknown }).scriptId ?? '').trim();
+          const accountId = String((msg as { accountId?: unknown }).accountId ?? '').trim() || undefined;
           const widgetId = String((msg as { widgetId?: unknown }).widgetId ?? '').trim();
           const rawKind = String((msg as { kind?: unknown }).kind ?? '').trim();
           if (!scriptId || !this.scriptHost) return;
@@ -5102,6 +5104,7 @@ export class DevServer {
           if (rawKind !== 'closed-by-user' && !widgetId) return;
           const evt: ScriptPanelInboundEvent = {
             scriptId,
+            accountId,
             widgetId,
             kind: rawKind,
             value: (msg as { value?: unknown }).value,
@@ -5786,12 +5789,13 @@ export class DevServer {
   /** Replays current panel state to one dashboard socket (used on reconnect). */
   sendScriptPanelSnapshots(ws: WebSocket): void {
     if (!this.scriptHost) return;
-    for (const scriptId of this.scriptHost.panelScriptIds()) {
-      const snap = this.scriptHost.getPanelSnapshot(scriptId);
+    for (const { scriptId, accountId } of this.scriptHost.panelInstances()) {
+      const snap = this.scriptHost.getPanelSnapshot(scriptId, accountId);
       if (!snap) continue;
       const msg: ScriptPanelOutboundMessage = {
         type: 'scriptPanelState',
         scriptId,
+        accountId,
         def: snap.def,
         isOpen: snap.isOpen,
       };

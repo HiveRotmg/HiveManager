@@ -162,8 +162,8 @@ interface StoredPanel {
 }
 
 /**
- * Process-wide registry of script panels. One panel per script id.
- * Re-calling `define` for the same script replaces the existing panel.
+ * Process-wide registry of script panels. Account-bound runs of the same
+ * script each own a panel; unbound runs retain the legacy script-id identity.
  */
 export class ScriptPanelRegistry {
   private deps: BridgeDeps;
@@ -173,6 +173,15 @@ export class ScriptPanelRegistry {
   constructor(deps: BridgeDeps) {
     this.deps = deps;
     this.configStore = new ScriptPanelConfigStore(deps.scriptPanelConfigDir);
+  }
+
+  private panelKey(scriptId: string, accountId?: string): string {
+    const account = String(accountId ?? '').trim();
+    return account ? `${scriptId}\u0000${account}` : scriptId;
+  }
+
+  private panelsForScript(scriptId: string): StoredPanel[] {
+    return [...this.panels.values()].filter((stored) => stored.scriptId === scriptId);
   }
 
   private currentSession(): { scriptId: string; accountId?: string } | undefined {
@@ -293,8 +302,9 @@ export class ScriptPanelRegistry {
       );
     }
     const { scriptId, accountId } = session;
+    const panelKey = this.panelKey(scriptId, accountId);
 
-    const previous = this.panels.get(scriptId);
+    const previous = this.panels.get(panelKey);
     if (previous) this.flushAutoSave(previous);
 
     const handlers = new Map<string, WidgetHandlers>();
@@ -309,7 +319,7 @@ export class ScriptPanelRegistry {
       activeConfig: String(def.persistence?.config || '').trim() || 'default',
       isOpen: false,
     };
-    this.panels.set(scriptId, stored);
+    this.panels.set(panelKey, stored);
 
     const restoredValues = stored.persistence.enabled && stored.persistence.autoLoad
       ? this.readConfig(stored, stored.activeConfig)
@@ -318,18 +328,19 @@ export class ScriptPanelRegistry {
     this.emit({
       type: 'scriptPanelState',
       scriptId,
+      accountId,
       def: this.serializableDef(stored),
       isOpen: stored.isOpen,
     });
 
     if (def.autoOpen) {
       stored.isOpen = true;
-      this.emit({ type: 'scriptPanelOpen', scriptId });
+      this.emit({ type: 'scriptPanelOpen', scriptId, accountId });
     }
 
     if (restoredValues && Object.keys(restoredValues).length > 0) {
       queueMicrotask(() => {
-        if (this.panels.get(scriptId) === stored) this.invokeConfigHandlers(stored, restoredValues);
+        if (this.panels.get(panelKey) === stored) this.invokeConfigHandlers(stored, restoredValues);
       });
     }
 
@@ -340,12 +351,12 @@ export class ScriptPanelRegistry {
       open() {
         if (stored.isOpen) return;
         stored.isOpen = true;
-        self.emit({ type: 'scriptPanelOpen', scriptId });
+        self.emit({ type: 'scriptPanelOpen', scriptId, accountId });
       },
       close() {
         if (!stored.isOpen) return;
         stored.isOpen = false;
-        self.emit({ type: 'scriptPanelClose', scriptId });
+        self.emit({ type: 'scriptPanelClose', scriptId, accountId });
       },
       update(patch: Partial<PanelDefinition>) {
         const merged: PanelDefinition = { ...stored.def, ...patch };
@@ -364,6 +375,7 @@ export class ScriptPanelRegistry {
         self.emit({
           type: 'scriptPanelState',
           scriptId,
+          accountId,
           def: self.serializableDef(stored),
           isOpen: stored.isOpen,
         });
@@ -380,7 +392,7 @@ export class ScriptPanelRegistry {
             w.value = value;
           }
         }
-        self.emit({ type: 'scriptPanelPatches', scriptId, patches: [{ op: 'value', id, value } as ScriptPanelPatch] });
+        self.emit({ type: 'scriptPanelPatches', scriptId, accountId, patches: [{ op: 'value', id, value } as ScriptPanelPatch] });
         if (w && isPersistedWidget(w as unknown as PanelWidget)) self.scheduleAutoSave(stored);
       },
       getValue<T = unknown>(id: string): T | undefined {
@@ -396,7 +408,7 @@ export class ScriptPanelRegistry {
           : [];
         const w = findWidget(stored.def.widgets, id) as unknown as { options?: unknown[] } | undefined;
         if (w) w.options = normalized;
-        self.emit({ type: 'scriptPanelPatches', scriptId, patches: [{ op: 'options', id, value: normalized }] });
+        self.emit({ type: 'scriptPanelPatches', scriptId, accountId, patches: [{ op: 'options', id, value: normalized }] });
       },
       setProps(id, props) {
         const safe: Record<string, unknown> = {};
@@ -406,13 +418,13 @@ export class ScriptPanelRegistry {
         }
         const w = findWidget(stored.def.widgets, id) as unknown as Record<string, unknown> | undefined;
         if (w) Object.assign(w, safe);
-        self.emit({ type: 'scriptPanelPatches', scriptId, patches: [{ op: 'props', id, value: safe }] });
+        self.emit({ type: 'scriptPanelPatches', scriptId, accountId, patches: [{ op: 'props', id, value: safe }] });
         if (w && 'value' in safe && isPersistedWidget(w as unknown as PanelWidget)) self.scheduleAutoSave(stored);
       },
       setImage(id, src) {
         const w = findWidget(stored.def.widgets, id) as { src?: string } | undefined;
         if (w) w.src = String(src);
-        self.emit({ type: 'scriptPanelPatches', scriptId, patches: [{ op: 'image', id, value: String(src) } as ScriptPanelPatch] });
+        self.emit({ type: 'scriptPanelPatches', scriptId, accountId, patches: [{ op: 'image', id, value: String(src) } as ScriptPanelPatch] });
       },
       setText(id, text) {
         const w = findWidget(stored.def.widgets, id) as unknown as Record<string, unknown> | undefined;
@@ -422,17 +434,17 @@ export class ScriptPanelRegistry {
           if ('label' in w) (w as { label?: unknown }).label = text;
           if ('caption' in w) (w as { caption?: unknown }).caption = text;
         }
-        self.emit({ type: 'scriptPanelPatches', scriptId, patches: [{ op: 'text', id, value: String(text) }] });
+        self.emit({ type: 'scriptPanelPatches', scriptId, accountId, patches: [{ op: 'text', id, value: String(text) }] });
       },
       setEnabled(id, enabled) {
         const w = findWidget(stored.def.widgets, id) as { enabled?: boolean } | undefined;
         if (w) w.enabled = !!enabled;
-        self.emit({ type: 'scriptPanelPatches', scriptId, patches: [{ op: 'enabled', id, value: !!enabled }] });
+        self.emit({ type: 'scriptPanelPatches', scriptId, accountId, patches: [{ op: 'enabled', id, value: !!enabled }] });
       },
       setVisible(id, visible) {
         const w = findWidget(stored.def.widgets, id) as { visible?: boolean } | undefined;
         if (w) w.visible = !!visible;
-        self.emit({ type: 'scriptPanelPatches', scriptId, patches: [{ op: 'visible', id, value: !!visible }] });
+        self.emit({ type: 'scriptPanelPatches', scriptId, accountId, patches: [{ op: 'visible', id, value: !!visible }] });
       },
       appendLog(id, line) {
         const w = findWidget(stored.def.widgets, id) as { type?: string; lines?: string[]; maxLines?: number } | undefined;
@@ -442,13 +454,13 @@ export class ScriptPanelRegistry {
           const cap = typeof w.maxLines === 'number' && w.maxLines > 0 ? w.maxLines : 200;
           if (lines.length > cap) lines.splice(0, lines.length - cap);
         }
-        self.emit({ type: 'scriptPanelPatches', scriptId, patches: [{ op: 'log-append', id, value: String(line) }] });
+        self.emit({ type: 'scriptPanelPatches', scriptId, accountId, patches: [{ op: 'log-append', id, value: String(line) }] });
       },
       setLog(id, lines) {
         const arr = Array.isArray(lines) ? lines.map((s) => String(s)) : [];
         const w = findWidget(stored.def.widgets, id) as { type?: string; lines?: string[] } | undefined;
         if (w && w.type === 'log') w.lines = arr.slice();
-        self.emit({ type: 'scriptPanelPatches', scriptId, patches: [{ op: 'log-set', id, value: arr }] });
+        self.emit({ type: 'scriptPanelPatches', scriptId, accountId, patches: [{ op: 'log-set', id, value: arr }] });
       },
       saveConfig(name) {
         try {
@@ -466,6 +478,7 @@ export class ScriptPanelRegistry {
           self.emit({
             type: 'scriptPanelState',
             scriptId,
+            accountId,
             def: self.serializableDef(stored),
             isOpen: stored.isOpen,
           });
@@ -506,8 +519,14 @@ export class ScriptPanelRegistry {
   }
 
   /** DevServer routes widget events back into the right script handler. */
-  dispatchEvent(evt: ScriptPanelInboundEvent, runInScript: (id: string, fn: () => void) => void): void {
-    const stored = this.panels.get(evt.scriptId);
+  dispatchEvent(
+    evt: ScriptPanelInboundEvent,
+    runInScript: (id: string, accountId: string | undefined, fn: () => void) => void,
+  ): void {
+    const accountId = String(evt.accountId ?? '').trim() || undefined;
+    const exact = this.panels.get(this.panelKey(evt.scriptId, accountId));
+    const candidates = accountId ? [] : this.panelsForScript(evt.scriptId);
+    const stored = exact ?? (candidates.length === 1 ? candidates[0] : undefined);
     if (!stored) return;
 
     if (evt.kind === 'closed-by-user') {
@@ -527,7 +546,7 @@ export class ScriptPanelRegistry {
     const entry = stored.handlers.get(evt.widgetId);
     if (!entry) return;
 
-    runInScript(evt.scriptId, () => {
+    runInScript(stored.scriptId, stored.accountId, () => {
       try {
         if (evt.kind === 'click') entry.onClick?.();
         else if (evt.kind === 'change') entry.onChange?.(evt.value);
@@ -542,23 +561,33 @@ export class ScriptPanelRegistry {
   }
 
   /** Called when a script stops — removes its panel and notifies the dashboard. */
-  destroyForScript(scriptId: string): void {
-    const stored = this.panels.get(scriptId);
-    if (!stored) return;
-    this.flushAutoSave(stored);
-    this.panels.delete(scriptId);
-    this.emit({ type: 'scriptPanelState', scriptId, def: null, isOpen: false });
+  destroyForScript(scriptId: string, accountId?: string): void {
+    const account = String(accountId ?? '').trim() || undefined;
+    const targets = account
+      ? [this.panels.get(this.panelKey(scriptId, account))].filter((panel): panel is StoredPanel => !!panel)
+      : this.panelsForScript(scriptId);
+    for (const stored of targets) {
+      this.flushAutoSave(stored);
+      this.panels.delete(this.panelKey(stored.scriptId, stored.accountId));
+      this.emit({
+        type: 'scriptPanelState',
+        scriptId: stored.scriptId,
+        accountId: stored.accountId,
+        def: null,
+        isOpen: false,
+      });
+    }
   }
 
   /** Snapshot of a panel (for dashboard reconnects). */
-  snapshot(scriptId: string): { def: unknown; isOpen: boolean } | undefined {
-    const stored = this.panels.get(scriptId);
+  snapshot(scriptId: string, accountId?: string): { def: unknown; isOpen: boolean } | undefined {
+    const stored = this.panels.get(this.panelKey(scriptId, accountId));
     if (!stored) return undefined;
     return { def: this.serializableDef(stored), isOpen: stored.isOpen };
   }
 
-  /** All script ids that currently have a panel registered. */
-  scriptIds(): string[] {
-    return [...this.panels.keys()];
+  /** All account-bound panel identities currently registered. */
+  instances(): Array<{ scriptId: string; accountId?: string }> {
+    return [...this.panels.values()].map(({ scriptId, accountId }) => ({ scriptId, accountId }));
   }
 }

@@ -36,11 +36,11 @@ test('panel autosave restores persistent inputs and runs their handlers', async 
 
     first.dispatchEvent(
       { scriptId: 'persistent-script', widgetId: 'auto-loot', kind: 'change', value: true },
-      (_scriptId, fn) => fn(),
+      (_scriptId, _accountId, fn) => fn(),
     );
     first.dispatchEvent(
       { scriptId: 'persistent-script', widgetId: 'nexus-hp', kind: 'change', value: 33 },
-      (_scriptId, fn) => fn(),
+      (_scriptId, _accountId, fn) => fn(),
     );
     firstHandle.setValue('session-note', 'do not save');
     firstHandle.setValue('health', 0.1);
@@ -119,6 +119,55 @@ test('account-scoped panel configs stay isolated between accounts', async () => 
     });
     await Promise.resolve();
     assert.equal(secondHandle.getValue('auto-aim'), false);
+  } finally {
+    rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test('two account-bound panels keep state and handlers isolated', () => {
+  const configDir = mkdtempSync(join(tmpdir(), 'hive-panel-config-'));
+  try {
+    let accountId = 'account-a';
+    const messages: Array<{ type: string; scriptId: string; accountId?: string }> = [];
+    const deps = depsFor(configDir, accountId);
+    deps.getScriptSession = () => ({ scriptId: 'persistent-script', accountId });
+    deps.emitScriptPanelMessage = (message) => messages.push(message);
+    const registry = new ScriptPanelRegistry(deps);
+    const clicks: string[] = [];
+
+    const first = registry.define({
+      widgets: [Panel.button({ id: 'start-stop', label: 'Start', onClick: () => clicks.push('account-a') })],
+    });
+    accountId = 'account-b';
+    const second = registry.define({
+      widgets: [Panel.button({ id: 'start-stop', label: 'Start', onClick: () => clicks.push('account-b') })],
+    });
+
+    first.setText('start-stop', 'First running');
+    second.setText('start-stop', 'Second running');
+    assert.equal(first.getValue('start-stop'), undefined);
+    assert.equal(registry.instances().length, 2);
+    assert.ok(registry.snapshot('persistent-script', 'account-a'));
+    assert.ok(registry.snapshot('persistent-script', 'account-b'));
+    assert.deepEqual(
+      messages.filter((message) => message.type === 'scriptPanelPatches').map((message) => message.accountId),
+      ['account-a', 'account-b'],
+    );
+
+    const sessions: Array<string | undefined> = [];
+    registry.dispatchEvent(
+      { scriptId: 'persistent-script', accountId: 'account-b', widgetId: 'start-stop', kind: 'click' },
+      (_scriptId, eventAccountId, fn) => {
+        sessions.push(eventAccountId);
+        fn();
+      },
+    );
+    assert.deepEqual(clicks, ['account-b']);
+    assert.deepEqual(sessions, ['account-b']);
+
+    registry.destroyForScript('persistent-script', 'account-a');
+    assert.equal(registry.snapshot('persistent-script', 'account-a'), undefined);
+    assert.ok(registry.snapshot('persistent-script', 'account-b'));
   } finally {
     rmSync(configDir, { recursive: true, force: true });
   }

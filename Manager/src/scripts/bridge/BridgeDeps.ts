@@ -60,10 +60,10 @@ export interface BridgeDeps {
 
 /** Outbound dashboard-bound messages produced by the panel bridge. */
 export type ScriptPanelOutboundMessage =
-  | { type: 'scriptPanelState'; scriptId: string; def: unknown | null; isOpen: boolean }
-  | { type: 'scriptPanelPatches'; scriptId: string; patches: ScriptPanelPatch[] }
-  | { type: 'scriptPanelOpen'; scriptId: string }
-  | { type: 'scriptPanelClose'; scriptId: string };
+  | { type: 'scriptPanelState'; scriptId: string; accountId?: string; def: unknown | null; isOpen: boolean }
+  | { type: 'scriptPanelPatches'; scriptId: string; accountId?: string; patches: ScriptPanelPatch[] }
+  | { type: 'scriptPanelOpen'; scriptId: string; accountId?: string }
+  | { type: 'scriptPanelClose'; scriptId: string; accountId?: string };
 
 export type ScriptPanelPatch =
   | { op: 'value'; id: string; value: unknown }
@@ -79,6 +79,7 @@ export type ScriptPanelPatch =
 /** Inbound dashboard → script-bridge event. */
 export interface ScriptPanelInboundEvent {
   scriptId: string;
+  accountId?: string;
   widgetId: string;
   kind: 'click' | 'change' | 'submit' | 'select' | 'closed-by-user';
   value?: unknown;

@@ -5755,6 +5755,13 @@
     persistMacScriptSelection();
   }
 
+  function scriptActionBody(scriptId, clientId) {
+    var body = { id: String(scriptId || '') };
+    var accountId = String(clientId || '');
+    if (accountId && accountId !== SINGLE_ACCOUNT_CLIENT_ID) body.accountId = accountId;
+    return body;
+  }
+
   /**
    * Script picker snapshot for a connection: aligns MAC sidebar, popout, and home multi cards.
    */
@@ -5770,9 +5777,28 @@
       setMacScriptSelection(clientId, '');
     }
     var selectedScript = scripts.find(function (s) { return String(s.id || '') === String(selectedScriptId || ''); }) || null;
-    var selectedScriptStatus = selectedScript ? String(selectedScript.status || 'idle') : 'idle';
+    var selectedRun = selectedScript && Array.isArray(selectedScript.runs)
+      ? selectedScript.runs.find(function (run) {
+          var runAccountId = String(run && run.accountId || '');
+          var requestedClientId = String(clientId || '');
+          return runAccountId === requestedClientId
+            || requestedClientId === SINGLE_ACCOUNT_CLIENT_ID && !runAccountId;
+        }) || null
+      : selectedScript && String(selectedScript.accountId || '') === String(clientId || '')
+        ? selectedScript
+        : null;
+    var selectedScriptStatus = selectedScript
+      ? selectedRun
+        ? 'running'
+        : String(selectedScript.status || 'idle') === 'error'
+          ? 'error'
+          : 'idle'
+      : 'idle';
     var selectedScriptRunning = selectedScriptStatus === 'running';
-    var scriptPillText = formatScriptStatusPillText(selectedScript, selectedScriptStatus);
+    var selectedScriptForUi = selectedScript && selectedRun
+      ? Object.assign({}, selectedScript, selectedRun, { status: 'running' })
+      : selectedScript;
+    var scriptPillText = formatScriptStatusPillText(selectedScriptForUi, selectedScriptStatus);
     var scriptStatusClass =
       selectedScriptStatus === 'error'
         ? 'danger'
@@ -5784,7 +5810,8 @@
     return {
       scripts: scripts,
       selectedScriptId: selectedScriptId,
-      selectedScript: selectedScript,
+      selectedScript: selectedScriptForUi,
+      selectedRun: selectedRun,
       selectedScriptStatus: selectedScriptStatus,
       selectedScriptRunning: selectedScriptRunning,
       scriptPillText: scriptPillText,
@@ -6147,7 +6174,7 @@
         fetch('/api/scripts/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: scriptId, accountId: clientId }),
+          body: JSON.stringify(scriptActionBody(scriptId, clientId)),
         })
           .then(function (r) { return r.json(); })
           .then(function (result) {
@@ -6173,7 +6200,7 @@
         fetch('/api/scripts/stop', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: scriptId }),
+          body: JSON.stringify(scriptActionBody(scriptId, clientId)),
         })
           .then(function (r) { return r.json(); })
           .then(function () { return fetch('/api/scripts'); })
@@ -7104,10 +7131,10 @@
           handleScriptPanelPatches(msg);
           break;
         case 'scriptPanelOpen':
-          openScriptPanelById(msg && msg.scriptId);
+          openScriptPanelById(msg && msg.scriptId, msg && msg.accountId);
           break;
         case 'scriptPanelClose':
-          closeScriptPanelById(msg && msg.scriptId, { notifyServer: false });
+          closeScriptPanelById(msg && msg.scriptId, { notifyServer: false, accountId: msg && msg.accountId });
           break;
         case 'botApiTokenGranted':
           if (msg.access_token) window._botApiToken = String(msg.access_token);
@@ -8777,7 +8804,7 @@
         fetch('/api/scripts/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: runScriptId }),
+          body: JSON.stringify(scriptActionBody(runScriptId, clientId)),
         })
           .then(function (r) { return r.json(); })
           .then(function () { return fetch('/api/scripts'); })
@@ -8798,7 +8825,7 @@
         fetch('/api/scripts/stop', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: stopScriptId }),
+          body: JSON.stringify(scriptActionBody(stopScriptId, clientId)),
         })
           .then(function (r) { return r.json(); })
           .then(function () { return fetch('/api/scripts'); })
@@ -10140,8 +10167,7 @@
 
   function runViewerAccountScriptAction(action, scriptId, accountId) {
     if (!scriptId || (action !== 'start' && action !== 'stop')) return;
-    var body = { id: scriptId };
-    if (action === 'start') body.accountId = String(accountId || '');
+    var body = scriptActionBody(scriptId, accountId);
     fetch('/api/scripts/' + action, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -19575,17 +19601,36 @@
   // `scriptPanelEvent` messages, which DevServer dispatches into the
   // running script's handler.
 
-  var scriptPanels = new Map();          // scriptId -> { def, isOpen, version }
-  var scriptPanelOpenId = null;          // currently visible panel's scriptId
+  var scriptPanels = new Map();          // panel key -> { scriptId, accountId, def, isOpen, version }
+  var scriptPanelOpenId = null;          // currently visible account-bound panel key
 
   function getScriptPanelEl() { return document.getElementById('script-panel-popout'); }
 
-  function sendScriptPanelEvent(scriptId, widgetId, kind, value) {
+  function scriptPanelKey(scriptId, accountId) {
+    return JSON.stringify([String(scriptId || ''), String(accountId || '')]);
+  }
+
+  function resolveScriptPanelKey(panelRef, accountId) {
+    var ref = String(panelRef || '');
+    if (scriptPanels.has(ref)) return ref;
+    var exact = scriptPanelKey(ref, accountId);
+    if (scriptPanels.has(exact)) return exact;
+    var matches = Array.from(scriptPanels.entries()).filter(function (pair) {
+      return pair[1] && String(pair[1].scriptId || '') === ref;
+    });
+    return matches.length ? matches[matches.length - 1][0] : '';
+  }
+
+  function sendScriptPanelEvent(panelRef, widgetId, kind, value) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    var key = resolveScriptPanelKey(panelRef);
+    var entry = scriptPanels.get(key);
+    if (!entry) return;
     try {
       ws.send(JSON.stringify({
         type: 'scriptPanelEvent',
-        scriptId: String(scriptId || ''),
+        scriptId: String(entry.scriptId || ''),
+        accountId: String(entry.accountId || ''),
         widgetId: String(widgetId || ''),
         kind: kind,
         value: value,
@@ -19597,18 +19642,22 @@
     if (!msg) return;
     var scriptId = String(msg.scriptId || '');
     if (!scriptId) return;
+    var accountId = String(msg.accountId || '');
+    var key = scriptPanelKey(scriptId, accountId);
     if (msg.def == null) {
-      scriptPanels.delete(scriptId);
-      if (scriptPanelOpenId === scriptId) closeScriptPanelById(scriptId, { notifyServer: false });
+      scriptPanels.delete(key);
+      if (scriptPanelOpenId === key) closeScriptPanelById(key, { notifyServer: false });
     } else {
-      var existing = scriptPanels.get(scriptId);
+      var existing = scriptPanels.get(key);
       var entry = {
+        scriptId: scriptId,
+        accountId: accountId,
         def: msg.def,
         isOpen: !!msg.isOpen,
         version: (existing ? existing.version : 0) + 1,
       };
-      scriptPanels.set(scriptId, entry);
-      if (scriptPanelOpenId === scriptId) renderScriptPanel(scriptId);
+      scriptPanels.set(key, entry);
+      if (scriptPanelOpenId === key) renderScriptPanel(key);
     }
     refreshScriptsDetailGuiButton();
     refreshViewerScriptGuiButton();
@@ -19617,11 +19666,12 @@
   function handleScriptPanelPatches(msg) {
     if (!msg) return;
     var scriptId = String(msg.scriptId || '');
-    var entry = scriptPanels.get(scriptId);
+    var key = scriptPanelKey(scriptId, String(msg.accountId || ''));
+    var entry = scriptPanels.get(key);
     if (!entry || !Array.isArray(msg.patches)) return;
     msg.patches.forEach(function (patch) { applyPatchToDef(entry.def, patch); });
-    if (scriptPanelOpenId === scriptId) {
-      msg.patches.forEach(function (patch) { applyPatchToDom(scriptId, patch); });
+    if (scriptPanelOpenId === key) {
+      msg.patches.forEach(function (patch) { applyPatchToDom(key, patch); });
     }
   }
 
@@ -19772,8 +19822,8 @@
     return String(s).replace(/(["\\\[\]\(\)\.#:>\+~\*\^\$\|=\s])/g, '\\$1');
   }
 
-  function openScriptPanelById(scriptId) {
-    var id = String(scriptId || '').trim();
+  function openScriptPanelById(scriptId, accountId) {
+    var id = resolveScriptPanelKey(scriptId, accountId);
     if (!id) return;
     var entry = scriptPanels.get(id);
     if (!entry) return;
@@ -19786,7 +19836,10 @@
 
   function closeScriptPanelById(scriptId, opts) {
     var notify = opts && opts.notifyServer !== false;
-    var id = String(scriptId || scriptPanelOpenId || '').trim();
+    var requested = String(scriptId || scriptPanelOpenId || '');
+    var id = scriptPanels.has(requested)
+      ? requested
+      : resolveScriptPanelKey(requested, opts && opts.accountId);
     if (!id) return;
     if (scriptPanelOpenId === id) {
       scriptPanelOpenId = null;
@@ -19823,7 +19876,7 @@
       return;
     }
     var def = entry.def || {};
-    title.textContent = String(def.title || getScriptNameForId(scriptId));
+    title.textContent = String(def.title || getScriptNameForId(entry.scriptId));
     subtitle.textContent = String(def.subtitle || '');
     var width = Number(def.width);
     if (Number.isFinite(width) && width >= 280 && width <= 1200) {
@@ -20656,54 +20709,40 @@
     var btn = document.getElementById('scripts-detail-open-gui');
     if (!btn) return;
     var id = scriptsPageSelectedId || '';
-    var hasPanel = id && scriptPanels.has(String(id));
+    var panelKey = id ? resolveScriptPanelKey(String(id)) : '';
+    var hasPanel = !!panelKey;
     btn.disabled = !hasPanel;
     btn.title = hasPanel
       ? 'Open the GUI this script registered via Hive.ui.panel'
       : 'The selected script has not registered a GUI panel.';
-    btn.dataset.scriptOpenGui = String(id || '');
+    btn.dataset.scriptOpenGui = String(panelKey || '');
   }
 
   function resolveViewerScriptPanelId() {
     if (!scriptPanels || typeof scriptPanels.keys !== 'function') return '';
     if (!viewerAccountSelect || viewerAccountSelect.disabled) return '';
-    var panelIds = Array.from(scriptPanels.keys()).map(String);
-    if (!panelIds.length) return '';
-
     var accountId = String(viewerAccountSelect && viewerAccountSelect.value || '');
-    var scripts = Array.isArray(scriptsTabLastData && scriptsTabLastData.scripts)
-      ? scriptsTabLastData.scripts
-      : [];
-    if (accountId) {
-      var matching = scripts.filter(function (script) {
-        return script
-          && String(script.accountId || '') === accountId
-          && panelIds.indexOf(String(script.id || '')) !== -1;
-      }).sort(function (a, b) {
-        return Number(b.startedAt || 0) - Number(a.startedAt || 0);
-      });
-      if (matching.length) return String(matching[0].id || '');
-      var hasKnownBindings = scripts.some(function (script) {
-        return script
-          && String(script.accountId || '')
-          && panelIds.indexOf(String(script.id || '')) !== -1;
-      });
-      if (hasKnownBindings) return '';
-    }
-
-    return panelIds.length === 1 ? panelIds[0] : '';
+    var selectedScriptId = getMacScriptSelection(accountId);
+    var exact = selectedScriptId ? scriptPanelKey(selectedScriptId, accountId) : '';
+    if (exact && scriptPanels.has(exact)) return exact;
+    var matching = Array.from(scriptPanels.entries()).filter(function (pair) {
+      return pair[1] && String(pair[1].accountId || '') === accountId;
+    });
+    return matching.length === 1 ? matching[0][0] : '';
   }
 
   function refreshViewerScriptGuiButton() {
     if (!viewerOpenScriptGuiBtn) return;
-    var scriptId = resolveViewerScriptPanelId();
+    var panelKey = resolveViewerScriptPanelId();
     var scripts = Array.isArray(scriptsTabLastData && scriptsTabLastData.scripts)
       ? scriptsTabLastData.scripts
       : [];
+    var panel = scriptPanels.get(panelKey);
+    var scriptId = String(panel && panel.scriptId || '');
     var script = scripts.find(function (entry) { return String(entry && entry.id || '') === scriptId; });
-    viewerOpenScriptGuiBtn.disabled = !scriptId;
-    viewerOpenScriptGuiBtn.dataset.scriptOpenGui = scriptId;
-    if (scriptId) {
+    viewerOpenScriptGuiBtn.disabled = !panelKey;
+    viewerOpenScriptGuiBtn.dataset.scriptOpenGui = panelKey;
+    if (panelKey) {
       viewerOpenScriptGuiBtn.title = 'Open ' + String(script && (script.name || script.id) || scriptId) + ' GUI';
     } else if (!viewerAccountSelect || viewerAccountSelect.disabled) {
       viewerOpenScriptGuiBtn.title = 'Connect an account to open its script GUI.';

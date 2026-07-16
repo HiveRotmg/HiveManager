@@ -26,6 +26,15 @@ export interface ScriptInfo {
   runtimeMs?: number;
   /** Headless account this run is bound to, only present while running. */
   accountId?: string;
+  /** Every active instance of this script, separated by bound headless account. */
+  runs?: ScriptRunInfo[];
+}
+
+export interface ScriptRunInfo {
+  accountId?: string;
+  startedAt: number;
+  runtimeMs: number;
+  activity?: string;
 }
 
 export interface MarketplaceScriptInfo {
@@ -47,16 +56,25 @@ interface ScriptInstance {
   onStop(): void;
 }
 
+interface RunningScript {
+  scriptId: string;
+  instance: ScriptInstance;
+  timer: NodeJS.Timeout;
+  startedAt: number;
+  accountId?: string;
+}
+
 const SCRIPT_MANIFEST = 'hive.script.json';
 
 export class ScriptHost {
   private scriptsDir: string;
-  private running: Map<string, { instance: ScriptInstance; timer: NodeJS.Timeout; startedAt: number; accountId?: string }> = new Map();
+  private running = new Map<string, RunningScript>();
+  private readonly starting = new Set<string>();
   private logCallback?: (id: string, line: string, level: ScriptLogLevel) => void;
   private bridgeInstalled = false;
   private readonly scriptSession: { scriptId: string | undefined; accountId?: string };
-  /** Latest activity line per script id (folder name or marketplace uuid), for dashboard cards. */
-  private scriptActivityById = new Map<string, string>();
+  /** Latest activity line per account-bound run, for dashboard cards. */
+  private scriptActivityByRun = new Map<string, string>();
   /** DevServer notifies dashboard WS clients when activity or runnable state changes (optional). */
   private scriptsStateNotify?: () => void;
 
@@ -96,9 +114,10 @@ export class ScriptHost {
    * `scriptSession.scriptId` is cleared. Use the session id when set; otherwise
    * attribute to the only running script when unambiguous.
    */
-  private resolveActivityScriptId(deps: BridgeDeps): string | undefined {
-    const sid = deps.getScriptSession?.().scriptId ?? deps.scriptSession.scriptId;
-    if (sid && String(sid).trim()) return String(sid).trim();
+  private resolveActivityRunKey(deps: BridgeDeps): string | undefined {
+    const session = deps.getScriptSession?.() ?? deps.scriptSession;
+    const sid = String(session.scriptId ?? '').trim();
+    if (sid) return this.runtimeKey(sid, session.accountId);
     if (this.running.size === 1) {
       return this.running.keys().next().value as string;
     }
@@ -110,12 +129,12 @@ export class ScriptHost {
     if (this.bridgeInstalled) return;
     deps.scriptPanelConfigDir ??= join(dirname(this.scriptsDir), 'ScriptConfigs');
     deps.setScriptActivityLabel = (label) => {
-      const id = this.resolveActivityScriptId(deps);
-      if (!id) return;
+      const runKey = this.resolveActivityRunKey(deps);
+      if (!runKey) return;
       if (label == null || String(label).trim() === '') {
-        this.scriptActivityById.delete(id);
+        this.scriptActivityByRun.delete(runKey);
       } else {
-        this.scriptActivityById.set(id, String(label).trim());
+        this.scriptActivityByRun.set(runKey, String(label).trim());
       }
       this.emitScriptsStateChanged();
     };
@@ -149,6 +168,19 @@ export class ScriptHost {
     else if (level === 'warn') console.warn(msg);
     else console.log(msg);
     this.logCallback?.(id, msg, level);
+  }
+
+  private runtimeKey(scriptId: string, accountId?: string): string {
+    const account = String(accountId ?? '').trim();
+    return account ? `${scriptId}\u0000${account}` : scriptId;
+  }
+
+  private runsForScript(scriptId: string): Array<{ key: string; entry: RunningScript }> {
+    const runs: Array<{ key: string; entry: RunningScript }> = [];
+    for (const [key, entry] of this.running) {
+      if (entry.scriptId === scriptId) runs.push({ key, entry });
+    }
+    return runs;
   }
 
   private isInside(parent: string, child: string): boolean {
@@ -196,7 +228,14 @@ export class ScriptHost {
       throw new Error(`Entry is not a file: ${entry}`);
     }
 
-    const runningEntry = this.running.get(folderName);
+    const activeRuns = this.runsForScript(folderName);
+    const runs: ScriptRunInfo[] = activeRuns.map(({ key, entry: runningEntry }) => ({
+      accountId: runningEntry.accountId,
+      startedAt: runningEntry.startedAt,
+      runtimeMs: Math.max(0, Date.now() - runningEntry.startedAt),
+      activity: this.scriptActivityByRun.get(key),
+    }));
+    const primaryRun = runs[0];
 
     return {
       id: folderName,
@@ -206,11 +245,12 @@ export class ScriptHost {
       path: entryPath,
       rootPath,
       entry,
-      status: runningEntry ? 'running' : 'idle',
-      activity: this.scriptActivityById.get(folderName),
-      startedAt: runningEntry?.startedAt,
-      runtimeMs: runningEntry ? Math.max(0, Date.now() - runningEntry.startedAt) : undefined,
-      accountId: runningEntry?.accountId,
+      status: runs.length ? 'running' : 'idle',
+      activity: primaryRun?.activity,
+      startedAt: primaryRun?.startedAt,
+      runtimeMs: primaryRun?.runtimeMs,
+      accountId: runs.length === 1 ? primaryRun?.accountId : undefined,
+      runs,
     };
   }
 
@@ -280,11 +320,12 @@ export class ScriptHost {
 
   /** Loads and starts a script package by folder id. */
   async start(id: string, accountId?: string): Promise<{ ok: boolean; error?: string }> {
-    if (this.running.has(id)) {
-      return { ok: false, error: 'Already running' };
+    const runKey = this.runtimeKey(id, accountId);
+    if (this.running.has(runKey) || this.starting.has(runKey)) {
+      return { ok: false, error: 'Already running for this account' };
     }
 
-    this.scriptActivityById.delete(id);
+    this.scriptActivityByRun.delete(runKey);
     this.emitScriptsStateChanged();
 
     const script = this.getScript(id);
@@ -298,6 +339,7 @@ export class ScriptHost {
       return { ok: false, error: 'Only .mjs script entries are supported' };
     }
 
+    this.starting.add(runKey);
     try {
       const fileUrl = pathToFileURL(script.path).href;
       const mod = await import(`${fileUrl}?t=${Date.now()}`);
@@ -331,26 +373,26 @@ export class ScriptHost {
 
       const startedAt = Date.now();
       const schedule = () => {
-        if (!this.running.has(id)) return;
+        if (!this.running.has(runKey)) return;
         this.withScriptId(id, () => {
           try {
             const delay = instance.onLoop();
             if (typeof delay === 'number' && delay < 0) {
               this.log(id, 'Script requested stop (onLoop returned < 0).');
-              this.stop(id);
+              this.stop(id, accountId);
               return;
             }
             const timer = setTimeout(schedule, typeof delay === 'number' ? delay : 600);
-            this.running.set(id, { instance, timer, startedAt, accountId });
+            this.running.set(runKey, { scriptId: id, instance, timer, startedAt, accountId });
           } catch (err: any) {
             this.log(id, `Error in onLoop: ${err.message}`, 'error');
-            this.stop(id);
+            this.stop(id, accountId);
           }
         }, accountId);
       };
 
       const timer = setTimeout(schedule, 0);
-      this.running.set(id, { instance, timer, startedAt, accountId });
+      this.running.set(runKey, { scriptId: id, instance, timer, startedAt, accountId });
       this.withScriptId(id, () => this.log(id, `Running ${script.name} v${script.version} by ${script.developer}.`), accountId);
 
       this.emitScriptsStateChanged();
@@ -359,26 +401,25 @@ export class ScriptHost {
     } catch (err: any) {
       console.error('[ScriptHost] start() caught error for', id, ':\n', err?.stack || err?.message || String(err));
       return { ok: false, error: err.message };
+    } finally {
+      this.starting.delete(runKey);
     }
   }
 
-  /** Stops a running script by id */
-  stop(id: string): { ok: boolean; error?: string } {
-    const entry = this.running.get(id);
+  private stopRuntime(runKey: string): { ok: boolean; error?: string } {
+    const entry = this.running.get(runKey);
     if (!entry) {
       return { ok: false, error: 'Not running' };
     }
 
     clearTimeout(entry.timer);
-    this.running.delete(id);
-    this.scriptActivityById.delete(id);
+    this.running.delete(runKey);
+    const id = entry.scriptId;
     try {
-      SDKBridge.panelRegistry?.destroyForScript(id);
+      SDKBridge.panelRegistry?.destroyForScript(id, entry.accountId);
     } catch {
       /* registry teardown errors shouldn't block script stop */
     }
-    this.emitScriptsStateChanged();
-
     this.withScriptId(id, () => {
       try {
         entry.instance.onStop();
@@ -388,6 +429,19 @@ export class ScriptHost {
       }
     }, entry.accountId);
 
+    this.scriptActivityByRun.delete(runKey);
+    this.emitScriptsStateChanged();
+
+    return { ok: true };
+  }
+
+  /** Stops one account-bound run, or every run of the script when accountId is omitted. */
+  stop(id: string, accountId?: string): { ok: boolean; error?: string } {
+    const account = String(accountId ?? '').trim();
+    if (account) return this.stopRuntime(this.runtimeKey(id, account));
+    const runs = this.runsForScript(id);
+    if (runs.length === 0) return { ok: false, error: 'Not running' };
+    for (const run of runs) this.stopRuntime(run.key);
     return { ok: true };
   }
 
@@ -412,11 +466,12 @@ export class ScriptHost {
     userId: string,
     hwid: string,
   ): Promise<{ ok: boolean; error?: string }> {
-    if (this.running.has(scriptId)) {
+    const runKey = this.runtimeKey(scriptId);
+    if (this.running.has(runKey)) {
       return { ok: false, error: 'Already running' };
     }
 
-    this.scriptActivityById.delete(scriptId);
+    this.scriptActivityByRun.delete(runKey);
     this.emitScriptsStateChanged();
 
     let cached = this.marketplaceModuleCache.get(scriptId);
@@ -460,26 +515,26 @@ export class ScriptHost {
 
       const startedAt = Date.now();
       const schedule = () => {
-        if (!this.running.has(scriptId)) return;
+        if (!this.running.has(runKey)) return;
         this.withScriptId(scriptId, () => {
           try {
             const delay = instance.onLoop();
             if (typeof delay === 'number' && delay < 0) {
               this.log(scriptId, 'Script requested stop (onLoop returned < 0).');
-              this.stop(scriptId);
+              this.stopRuntime(runKey);
               return;
             }
             const timer = setTimeout(schedule, typeof delay === 'number' ? delay : 600);
-            this.running.set(scriptId, { instance, timer, startedAt });
+            this.running.set(runKey, { scriptId, instance, timer, startedAt });
           } catch (err: any) {
             this.log(scriptId, `Error in onLoop: ${err.message}`, 'error');
-            this.stop(scriptId);
+            this.stopRuntime(runKey);
           }
         });
       };
 
       const timer = setTimeout(schedule, 0);
-      this.running.set(scriptId, { instance, timer, startedAt });
+      this.running.set(runKey, { scriptId, instance, timer, startedAt });
       this.withScriptId(scriptId, () => this.log(scriptId, `Running marketplace script: ${cached!.name}.`));
 
       this.emitScriptsStateChanged();
@@ -497,13 +552,14 @@ export class ScriptHost {
 
   /** Stops all running scripts */
   stopAll() {
-    for (const id of this.running.keys()) {
-      this.stop(id);
-    }
+    for (const runKey of Array.from(this.running.keys())) this.stopRuntime(runKey);
   }
 
-  isRunning(id: string): boolean {
-    return this.running.has(id);
+  isRunning(id: string, accountId?: string): boolean {
+    const account = String(accountId ?? '').trim();
+    return account
+      ? this.running.has(this.runtimeKey(id, account))
+      : this.runsForScript(id).length > 0;
   }
 
   getScriptsDir(): string {
@@ -516,16 +572,19 @@ export class ScriptHost {
    * right scriptId pushed onto the bridge session.
    */
   dispatchPanelEvent(evt: ScriptPanelInboundEvent): void {
-    SDKBridge.panelRegistry?.dispatchEvent(evt, (id, fn) => this.withScriptId(id, fn));
+    SDKBridge.panelRegistry?.dispatchEvent(
+      evt,
+      (id, accountId, fn) => this.withScriptId(id, fn, accountId),
+    );
   }
 
   /** Snapshot of a script's panel (so dashboards joining late can hydrate). */
-  getPanelSnapshot(scriptId: string): { def: unknown; isOpen: boolean } | undefined {
-    return SDKBridge.panelRegistry?.snapshot(scriptId);
+  getPanelSnapshot(scriptId: string, accountId?: string): { def: unknown; isOpen: boolean } | undefined {
+    return SDKBridge.panelRegistry?.snapshot(scriptId, accountId);
   }
 
   /** All script ids with a registered panel — used to bootstrap dashboard state. */
-  panelScriptIds(): string[] {
-    return SDKBridge.panelRegistry?.scriptIds() ?? [];
+  panelInstances(): Array<{ scriptId: string; accountId?: string }> {
+    return SDKBridge.panelRegistry?.instances() ?? [];
   }
 }
