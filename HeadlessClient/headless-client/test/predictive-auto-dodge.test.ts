@@ -438,6 +438,84 @@ test('dodge collision world stops non-passing projectiles at cover', () => {
   assert.equal(world.isProjectileSegmentOpen(3.5, 5.5, 5.5, 5.5, passing), true);
 });
 
+test('predictive auto-dodge state includes a switches counter, initialised to 0', () => {
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  const state = controller.evaluate({
+    time: 0,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    moveSpeed: 0.0096,
+    intentVelocity: { x: 0, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [],
+    aoes: [],
+    environment: openEnvironment,
+  });
+  assert.equal(state.switches, 0);
+});
+
+test('predictive auto-dodge does not swap direction under tiny clearance noise', () => {
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  const projectile = hostileProjectile();
+  const first = controller.evaluate({
+    time: 300,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    moveSpeed: 0.0096,
+    intentVelocity: { x: 0, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [projectile],
+    aoes: [],
+    environment: openEnvironment,
+  });
+  assert.equal(first.overrideActive, true);
+  const firstCandidate = first.selectedCandidate;
+  const second = controller.evaluate({
+    time: 316,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    moveSpeed: 0.0096,
+    intentVelocity: { x: 0, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [projectile],
+    aoes: [],
+    environment: openEnvironment,
+  });
+  assert.equal(second.selectedCandidate, firstCandidate);
+  assert.equal(second.switches, 0);
+});
+
+test('smoothing does not delay reaction to a fresh projectile', () => {
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  const idle = controller.evaluate({
+    time: 0,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    moveSpeed: 0.0096,
+    intentVelocity: { x: 0, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [],
+    aoes: [],
+    environment: openEnvironment,
+  });
+  assert.equal(idle.overrideActive, false);
+  const react = controller.evaluate({
+    time: 16,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    moveSpeed: 0.0096,
+    intentVelocity: { x: 0, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [{ ...hostileProjectile(), startTime: 16 }],
+    aoes: [],
+    environment: openEnvironment,
+  });
+  assert.equal(react.overrideActive, true);
+});
+
 function hostileProjectile(): CombatProjectileSnapshot {
   return {
     side: 'enemy',

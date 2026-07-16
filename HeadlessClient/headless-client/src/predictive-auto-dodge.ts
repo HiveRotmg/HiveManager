@@ -57,6 +57,7 @@ export interface AutoDodgeState {
   selectedCandidate: number;
   speedScale: number;
   decision: string;
+  switches: number;
 }
 
 const DIRECTION_COUNT = 32;
@@ -71,8 +72,10 @@ const EMERGENCY_INTENT_BAND = 0.14;
 const UNAVOIDABLE_IMPACT_BAND_MS = 60;
 const UNAVOIDABLE_CLEARANCE_BAND = 0.05;
 const EMERGENCY_OVERRIDE_MS = 100;
-const HYSTERESIS_MS = 100;
+const HYSTERESIS_MS = 180;
 const HYSTERESIS_SCORE_GAIN = 0.25;
+const SMOOTHING_ALPHA = 0.35;
+const COMMIT_BONUS = 0.05;
 const CORRIDOR_NEIGHBORS = 3;
 const LOCAL_PLAN_STEP_MS = 60;
 const LOCAL_PLAN_BEAM_WIDTH = 40;
@@ -125,6 +128,11 @@ export class PredictiveAutoDodgeController {
   private readonly candidateBlockMs = new Int32Array(CANDIDATE_COUNT);
   private readonly candidateEnemyClearance = new Float64Array(CANDIDATE_COUNT);
   private readonly candidateValid = new Uint8Array(CANDIDATE_COUNT);
+  private readonly smoothedScore = new Float64Array(CANDIDATE_COUNT);
+  private readonly previousBulletKeys = new Set<string>();
+  private previousAoeCount = 0;
+  private previousOverrideActive = false;
+  private totalSwitches = 0;
   private readonly relevantProjectiles: CombatProjectileSnapshot[] = [];
   private readonly projectilePosition = { x: 0, y: 0 };
   private readonly previousProjectilePosition = { x: 0, y: 0 };
@@ -137,6 +145,9 @@ export class PredictiveAutoDodgeController {
       const angle = index * Math.PI * 2 / DIRECTION_COUNT;
       this.candidateX[index + 1] = Math.cos(angle);
       this.candidateY[index + 1] = Math.sin(angle);
+    }
+    for (let index = 0; index < CANDIDATE_COUNT; index++) {
+      this.smoothedScore[index] = Infinity;
     }
   }
 
@@ -155,6 +166,7 @@ export class PredictiveAutoDodgeController {
     this.selectedCandidate = 0;
     this.selectedUntil = 0;
     this.relevantProjectiles.length = 0;
+    this.totalSwitches = 0;
     this.state = emptyState(this.enabled);
   }
 
@@ -176,6 +188,7 @@ export class PredictiveAutoDodgeController {
 
     snapshot = this.withGoalIntent(snapshot);
     this.resetFrame();
+    const threatSetChanged = this.detectThreatSetChange(snapshot);
     const intentLength = Math.hypot(snapshot.intentVelocity.x, snapshot.intentVelocity.y);
     this.candidateX[INTENT_CANDIDATE] = intentLength > 0.000001
       ? snapshot.intentVelocity.x / intentLength : 0;
@@ -379,9 +392,19 @@ export class PredictiveAutoDodgeController {
       this.candidateValid[INTENT_CANDIDATE] = this.candidateValid[0];
     }
 
+    this.updateSmoothedScores(threatSetChanged);
+    const scoreFor = (candidate: number): number => {
+      const base = this.smoothedScore[candidate];
+      return candidate === this.selectedCandidate
+        && this.candidateValid[candidate]
+        && this.candidateScore[candidate] >= INTENT_SAFE_CLEARANCE
+        ? base + COMMIT_BONUS
+        : base;
+    };
+
     let proposedCandidate = 0;
     if (threatCount > 0) {
-      let bestScore = this.candidateScore[0];
+      let bestScore = scoreFor(0);
       let bestImpact = this.candidateImpactMs[0];
       let bestCorridor = this.corridorSafety(0);
       let bestEnemyClearance = this.candidateEnemyClearance[0];
@@ -392,7 +415,7 @@ export class PredictiveAutoDodgeController {
         if (!this.candidateValid[candidate]) continue;
         const impact = this.candidateImpactMs[candidate];
         const corridor = this.corridorSafety(candidate);
-        const score = this.candidateScore[candidate];
+        const score = scoreFor(candidate);
         const enemyClearance = this.candidateEnemyClearance[candidate];
         const intentDot = this.candidateX[candidate] * intentX
           + this.candidateY[candidate] * intentY;
@@ -403,7 +426,7 @@ export class PredictiveAutoDodgeController {
             && enemyClearance > bestEnemyClearance
           || impact === bestImpact && corridor === bestCorridor && score === bestScore
             && enemyClearance === bestEnemyClearance && intentDot > bestIntentDot) {
-          bestScore = this.candidateScore[candidate];
+          bestScore = scoreFor(candidate);
           bestImpact = this.candidateImpactMs[candidate];
           bestCorridor = corridor;
           bestEnemyClearance = enemyClearance;
@@ -550,6 +573,9 @@ export class PredictiveAutoDodgeController {
         < this.candidateScore[this.selectedCandidate] + HYSTERESIS_SCORE_GAIN) {
       choice = this.selectedCandidate;
     } else {
+      if (this.previousOverrideActive && choice !== this.selectedCandidate) {
+        this.totalSwitches++;
+      }
       this.selectedCandidate = choice;
       this.selectedUntil = snapshot.time + HYSTERESIS_MS;
     }
@@ -1090,6 +1116,21 @@ export class PredictiveAutoDodgeController {
     }
   }
 
+  private detectThreatSetChange(snapshot: AutoDodgeSnapshot): boolean {
+    let sizeMatch = true;
+    let seen = 0;
+    for (const projectile of snapshot.projectiles) {
+      if (projectile.side !== 'enemy') continue;
+      const key = `${projectile.ownerId}:${projectile.bulletId}`;
+      if (!this.previousBulletKeys.has(key)) sizeMatch = false;
+      seen++;
+    }
+    if (seen !== this.previousBulletKeys.size) sizeMatch = false;
+    const aoeCount = snapshot.aoes.length;
+    const overrideEdge = this.previousOverrideActive !== this.state.overrideActive;
+    return !sizeMatch || aoeCount !== this.previousAoeCount || overrideEdge;
+  }
+
   /** Favors broad safe lanes over isolated directions that are safe by only a few degrees. */
   private corridorSafety(candidate: number): number {
     const cappedImpact = (index: number): number => this.candidateValid[index]
@@ -1104,6 +1145,22 @@ export class PredictiveAutoDodgeController {
       score += cappedImpact(((direction - gap + DIRECTION_COUNT) % DIRECTION_COUNT) + 1);
     }
     return score;
+  }
+
+  private updateSmoothedScores(threatSetChanged: boolean): void {
+    for (let index = 0; index < CANDIDATE_COUNT; index++) {
+      const raw = this.candidateScore[index];
+      if (threatSetChanged || !Number.isFinite(this.smoothedScore[index])) {
+        this.smoothedScore[index] = raw;
+        continue;
+      }
+      if (!Number.isFinite(raw)) {
+        this.smoothedScore[index] = raw;
+        continue;
+      }
+      const previous = this.smoothedScore[index];
+      this.smoothedScore[index] = previous + SMOOTHING_ALPHA * (raw - previous);
+    }
   }
 
   private finish(
@@ -1146,7 +1203,16 @@ export class PredictiveAutoDodgeController {
       selectedCandidate,
       speedScale,
       decision,
+      switches: this.totalSwitches,
     };
+    this.previousBulletKeys.clear();
+    for (const projectile of snapshot.projectiles) {
+      if (projectile.side === 'enemy') {
+        this.previousBulletKeys.add(`${projectile.ownerId}:${projectile.bulletId}`);
+      }
+    }
+    this.previousAoeCount = snapshot.aoes.length;
+    this.previousOverrideActive = overrideActive;
     return this.state;
   }
 }
@@ -1228,6 +1294,7 @@ function emptyState(enabled: boolean, velocity = { x: 0, y: 0 }): AutoDodgeState
     selectedCandidate: 0,
     speedScale: 1,
     decision: 'none',
+    switches: 0,
   };
 }
 
