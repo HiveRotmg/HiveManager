@@ -84,6 +84,8 @@ const LOCAL_PLAN_CELL_SIZE = 0.25;
 const GOAL_PROGRESS_TOLERANCE = 0.25;
 const GOAL_PATH_POINT_EPSILON = 0.02;
 const MAX_TIME = 0x7fffffff;
+const MIN_SAMPLE_MS = 8;
+const CURVED_TRAJECTORY_MAX_SAMPLE_MS = 15;
 
 interface GoalDodgePlan {
   candidate: number;
@@ -110,6 +112,7 @@ interface LocalPlanNode {
 
 interface LocalProjectileTrack {
   points: Array<{ x: number; y: number }>;
+  stepMs: number;
 }
 
 interface LocalEdgeSafety {
@@ -201,7 +204,8 @@ export class PredictiveAutoDodgeController {
       let envelopeRelevant = false;
       let directRelevant = false;
       let previousSet = false;
-      for (let offset = 0; offset <= HORIZON_MS; offset += SAMPLE_MS) {
+      const projectileStep = this.getSampleStepMs(projectile);
+      for (let offset = 0; offset <= HORIZON_MS; offset += projectileStep) {
         const sampleTime = snapshot.time + offset;
         if (!isProjectileAliveAt(projectile, sampleTime)) break;
         predictProjectilePosition(projectile, sampleTime, this.projectilePosition);
@@ -230,7 +234,7 @@ export class PredictiveAutoDodgeController {
           ) <= reachable) {
             envelopeRelevant = true;
           }
-          const previousMovementOffset = snapshot.movementLeadMs + offset - SAMPLE_MS;
+          const previousMovementOffset = snapshot.movementLeadMs + offset - projectileStep;
           const previousIntentX = snapshot.position.x
             + this.candidateX[INTENT_CANDIDATE] * snapshot.moveSpeed * previousMovementOffset;
           const previousIntentY = snapshot.position.y
@@ -295,7 +299,8 @@ export class PredictiveAutoDodgeController {
       let standingClearance = Infinity;
       let intentClearance = Infinity;
       let previousSet = false;
-      for (let offset = 0; offset <= HORIZON_MS; offset += SAMPLE_MS) {
+      const projectileStep = this.getSampleStepMs(projectile);
+      for (let offset = 0; offset <= HORIZON_MS; offset += projectileStep) {
         const sampleTime = snapshot.time + offset;
         if (!isProjectileAliveAt(projectile, sampleTime)) break;
         predictProjectilePosition(projectile, sampleTime, this.projectilePosition);
@@ -320,7 +325,7 @@ export class PredictiveAutoDodgeController {
             clearance = chebyshev(this.projectilePosition.x - playerX,
               this.projectilePosition.y - playerY) - HIT_HALF_SIZE;
           } else {
-            const previousMovementOffset = snapshot.movementLeadMs + offset - SAMPLE_MS;
+            const previousMovementOffset = snapshot.movementLeadMs + offset - projectileStep;
             const previousPlayerX = snapshot.position.x
               + this.candidateX[candidate] * snapshot.moveSpeed * previousMovementOffset;
             const previousPlayerY = snapshot.position.y
@@ -331,7 +336,7 @@ export class PredictiveAutoDodgeController {
               this.projectilePosition.x - playerX,
               this.projectilePosition.y - playerY,
             ) - HIT_HALF_SIZE;
-            impactOffset = offset - SAMPLE_MS;
+            impactOffset = offset - projectileStep;
           }
           if (clearance < this.candidateScore[candidate]) this.candidateScore[candidate] = clearance;
           if (clearance <= 0 && impactOffset < this.candidateImpactMs[candidate]) {
@@ -810,7 +815,8 @@ export class PredictiveAutoDodgeController {
     for (const projectile of this.relevantProjectiles) {
       const points: Array<{ x: number; y: number }> = [];
       let previous: { x: number; y: number } | undefined;
-      for (let offset = 0; offset <= HORIZON_MS; offset += SAMPLE_MS) {
+      const projectileStep = this.getSampleStepMs(projectile);
+      for (let offset = 0; offset <= HORIZON_MS; offset += projectileStep) {
         const sampleTime = snapshot.time + offset;
         if (!isProjectileAliveAt(projectile, sampleTime)) break;
         predictProjectilePosition(projectile, sampleTime, this.projectilePosition);
@@ -825,7 +831,7 @@ export class PredictiveAutoDodgeController {
         points.push(point);
         previous = point;
       }
-      if (points.length > 0) tracks.push({ points });
+      if (points.length > 0) tracks.push({ points, stepMs: projectileStep });
     }
     return tracks;
   }
@@ -856,9 +862,10 @@ export class PredictiveAutoDodgeController {
       minEnemyClearance = Math.min(minEnemyClearance, enemyClearance);
     }
 
-    const startIndex = Math.trunc(startTimeMs / SAMPLE_MS);
-    const endIndex = Math.trunc(endTimeMs / SAMPLE_MS);
     for (const track of projectileTracks) {
+      const trackStep = track.stepMs;
+      const startIndex = Math.trunc(startTimeMs / trackStep);
+      const endIndex = Math.trunc(endTimeMs / trackStep);
       if (startIndex >= track.points.length) continue;
       let previousProjectile = track.points[startIndex]!;
       let previousPlayer = { x: from.x, y: from.y };
@@ -871,7 +878,7 @@ export class PredictiveAutoDodgeController {
 
       for (let index = startIndex + 1; index <= endIndex && index < track.points.length; index++) {
         const projectile = track.points[index]!;
-        const ratio = (index * SAMPLE_MS - startTimeMs) / (endTimeMs - startTimeMs);
+        const ratio = (index * trackStep - startTimeMs) / (endTimeMs - startTimeMs);
         const player = {
           x: from.x + (to.x - from.x) * ratio,
           y: from.y + (to.y - from.y) * ratio,
@@ -1062,7 +1069,8 @@ export class PredictiveAutoDodgeController {
     }
     for (const projectile of this.relevantProjectiles) {
       let previousSet = false;
-      for (let offset = 0; offset <= HORIZON_MS; offset += SAMPLE_MS) {
+      const projectileStep = this.getSampleStepMs(projectile);
+      for (let offset = 0; offset <= HORIZON_MS; offset += projectileStep) {
         const sampleTime = snapshot.time + offset;
         if (!isProjectileAliveAt(projectile, sampleTime)) break;
         predictProjectilePosition(projectile, sampleTime, this.projectilePosition);
@@ -1078,7 +1086,7 @@ export class PredictiveAutoDodgeController {
         const playerY = snapshot.position.y + velocityY * movementOffset;
         let clearance: number;
         if (previousSet) {
-          const previousMovementOffset = snapshot.movementLeadMs + offset - SAMPLE_MS;
+          const previousMovementOffset = snapshot.movementLeadMs + offset - projectileStep;
           clearance = minimumChebyshevOnSegment(
             this.previousProjectilePosition.x
               - (snapshot.position.x + velocityX * previousMovementOffset),
@@ -1114,6 +1122,20 @@ export class PredictiveAutoDodgeController {
       this.candidateEnemyClearance[index] = Infinity;
       this.candidateValid[index] = 1;
     }
+  }
+
+  private getSampleStepMs(projectile: CombatProjectileSnapshot): number {
+    const definition = projectile.definition;
+    const speedFactor = Math.max(0.5, Math.min(1, 80 / Math.max(1, definition.speed)));
+    let step = Math.max(MIN_SAMPLE_MS, Math.min(SAMPLE_MS, Math.round(SAMPLE_MS * speedFactor)));
+    if (definition.wavy
+      || definition.parametric
+      || definition.boomerang
+      || definition.amplitude !== 0
+      || definition.acceleration !== 0) {
+      step = Math.min(step, CURVED_TRAJECTORY_MAX_SAMPLE_MS);
+    }
+    return step;
   }
 
   private detectThreatSetChange(snapshot: AutoDodgeSnapshot): boolean {

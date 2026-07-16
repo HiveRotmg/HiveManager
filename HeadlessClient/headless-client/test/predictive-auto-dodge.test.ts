@@ -516,6 +516,105 @@ test('smoothing does not delay reaction to a fresh projectile', () => {
   assert.equal(react.overrideActive, true);
 });
 
+test('fast projectile at speed 400 is flagged as a threat', () => {
+  const fastDef: CombatProjectileDefinition = {
+    ...definition,
+    speed: 400,
+    lifetimeMs: 500,
+  };
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  const projectile: CombatProjectileSnapshot = {
+    side: 'enemy',
+    bulletId: 11,
+    bulletType: 0,
+    ownerId: 20,
+    containerType: 100,
+    startX: 0.5,
+    startY: 5,
+    angle: 0,
+    startTime: 0,
+    definition: fastDef,
+    damage: 100,
+    hitObjects: new Set(),
+  };
+  const state = controller.evaluate({
+    time: 0,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    moveSpeed: 0.0096,
+    intentVelocity: { x: 0, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [projectile],
+    aoes: [],
+    environment: openEnvironment,
+  });
+  assert.equal(state.overrideActive, true);
+  assert.ok(state.threatCount > 0,
+    `expected fast projectile to raise threatCount, got ${state.threatCount}`);
+});
+
+test('wavy projectile with amplitude is flagged even when its mean path misses', () => {
+  const wavyDef: CombatProjectileDefinition = {
+    ...definition,
+    speed: 120,
+    amplitude: 1.5,
+    frequency: 3,
+    wavy: true,
+    lifetimeMs: 1500,
+  };
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  const projectile: CombatProjectileSnapshot = {
+    side: 'enemy',
+    bulletId: 12,
+    bulletType: 0,
+    ownerId: 20,
+    containerType: 100,
+    startX: 0,
+    startY: 5.5,
+    angle: 0,
+    startTime: 0,
+    definition: wavyDef,
+    damage: 100,
+    hitObjects: new Set(),
+  };
+  const state = controller.evaluate({
+    time: 0,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    moveSpeed: 0.0096,
+    intentVelocity: { x: 0, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [projectile],
+    aoes: [],
+    environment: openEnvironment,
+  });
+  assert.ok(state.threatCount > 0,
+    `expected wavy projectile to raise threatCount, got ${state.threatCount}`);
+});
+
+test('slow projectile still overrides correctly', () => {
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  const slow: CombatProjectileSnapshot = {
+    ...hostileProjectile(),
+    definition: { ...definition, speed: 60 },
+  };
+  const state = controller.evaluate({
+    time: 300,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    moveSpeed: 0.0096,
+    intentVelocity: { x: 0, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [slow],
+    aoes: [],
+    environment: openEnvironment,
+  });
+  assert.equal(state.overrideActive, true);
+});
+
 function hostileProjectile(): CombatProjectileSnapshot {
   return {
     side: 'enemy',
