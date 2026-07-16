@@ -62,6 +62,7 @@ export interface HeadlessChatMessage {
 
 export interface HeadlessFleetEvents {
   changed: [sessions: HeadlessSessionSummary[]];
+  maintenance: [accountId: string, serverName: string];
   viewerTick: [accountId: string];
   damage: [accountId: string, snapshot: HeadlessDamageSnapshot];
   chat: [accountId: string, message: HeadlessChatMessage];
@@ -82,6 +83,7 @@ export class HeadlessFleet extends EventEmitter {
   private readonly pending = new Map<string, Promise<Client>>();
   private changedTimer: NodeJS.Timeout | undefined;
   private chatSequence = 0;
+  private maintenanceActive = false;
 
   constructor(private readonly gameData: GameDataLoader) {
     super();
@@ -139,6 +141,10 @@ export class HeadlessFleet extends EventEmitter {
     const inFlight = this.pending.get(accountId);
     if (inFlight) return inFlight;
 
+    if (this.entries.size === 0 && this.pending.size === 0) {
+      this.maintenanceActive = false;
+    }
+
     const task = this.createClient(account).finally(() => this.pending.delete(accountId));
     this.pending.set(accountId, task);
     return task;
@@ -155,7 +161,14 @@ export class HeadlessFleet extends EventEmitter {
   }
 
   disconnectAll(reason = 'manager shutdown'): void {
-    for (const accountId of Array.from(this.entries.keys())) this.disconnect(accountId, reason);
+    const entries = Array.from(this.entries.values());
+    if (entries.length === 0) return;
+    this.entries.clear();
+    for (const entry of entries) {
+      entry.stopping = true;
+      entry.client.stop(reason);
+    }
+    this.emitChanged();
   }
 
   visibleObjects(accountId?: string | null): TrackedObject[] {
@@ -234,9 +247,20 @@ export class HeadlessFleet extends EventEmitter {
     client.on(ClientEvent.Disconnect, () => {
       if (!entry.stopping) changed();
     });
+    client.on(ClientEvent.Failure, (packet) => {
+      if (packet.errorId === 16) this.handleServerMaintenance(account.id, entry.serverName);
+    });
     client.connect();
     this.emitChanged();
     return client;
+  }
+
+  private handleServerMaintenance(accountId: string, serverName: string): void {
+    if (!this.maintenanceActive) {
+      this.maintenanceActive = true;
+      this.emit('maintenance', accountId, serverName);
+    }
+    this.disconnectAll('server maintenance');
   }
 
   private classifyChat(packet: TextPacket, client: Client): HeadlessChatChannel {

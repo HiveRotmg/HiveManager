@@ -4033,7 +4033,7 @@ export class Client extends EventEmitter {
    * drive the normal backoff reconnect for transient ones.
    */
   private handleFailure(p: FailurePacket): void {
-    const failureClass = classifyFailure(p.errorDescription);
+    const failureClass = classifyFailure(p.errorDescription, p.errorId);
     if (this.dodgeJumpLimiter.noteDisconnect(this.time())) {
       console.warn(`${this.tag} reducing dodge-jump allowance after a failure near an unconfirmed jump`);
     }
@@ -4124,7 +4124,10 @@ export type FailureClass = 'rate-limited' | 'auth' | 'fatal' | 'transient';
  * "back off for minutes" from "re-authenticate" from "give up" from "just
  * reconnect". Pure and exported for testing.
  */
-export function classifyFailure(description: string): FailureClass {
+export function classifyFailure(description: string, errorId?: number): FailureClass {
+  // Error 16 is emitted with an empty description during scheduled server
+  // maintenance. Treat it as fatal so clients do not enter a reconnect loop.
+  if (errorId === 16) return 'fatal';
   const text = (description ?? '').toLowerCase();
   if (/banned|abuse|too many|rate limit|try again later/.test(text)) {
     return 'rate-limited';

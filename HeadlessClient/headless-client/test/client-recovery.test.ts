@@ -12,6 +12,7 @@ test('classifyFailure distinguishes rate-limit, auth, fatal, and transient failu
   assert.equal(classifyFailure('Your client is out of date, please upgrade'), 'fatal');
   assert.equal(classifyFailure('Unexpected server error'), 'transient');
   assert.equal(classifyFailure(''), 'transient');
+  assert.equal(classifyFailure('', 16), 'fatal');
 });
 
 test('backoffDelay stays within [base, min(base*2^attempt, max)] and respects the ceiling', () => {

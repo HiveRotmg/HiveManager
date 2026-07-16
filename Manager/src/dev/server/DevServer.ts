@@ -1427,6 +1427,9 @@ export class DevServer {
       this.broadcastHeadlessSessions(sessions);
       this.syncViewerOtherProjectileTracking();
     });
+    this.headlessFleet?.on('maintenance', (accountId, serverName) => {
+      this.broadcastServerMaintenance(accountId, serverName);
+    });
     this.headlessFleet?.on('damage', (accountId, snapshot) => this.broadcastHeadlessDamage(accountId, snapshot));
     this.headlessFleet?.on('chat', (accountId, message) => this.broadcastHeadlessChat(accountId, message));
     this.headlessFleet?.on('packet', (accountId, traffic) => this.captureHeadlessPacket(accountId, traffic));
@@ -2840,6 +2843,13 @@ export class DevServer {
       if (ws.readyState === WebSocket.OPEN) ws.send(msg);
     }
     this.broadcastClientList();
+  }
+
+  private broadcastServerMaintenance(accountId: string, serverName: string): void {
+    const msg = JSON.stringify({ type: 'serverMaintenance', accountId, serverName });
+    for (const ws of this.wss.clients) {
+      if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+    }
   }
 
   private broadcastHeadlessDamage(accountId: string, snapshot = this.headlessFleet?.damage(accountId)): void {

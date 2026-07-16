@@ -6874,6 +6874,10 @@
             addHomeFeed('err', msg.message || 'Unable to disconnect client.');
           }
           break;
+        case 'serverMaintenance':
+          addHomeFeed('err', 'Server is under maintenance. All connected clients were disconnected.');
+          window.alert('Server is under maintenance. All connected clients were disconnected.');
+          break;
         case 'headlessSessions':
           var previousDamageAccountId = damageAccountSelect ? String(damageAccountSelect.value || '') : '';
           var previousViewerAccountId = viewerAccountSelect ? String(viewerAccountSelect.value || '') : '';
