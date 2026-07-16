@@ -9,6 +9,11 @@ import {
   ENEMY_SOFT_AVOID_RADIUS,
   type LocalDodgeCollisionSnapshot,
 } from './dodge-collision-world';
+import {
+  normalizeDodgeMovementIntent,
+  type CombatRangeDodgeIntent,
+  type DodgeMovementIntent,
+} from './dodge-movement-intent';
 
 export interface DodgePlanningEnvironment {
   canOccupy(x: number, y: number, safeWalk: boolean, avoidEnemies?: boolean): boolean;
@@ -84,6 +89,13 @@ export interface DodgePlanningInput {
   playerId: number;
   position: { x: number; y: number };
   goal?: { x: number; y: number; threshold?: number };
+  /** Stable script/global preference. `goal` remains a legacy local-route fallback. */
+  intent?: DodgeMovementIntent | null;
+  routeWaypoint?: { x: number; y: number; threshold?: number };
+  preferredDirection?: { x: number; y: number };
+  combatTargetPositionAt?: (timeOffsetMs: number) => { x: number; y: number };
+  /** Scales only the combat too-far preference; hard ranges are never scaled. */
+  retreatPenaltyScale?: number;
   /** Maximum speed in tiles per millisecond. */
   moveSpeed: number;
   /** Current global-navigation command in tiles per millisecond. */
@@ -169,7 +181,11 @@ export interface DodgeCostWeights {
   speedChange: number;
   pathIntentDeviationPerSecond: number;
   unnecessaryWaitPerSecond: number;
+  combatTooClosePerSecond: number;
+  combatTooFarPerSecond: number;
   terminalGoalDistance: number;
+  terminalCombatTooClose: number;
+  terminalCombatTooFar: number;
   terminalHeadingMismatch: number;
   terminalFutureExposure: number;
   terminalEnemyProximity: number;
@@ -197,8 +213,15 @@ export const DODGE_COST_WEIGHTS: Readonly<DodgeCostWeights> = Object.freeze({
   pathIntentDeviationPerSecond: 0.8,
   // Per-second cost for waiting while a movement goal remains outstanding.
   unnecessaryWaitPerSecond: 1.2,
+  // Strong per-second pressure away from the selected target's hard range.
+  combatTooClosePerSecond: 10,
+  // Softer per-second pressure back toward weapon range; scaled down during danger.
+  combatTooFarPerSecond: 2.5,
   // Terminal cost per tile remaining to the local global-path waypoint.
   terminalGoalDistance: 4,
+  // Terminal range errors around the selected combat target.
+  terminalCombatTooClose: 6,
+  terminalCombatTooFar: 2,
   // Terminal heading mismatch relative to the local waypoint.
   terminalHeadingMismatch: 0.35,
   // Terminal penalty for ending with close predicted projectile exposure.
@@ -292,6 +315,11 @@ interface PlanCounters {
 
 interface PlannerContext {
   input: DodgePlanningInput;
+  intent: DodgeMovementIntent | null;
+  routeWaypoint: { x: number; y: number; threshold: number } | undefined;
+  combatTargetPositions: TimedCombatTargetPosition[];
+  combatTargetScratch: { x: number; y: number };
+  retreatPenaltyScale: number;
   horizonMs: number;
   collision: CollisionQuery;
   projectileSegments: ProjectileSegment[];
@@ -300,6 +328,12 @@ interface PlannerContext {
   counters: PlanCounters;
   startEnemyDistance: number;
   stateCap: number;
+}
+
+interface TimedCombatTargetPosition {
+  timeOffsetMs: number;
+  x: number;
+  y: number;
 }
 
 const FIXED_CONTROLS = createFixedControls();
@@ -447,7 +481,7 @@ export class SpaceTimeDodgePlanner {
     const counters = emptyCounters();
     const context = this.createContext(input, JUMP_LANDING_HOLD_MS, counters);
     const startEnemy = context.collision.enemyDistance(input.position.x, input.position.y);
-    const goal = validGoal(input.goal) ? input.goal : undefined;
+    const goal = context.intent?.mode !== 'combat_range' ? goalScoringPoint(context) : undefined;
     const startGoalDistance = goal ? distance(input.position, goal) : 0;
     let best: EmergencyJumpPlan | undefined;
 
@@ -476,6 +510,15 @@ export class SpaceTimeDodgePlanner {
         const enemyDistance = context.collision.enemyDistance(target.x, target.y);
         const score = landingSafety.softCost
           - goalProgress * 2
+          + (context.intent?.mode === 'combat_range'
+            ? combatRangePenalty(
+                context,
+                target,
+                JUMP_LANDING_HOLD_MS,
+                this.weights.terminalCombatTooClose,
+                this.weights.terminalCombatTooFar * context.retreatPenaltyScale,
+              )
+            : 0)
           - Math.min(enemyDistance, ENEMY_SOFT_AVOID_RADIUS) * 0.05
           - jumpDistance * 0.02;
         if (!best || score < best.score - 1e-9) {
@@ -521,6 +564,20 @@ export class SpaceTimeDodgePlanner {
     counters: PlanCounters,
     stateCap = this.config.maxStatesPerLayer,
   ): PlannerContext {
+    const intent = plannerIntent(input);
+    const routeWaypoint = validGoal(input.routeWaypoint)
+      ? {
+          x: input.routeWaypoint.x,
+          y: input.routeWaypoint.y,
+          threshold: Math.max(0, input.routeWaypoint.threshold ?? 0),
+        }
+      : validGoal(input.goal)
+        ? {
+            x: input.goal.x,
+            y: input.goal.y,
+            threshold: Math.max(0, input.goal.threshold ?? 0),
+          }
+        : undefined;
     const reachRadius = Math.max(1, input.moveSpeed * horizonMs + 1.5);
     const collision = createCollisionQuery(
       input.environment,
@@ -535,8 +592,19 @@ export class SpaceTimeDodgePlanner {
       input.position,
       reachRadius + PROJECTILE_NEAR_BAND + 1,
     );
+    const combatTargetPositions = sampleCombatTargetPositions(
+      input,
+      intent,
+      this.config.timeLayersMs,
+      horizonMs,
+    );
     return {
       input,
+      intent,
+      routeWaypoint,
+      combatTargetPositions,
+      combatTargetScratch: { x: 0, y: 0 },
+      retreatPenaltyScale: clamp(input.retreatPenaltyScale ?? 1, 0, 1),
       horizonMs,
       collision,
       projectileSegments,
@@ -563,7 +631,7 @@ export class SpaceTimeDodgePlanner {
       const startMs = this.config.timeLayersMs[layer - 1]!;
       const endMs = this.config.timeLayersMs[layer]!;
       const durationMs = endMs - startMs;
-      const velocity = directVelocity(input, current, durationMs);
+      const velocity = directVelocity(context, current, startMs, durationMs);
       const next = {
         x: current.x + velocity.x * durationMs,
         y: current.y + velocity.y * durationMs,
@@ -578,6 +646,7 @@ export class SpaceTimeDodgePlanner {
         previousVelocity,
         durationMs,
         safety,
+        endMs,
       );
       cumulativeCost += transitionCost;
       riskCost += safety.softCost;
@@ -705,6 +774,7 @@ export class SpaceTimeDodgePlanner {
             { x: state.velocityX, y: state.velocityY },
             durationMs,
             safety,
+            endMs,
           );
           const cumulativeCost = state.cumulativeCost + transitionCost;
           const candidate: CandidateState = {
@@ -879,8 +949,15 @@ export class SpaceTimeDodgePlanner {
     }
 
     const startEnemyDistance = context.collision.enemyDistance(from.x, from.y);
+    const combatIntent = context.intent?.mode === 'combat_range' ? context.intent : undefined;
+    const combatTarget = context.combatTargetScratch;
+    if (combatIntent) writeCombatTargetAt(context, startMs, combatTarget);
+    const combatStartDistance = combatIntent
+      ? Math.hypot(from.x - combatTarget.x, from.y - combatTarget.y)
+      : Infinity;
+    let priorCombatDistance = combatStartDistance;
     let priorEnemyDistance = startEnemyDistance;
-    let minimumEnemyDistance = startEnemyDistance;
+    let minimumEnemyDistance = Math.min(startEnemyDistance, combatStartDistance);
     let enemyExposure = 0;
     let damagingExposure = 0;
     const spatialSteps = Math.ceil(travel / Math.max(0.05, context.collision.resolution));
@@ -907,6 +984,22 @@ export class SpaceTimeDodgePlanner {
       }
       priorEnemyDistance = enemyDistance;
       minimumEnemyDistance = Math.min(minimumEnemyDistance, enemyDistance);
+      if (combatIntent) {
+        writeCombatTargetAt(context, startMs + durationMs * ratio, combatTarget);
+        const targetDistance = Math.hypot(x - combatTarget.x, y - combatTarget.y);
+        const hardMinimum = Math.max(ENEMY_AVOID_RADIUS, combatIntent.hardMinimumRange);
+        if (combatStartDistance >= hardMinimum - DISTANCE_EPSILON) {
+          if (targetDistance < hardMinimum - DISTANCE_EPSILON) {
+            context.counters.candidatesRejectedByGeometry++;
+            return undefined;
+          }
+        } else if (targetDistance + 1e-6 < priorCombatDistance) {
+          context.counters.candidatesRejectedByGeometry++;
+          return undefined;
+        }
+        priorCombatDistance = targetDistance;
+        minimumEnemyDistance = Math.min(minimumEnemyDistance, targetDistance);
+      }
       if (enemyDistance < ENEMY_SOFT_AVOID_RADIUS) {
         const normalized = clamp(
           (ENEMY_SOFT_AVOID_RADIUS - enemyDistance)
@@ -1016,6 +1109,7 @@ export class SpaceTimeDodgePlanner {
     previousVelocity: { x: number; y: number },
     durationMs: number,
     safety: EdgeSafety,
+    endMs: number,
   ): number {
     const durationSeconds = durationMs / 1000;
     const speed = Math.hypot(velocity.x, velocity.y);
@@ -1037,7 +1131,8 @@ export class SpaceTimeDodgePlanner {
         * Math.abs(speed - previousSpeed) / context.input.moveSpeed;
     }
 
-    const desired = desiredDirection(context.input, from);
+    cost += this.calculateIntentTransitionCost(context, from, velocity, durationMs, endMs);
+    const desired = desiredDirectionAt(context, from, endMs - durationMs);
     if (speed <= 1e-9
       && (desired || context.projectileSegments.length > 0 || context.input.aoes.length > 0)) {
       cost += this.weights.unnecessaryWaitPerSecond * durationSeconds;
@@ -1056,10 +1151,42 @@ export class SpaceTimeDodgePlanner {
     return cost;
   }
 
+  private calculateIntentTransitionCost(
+    context: PlannerContext,
+    from: { x: number; y: number },
+    velocity: { x: number; y: number },
+    durationMs: number,
+    endMs: number,
+  ): number {
+    if (context.intent?.mode !== 'combat_range') return 0;
+    const endpoint = {
+      x: from.x + velocity.x * durationMs,
+      y: from.y + velocity.y * durationMs,
+    };
+    const durationSeconds = durationMs / 1000;
+    return combatRangePenalty(
+      context,
+      endpoint,
+      endMs,
+      this.weights.combatTooClosePerSecond * durationSeconds,
+      this.weights.combatTooFarPerSecond * durationSeconds * context.retreatPenaltyScale,
+    );
+  }
+
   private partialProgressRank(context: PlannerContext, x: number, y: number): number {
-    const goal = validGoal(context.input.goal) ? context.input.goal : undefined;
+    const position = { x, y };
+    if (context.intent?.mode === 'combat_range') {
+      return combatRangePenalty(
+        context,
+        position,
+        context.horizonMs,
+        0.8,
+        context.retreatPenaltyScale * 0.35,
+      );
+    }
+    const goal = goalScoringPoint(context);
     if (!goal) return 0;
-    return Math.max(0, distance({ x, y }, goal) - Math.max(0, goal.threshold ?? 0)) * 0.35;
+    return Math.max(0, distance(position, goal) - goal.threshold) * 0.35;
   }
 
   private stateTerminalScore(
@@ -1087,9 +1214,9 @@ export class SpaceTimeDodgePlanner {
   ): number {
     let cost = this.weights.incompleteHorizonPerSecond
       * Math.max(0, context.horizonMs - safeThroughMs) / 1000;
-    const goal = validGoal(context.input.goal) ? context.input.goal : undefined;
+    const goal = context.intent?.mode !== 'combat_range' ? goalScoringPoint(context) : undefined;
     if (goal) {
-      const remaining = Math.max(0, distance(position, goal) - Math.max(0, goal.threshold ?? 0));
+      const remaining = Math.max(0, distance(position, goal) - goal.threshold);
       cost += this.weights.terminalGoalDistance * remaining;
       const speed = Math.hypot(velocity.x, velocity.y);
       if (speed > 1e-9 && remaining > 1e-9) {
@@ -1098,6 +1225,15 @@ export class SpaceTimeDodgePlanner {
         const alignment = clamp((velocity.x * dx + velocity.y * dy) / (speed * Math.hypot(dx, dy)), -1, 1);
         cost += this.weights.terminalHeadingMismatch * (1 - alignment) * 0.5;
       }
+    }
+    if (context.intent?.mode === 'combat_range') {
+      cost += combatRangePenalty(
+        context,
+        position,
+        safeThroughMs,
+        this.weights.terminalCombatTooClose,
+        this.weights.terminalCombatTooFar * context.retreatPenaltyScale,
+      );
     }
     if (Number.isFinite(projectileClearance) && projectileClearance < PROJECTILE_NEAR_BAND) {
       const normalized = clamp((PROJECTILE_NEAR_BAND - projectileClearance) / PROJECTILE_NEAR_BAND, 0, 1);
@@ -1318,7 +1454,7 @@ export class SpaceTimeDodgePlanner {
       const startMs = this.config.timeLayersMs[layer - 1]!;
       const endMs = this.config.timeLayersMs[layer]!;
       const durationMs = endMs - startMs;
-      const velocity = directVelocity(input, current, durationMs);
+      const velocity = directVelocity(context, current, startMs, durationMs);
       const next = {
         x: current.x + velocity.x * durationMs,
         y: current.y + velocity.y * durationMs,
@@ -1529,7 +1665,7 @@ function createPlanningControls(
 ): MovementControl[] {
   const controls = FIXED_CONTROLS.map((control) => ({ ...control }));
   const adaptiveDirections: Array<{ x: number; y: number }> = [];
-  const desired = desiredDirection(input, input.position);
+  const desired = desiredDirectionFromInput(input, input.position);
   if (desired) adaptiveDirections.push(desired);
 
   let nearest: ProjectileSegment | undefined;
@@ -1574,39 +1710,114 @@ function createPlanningControls(
 }
 
 function directVelocity(
-  input: DodgePlanningInput,
+  context: PlannerContext,
   position: { x: number; y: number },
+  startMs: number,
   durationMs: number,
 ): { x: number; y: number } {
-  const goal = validGoal(input.goal) ? input.goal : undefined;
-  if (!goal) {
-    const speed = Math.hypot(input.intentVelocity.x, input.intentVelocity.y);
-    if (speed <= input.moveSpeed + 1e-9) return { ...input.intentVelocity };
-    return {
-      x: input.intentVelocity.x / speed * input.moveSpeed,
-      y: input.intentVelocity.y / speed * input.moveSpeed,
-    };
+  const { input } = context;
+  const desired = desiredDirectionAt(context, position, startMs);
+  if (!desired) return { x: 0, y: 0 };
+
+  let maximumTravel = input.moveSpeed * durationMs;
+  if (context.intent?.mode === 'combat_range') {
+    const target = context.combatTargetScratch;
+    writeCombatTargetAt(context, startMs, target);
+    const targetDistance = distance(position, target);
+    if (targetDistance > context.intent.preferredMaximumRange) {
+      maximumTravel = Math.min(
+        maximumTravel,
+        targetDistance - context.intent.preferredMaximumRange,
+      );
+    } else if (targetDistance < context.intent.preferredMinimumRange) {
+      maximumTravel = Math.min(
+        maximumTravel,
+        context.intent.preferredMinimumRange - targetDistance,
+      );
+    }
+  } else {
+    const goal = goalScoringPoint(context);
+    if (goal) {
+      maximumTravel = Math.min(
+        maximumTravel,
+        Math.max(0, distance(position, goal) - goal.threshold * 0.5),
+      );
+    }
   }
-  const dx = goal.x - position.x;
-  const dy = goal.y - position.y;
-  const distance = Math.hypot(dx, dy);
-  const threshold = Math.max(0, goal.threshold ?? 0);
-  if (distance <= threshold + 1e-9) return { x: 0, y: 0 };
-  const travel = Math.min(input.moveSpeed * durationMs, Math.max(0, distance - threshold * 0.5));
-  return { x: dx / distance * travel / durationMs, y: dy / distance * travel / durationMs };
+  return {
+    x: desired.x * maximumTravel / durationMs,
+    y: desired.y * maximumTravel / durationMs,
+  };
 }
 
-function desiredDirection(
+function desiredDirectionFromInput(
   input: DodgePlanningInput,
   position: { x: number; y: number },
 ): { x: number; y: number } | undefined {
-  const goal = validGoal(input.goal) ? input.goal : undefined;
-  const dx = goal ? goal.x - position.x : input.intentVelocity.x;
-  const dy = goal ? goal.y - position.y : input.intentVelocity.y;
+  const intent = plannerIntent(input);
+  const route = validGoal(input.routeWaypoint)
+    ? input.routeWaypoint
+    : validGoal(input.goal) ? input.goal : undefined;
+  let dx: number;
+  let dy: number;
+  if (intent?.mode === 'combat_range') {
+    const targetDistance = Math.hypot(position.x - intent.targetX, position.y - intent.targetY);
+    if (targetDistance < intent.preferredMinimumRange) {
+      dx = position.x - intent.targetX;
+      dy = position.y - intent.targetY;
+    } else if (targetDistance > intent.preferredMaximumRange) {
+      dx = route ? route.x - position.x : intent.targetX - position.x;
+      dy = route ? route.y - position.y : intent.targetY - position.y;
+    } else {
+      return undefined;
+    }
+  } else if (intent?.mode === 'goal') {
+    if (Math.hypot(position.x - intent.goalX, position.y - intent.goalY)
+      <= Math.max(0, intent.arriveThreshold ?? 0)) return undefined;
+    dx = route ? route.x - position.x : intent.goalX - position.x;
+    dy = route ? route.y - position.y : intent.goalY - position.y;
+  } else if (input.preferredDirection) {
+    dx = input.preferredDirection.x;
+    dy = input.preferredDirection.y;
+  } else {
+    dx = input.intentVelocity.x;
+    dy = input.intentVelocity.y;
+  }
   const length = Math.hypot(dx, dy);
   if (length <= 1e-9) return undefined;
-  if (goal && length <= Math.max(0, goal.threshold ?? 0)) return undefined;
   return { x: dx / length, y: dy / length };
+}
+
+function desiredDirectionAt(
+  context: PlannerContext,
+  position: { x: number; y: number },
+  timeOffsetMs: number,
+): { x: number; y: number } | undefined {
+  const intent = context.intent;
+  if (intent?.mode === 'combat_range') {
+    const target = context.combatTargetScratch;
+    writeCombatTargetAt(context, timeOffsetMs, target);
+    const targetDistance = distance(position, target);
+    if (targetDistance >= intent.preferredMinimumRange
+      && targetDistance <= intent.preferredMaximumRange) return undefined;
+    const destination = targetDistance < intent.preferredMinimumRange
+      ? { x: position.x * 2 - target.x, y: position.y * 2 - target.y }
+      : context.routeWaypoint ?? target;
+    return unitVector(position, destination);
+  }
+  if (intent?.mode === 'goal') {
+    if (Math.hypot(position.x - intent.goalX, position.y - intent.goalY)
+      <= Math.max(0, intent.arriveThreshold ?? 0)) return undefined;
+    return unitVector(
+      position,
+      context.routeWaypoint ?? { x: intent.goalX, y: intent.goalY },
+    );
+  }
+  if (context.routeWaypoint) return unitVector(position, context.routeWaypoint);
+  if (context.input.preferredDirection) {
+    return unitVector({ x: 0, y: 0 }, context.input.preferredDirection);
+  }
+  return unitVector({ x: 0, y: 0 }, context.input.intentVelocity);
 }
 
 function reconstructTrajectory(
@@ -1821,6 +2032,142 @@ function emptyCounters(): PlanCounters {
     statesPrunedByBeam: 0,
     activeProjectilesConsidered: 0,
   };
+}
+
+function plannerIntent(input: DodgePlanningInput): DodgeMovementIntent | null {
+  if (input.intent === null) return null;
+  if (input.intent !== undefined) {
+    const normalized = normalizeDodgeMovementIntent(input.intent);
+    if (!normalized) return null;
+    if (normalized.mode === 'goal') return normalized;
+    const hardMinimumRange = Math.max(ENEMY_AVOID_RADIUS, normalized.hardMinimumRange);
+    const preferredMinimumRange = Math.max(hardMinimumRange, normalized.preferredMinimumRange);
+    return {
+      ...normalized,
+      hardMinimumRange,
+      preferredMinimumRange,
+      preferredMaximumRange: Math.max(preferredMinimumRange, normalized.preferredMaximumRange),
+    };
+  }
+  if (!validGoal(input.goal)) return null;
+  return {
+    mode: 'goal',
+    goalX: input.goal.x,
+    goalY: input.goal.y,
+    arriveThreshold: Math.max(0, input.goal.threshold ?? 0),
+  };
+}
+
+function sampleCombatTargetPositions(
+  input: DodgePlanningInput,
+  intent: DodgeMovementIntent | null,
+  timeLayersMs: readonly number[],
+  horizonMs: number,
+): TimedCombatTargetPosition[] {
+  if (intent?.mode !== 'combat_range') return [];
+  const positions: TimedCombatTargetPosition[] = [];
+  for (const timeOffsetMs of timeLayersMs) {
+    if (timeOffsetMs > horizonMs) break;
+    const predicted = input.combatTargetPositionAt?.(timeOffsetMs);
+    positions.push({
+      timeOffsetMs,
+      x: predicted && Number.isFinite(predicted.x) ? predicted.x : intent.targetX,
+      y: predicted && Number.isFinite(predicted.y) ? predicted.y : intent.targetY,
+    });
+  }
+  if (positions.length === 0 || positions.at(-1)!.timeOffsetMs < horizonMs) {
+    const predicted = input.combatTargetPositionAt?.(horizonMs);
+    positions.push({
+      timeOffsetMs: horizonMs,
+      x: predicted && Number.isFinite(predicted.x) ? predicted.x : intent.targetX,
+      y: predicted && Number.isFinite(predicted.y) ? predicted.y : intent.targetY,
+    });
+  }
+  return positions;
+}
+
+function writeCombatTargetAt(
+  context: PlannerContext,
+  timeOffsetMs: number,
+  out: { x: number; y: number },
+): void {
+  const intent = context.intent as CombatRangeDodgeIntent;
+  const positions = context.combatTargetPositions;
+  if (positions.length === 0) {
+    out.x = intent.targetX;
+    out.y = intent.targetY;
+    return;
+  }
+  if (timeOffsetMs <= positions[0]!.timeOffsetMs) {
+    out.x = positions[0]!.x;
+    out.y = positions[0]!.y;
+    return;
+  }
+  for (let index = 1; index < positions.length; index++) {
+    const next = positions[index]!;
+    if (timeOffsetMs > next.timeOffsetMs) continue;
+    const previous = positions[index - 1]!;
+    const duration = next.timeOffsetMs - previous.timeOffsetMs;
+    const ratio = duration <= 0 ? 1 : (timeOffsetMs - previous.timeOffsetMs) / duration;
+    out.x = previous.x + (next.x - previous.x) * ratio;
+    out.y = previous.y + (next.y - previous.y) * ratio;
+    return;
+  }
+  const last = positions.at(-1)!;
+  out.x = last.x;
+  out.y = last.y;
+}
+
+function combatRangePenalty(
+  context: PlannerContext,
+  position: { x: number; y: number },
+  timeOffsetMs: number,
+  tooCloseWeight: number,
+  tooFarWeight: number,
+): number {
+  const intent = context.intent as CombatRangeDodgeIntent;
+  const target = context.combatTargetScratch;
+  writeCombatTargetAt(context, timeOffsetMs, target);
+  const targetDistance = distance(position, target);
+  const closeWidth = Math.max(0.25, intent.preferredMinimumRange - intent.hardMinimumRange);
+  const farWidth = Math.max(1, intent.preferredMaximumRange - intent.preferredMinimumRange);
+  const tooClose = targetDistance < intent.preferredMinimumRange
+    ? clamp((intent.preferredMinimumRange - targetDistance) / closeWidth, 0, 1)
+    : 0;
+  const tooFar = targetDistance > intent.preferredMaximumRange
+    ? clamp((targetDistance - intent.preferredMaximumRange) / farWidth, 0, 3)
+    : 0;
+  return tooCloseWeight * tooClose * tooClose + tooFarWeight * tooFar * tooFar;
+}
+
+function goalScoringPoint(
+  context: PlannerContext,
+): { x: number; y: number; threshold: number } | undefined {
+  if (context.intent?.mode === 'goal') {
+    const arriveThreshold = Math.max(0, context.intent.arriveThreshold ?? 0);
+    if (Math.hypot(
+      context.input.position.x - context.intent.goalX,
+      context.input.position.y - context.intent.goalY,
+    ) <= arriveThreshold) {
+      return { x: context.intent.goalX, y: context.intent.goalY, threshold: arriveThreshold };
+    }
+    return context.routeWaypoint ?? {
+      x: context.intent.goalX,
+      y: context.intent.goalY,
+      threshold: arriveThreshold,
+    };
+  }
+  return context.routeWaypoint;
+}
+
+function unitVector(
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+): { x: number; y: number } | undefined {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const length = Math.hypot(dx, dy);
+  return length > 1e-9 ? { x: dx / length, y: dy / length } : undefined;
 }
 
 function validGoal(

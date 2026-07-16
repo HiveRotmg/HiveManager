@@ -257,6 +257,53 @@ test('a logical goal id change immediately replaces the committed plan', () => {
   assert.equal(changed.planReused, false);
 });
 
+test('switching between goal and combat-range modes takes effect immediately', () => {
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  const base = {
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    routeRevision: 1,
+    moveSpeed: 0.004,
+    intentVelocity: { x: 0, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [],
+    aoes: [],
+    environment: openEnvironment,
+  };
+  const goal = controller.evaluate({
+    ...base,
+    time: 0,
+    goal: { x: 10, y: 5 },
+    movementIntent: { mode: 'goal', goalX: 20, goalY: 5, goalId: 'goal' },
+  });
+  const combat = controller.evaluate({
+    ...base,
+    time: 16,
+    movementIntent: {
+      mode: 'combat_range',
+      targetId: 42,
+      targetX: 7.5,
+      targetY: 5,
+      hardMinimumRange: 1.3,
+      preferredMinimumRange: 2,
+      preferredMaximumRange: 3,
+    },
+  });
+  const resumedGoal = controller.evaluate({
+    ...base,
+    time: 32,
+    goal: { x: 10, y: 5 },
+    movementIntent: { mode: 'goal', goalX: 20, goalY: 5, goalId: 'goal' },
+  });
+
+  assert.equal(goal.planRevision, 1);
+  assert.equal(combat.planRevision, 2);
+  assert.deepEqual(combat.velocity, { x: 0, y: 0 });
+  assert.equal(resumedGoal.planRevision, 3);
+  assert.ok(resumedGoal.velocity.x > 0);
+});
+
 test('rolling planner replans only when a danger update invalidates the timed trajectory', () => {
   const controller = new PredictiveAutoDodgeController();
   controller.setEnabled(true);

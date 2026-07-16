@@ -215,6 +215,15 @@ export class AutoCombatController {
     return this.motion.currentPosition(object.objectId, object, now);
   }
 
+  predictObjectPosition(
+    objectId: number,
+    fallback: { x: number; y: number },
+    now: number,
+    futureMs: number,
+  ): { x: number; y: number } {
+    return this.motion.predictPosition(objectId, fallback, now, futureMs);
+  }
+
   update(now: number, snapshot: AutoCombatSnapshot, actions: AutoCombatActions): void {
     const objects = [...snapshot.objects];
     if (now < this.lastUpdateAt) this.clearMap();

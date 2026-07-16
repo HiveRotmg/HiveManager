@@ -51,6 +51,131 @@ test('1. projectile-free planning follows the global pathfinding intent', () => 
   assert.ok(result.trajectory.waypoints.at(-1)!.x > 9.9);
 });
 
+test('goal mode follows its route waypoint toward the global destination', () => {
+  const result = plan(planningInput({
+    intent: {
+      mode: 'goal',
+      goalX: 20,
+      goalY: 5,
+      goalId: 'ordinary-destination',
+      arriveThreshold: 0.5,
+    },
+    routeWaypoint: { x: 10, y: 5, threshold: 0.2 },
+  }));
+
+  assert.equal(result.reachesHorizon, true);
+  assert.ok(result.trajectory.waypoints.at(-1)!.x > 9.8);
+  assert.ok(result.trajectory.waypoints.every((waypoint) => Math.abs(waypoint.y - 5) < 1e-9));
+});
+
+test('goal mode passes a combat enemy without combat-range attraction', () => {
+  const enemy = { x: 7, y: 5 };
+  const result = plan(planningInput({
+    intent: {
+      mode: 'goal',
+      goalX: 12,
+      goalY: 5,
+      goalId: 'run-past',
+      arriveThreshold: 0.2,
+    },
+    routeWaypoint: { x: 10, y: 5, threshold: 0.2 },
+    environment: {
+      canOccupy: () => true,
+      enemyClearance: (x, y) => Math.hypot(x - enemy.x, y - enemy.y),
+      isProjectileSegmentOpen: () => true,
+    },
+  }));
+
+  assert.ok(result.trajectory.waypoints.at(-1)!.x > enemy.x);
+  assert.ok(result.minimumEnemyClearance >= ENEMY_AVOID_RADIUS - 1e-6);
+});
+
+test('combat-range mode approaches from beyond the preferred maximum', () => {
+  const result = plan(planningInput({
+    goal: undefined,
+    intent: combatIntent({ targetX: 10, preferredMinimumRange: 2, preferredMaximumRange: 3 }),
+    routeWaypoint: undefined,
+    intentVelocity: { x: 0, y: 0 },
+  }));
+
+  assert.ok(result.trajectory.waypoints[0]!.x > 5);
+  const terminalDistance = Math.hypot(result.trajectory.waypoints.at(-1)!.x - 10,
+    result.trajectory.waypoints.at(-1)!.y - 5);
+  assert.ok(terminalDistance >= 2 - 1e-6 && terminalDistance <= 3 + 1e-6);
+});
+
+test('combat-range mode retreats from below the preferred minimum', () => {
+  const result = plan(planningInput({
+    goal: undefined,
+    intent: combatIntent({
+      targetX: 6.5,
+      hardMinimumRange: 1.3,
+      preferredMinimumRange: 2.5,
+      preferredMaximumRange: 3.5,
+    }),
+    routeWaypoint: undefined,
+    intentVelocity: { x: 0, y: 0 },
+  }));
+
+  assert.ok(result.trajectory.waypoints[0]!.x < 5);
+  assert.ok(Math.hypot(
+    result.trajectory.waypoints.at(-1)!.x - 6.5,
+    result.trajectory.waypoints.at(-1)!.y - 5,
+  ) >= 2.5 - 1e-6);
+});
+
+test('combat-range mode waits when already inside the preferred band', () => {
+  const result = plan(planningInput({
+    goal: undefined,
+    intent: combatIntent({ targetX: 7.5, preferredMinimumRange: 2, preferredMaximumRange: 3 }),
+    routeWaypoint: undefined,
+    intentVelocity: { x: 0, y: 0 },
+    previousVelocity: { x: 0, y: 0 },
+  }));
+
+  assert.ok(result.trajectory.waypoints.every((waypoint) => waypoint.speed === 0));
+  assert.ok(result.trajectory.waypoints.every((waypoint) => waypoint.x === 5 && waypoint.y === 5));
+});
+
+test('combat hard range clamps to 1.3 and starting inside can only escape', () => {
+  const target = { x: 6.2, y: 5 };
+  const result = plan(planningInput({
+    goal: undefined,
+    intent: combatIntent({
+      targetX: target.x,
+      hardMinimumRange: 1,
+      preferredMinimumRange: 1.4,
+      preferredMaximumRange: 2.5,
+    }),
+    routeWaypoint: undefined,
+    intentVelocity: { x: 0, y: 0 },
+  }));
+  const distances = result.trajectory.waypoints.map((waypoint) => (
+    Math.hypot(waypoint.x - target.x, waypoint.y - target.y)
+  ));
+
+  assert.ok(distances[0]! >= 1.2 - 1e-6);
+  assert.ok(distances.every((value, index) => index === 0 || value + 1e-6 >= distances[index - 1]!));
+  assert.ok(distances.at(-1)! >= ENEMY_AVOID_RADIUS);
+});
+
+test('combat range scoring samples predicted target movement by time layer', () => {
+  let samples = 0;
+  const result = plan(planningInput({
+    goal: undefined,
+    intent: combatIntent({ targetX: 10, preferredMinimumRange: 2, preferredMaximumRange: 3 }),
+    routeWaypoint: undefined,
+    intentVelocity: { x: 0, y: 0 },
+    combatTargetPositionAt: (timeOffsetMs) => {
+      samples++;
+      return { x: 10 + timeOffsetMs * 0.002, y: 5 };
+    },
+  }));
+
+  assert.ok(samples >= 13);
+  assert.ok(result.trajectory.waypoints.at(-1)!.x > 8);
+});
+
 test('2. a direct incoming projectile produces a swept-safe route around it', () => {
   const input = planningInput({ projectiles: [projectile()] });
   const planner = testPlanner();
@@ -516,6 +641,26 @@ function planningInput(overrides: Partial<DodgePlanningInput> = {}): DodgePlanni
     aoes: [],
     environment: OPEN_ENVIRONMENT,
     safeWalk: true,
+    ...overrides,
+  };
+}
+
+function combatIntent(overrides: Partial<{
+  targetId: number;
+  targetX: number;
+  targetY: number;
+  hardMinimumRange: number;
+  preferredMinimumRange: number;
+  preferredMaximumRange: number;
+}> = {}) {
+  return {
+    mode: 'combat_range' as const,
+    targetId: 42,
+    targetX: 10,
+    targetY: 5,
+    hardMinimumRange: 1.3,
+    preferredMinimumRange: 2,
+    preferredMaximumRange: 3,
     ...overrides,
   };
 }

@@ -50,6 +50,7 @@ export interface AutoDodgeSnapshot {
   /** Stable global/script intent; `goal` remains the current local route point. */
   movementIntent?: DodgeMovementIntent | null;
   routeRevision?: number;
+  combatTargetPositionAt?: (timeOffsetMs: number) => { x: number; y: number };
   /** Maximum movement speed in tiles per millisecond. */
   moveSpeed: number;
   intentVelocity: { x: number; y: number };
@@ -265,7 +266,7 @@ export class PredictiveAutoDodgeController {
       });
     }
 
-    const hasMovementIntent = !!goal
+    const hasMovementIntent = !!intent
       || Math.hypot(snapshot.intentVelocity.x, snapshot.intentVelocity.y) > VELOCITY_MATCH_TOLERANCE;
     if (!hasMovementIntent && projectiles.length === 0 && snapshot.aoes.length === 0) {
       this.committed = undefined;
@@ -291,6 +292,11 @@ export class PredictiveAutoDodgeController {
       playerId: snapshot.playerId,
       position: { ...snapshot.position },
       goal: goal ?? undefined,
+      intent,
+      routeWaypoint: goal ?? undefined,
+      preferredDirection: normalizedDirection(snapshot.intentVelocity),
+      combatTargetPositionAt: snapshot.combatTargetPositionAt,
+      retreatPenaltyScale: 1,
       moveSpeed: snapshot.moveSpeed,
       intentVelocity: { ...snapshot.intentVelocity },
       previousVelocity: this.committed
@@ -396,14 +402,14 @@ export class PredictiveAutoDodgeController {
         target: null,
         path: [],
         trajectory: null,
-        overrideActive: !!goal,
+        overrideActive: !!intent,
         jumpPlan,
         planReused,
         replanReason,
         threatCount: projectiles.length + snapshot.aoes.length,
         earliestImpactMs: null,
         selectedCandidate: 0,
-        decision: goal ? 'goal_blocked' : 'controlled_stop',
+        decision: intent ? `${intent.mode}_blocked` : 'controlled_stop',
       });
     }
 
@@ -442,18 +448,19 @@ export class PredictiveAutoDodgeController {
       velocity.y - snapshot.intentVelocity.y,
     ) <= VELOCITY_MATCH_TOLERANCE;
     const earliestImpactMs = committed.result.earliestIntentCollisionMs ?? null;
-    const overrideActive = !!goal || !matchesIntent || earliestImpactMs !== null;
+    const overrideActive = !!intent || !matchesIntent || earliestImpactMs !== null;
     const commandVelocity = !overrideActive && matchesIntent
       ? { ...snapshot.intentVelocity }
       : velocity;
     this.lastCommandVelocity = { ...commandVelocity };
     const fallback = committed.result.fallback;
     const decision = fallback === 'stop'
-      ? (goal ? 'goal_blocked' : 'controlled_stop')
+      ? (intent ? `${intent.mode}_blocked` : 'controlled_stop')
       : fallback === 'least_risk' || fallback === 'partial'
         ? 'controlled_fallback'
         : overrideActive
-          ? (goal ? 'goal_path' : 'dodge_trajectory')
+          ? (intent?.mode === 'combat_range' ? 'combat_range_path'
+            : intent ? 'goal_path' : 'dodge_trajectory')
           : 'preserve_safe_intent';
 
     return this.finish(snapshot, goal, {
@@ -835,6 +842,13 @@ function unitDirection(
   const dy = to.y - from.y;
   const length = Math.hypot(dx, dy);
   return length > 1e-9 ? { x: dx / length, y: dy / length } : undefined;
+}
+
+function normalizedDirection(
+  velocity: { x: number; y: number },
+): { x: number; y: number } | undefined {
+  const speed = Math.hypot(velocity.x, velocity.y);
+  return speed > 1e-9 ? { x: velocity.x / speed, y: velocity.y / speed } : undefined;
 }
 
 function projectileKey(projectile: CombatProjectileSnapshot): string {

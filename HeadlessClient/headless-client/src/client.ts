@@ -3275,6 +3275,12 @@ export class Client extends EventEmitter {
     const dodgeGoal = movementGoal
       ? boundedMovementGoal(this.pos, movementGoal, MAX_LOCAL_GOAL_DISTANCE)
       : undefined;
+    const combatIntent = this.dodgeMovementIntent?.mode === 'combat_range'
+      ? this.dodgeMovementIntent
+      : undefined;
+    const combatTarget = combatIntent?.targetId
+      ? this.objects.get(combatIntent.targetId)
+      : undefined;
     const jumpLimiterState = this.dodgeJumpLimiter.getState(now);
     this.dodgeWorld?.setExplorativeUnknown(this.pathfinder.hasTarget());
     const dodgeState = this.autoDodge?.isEnabled() && this.combat && this.dodgeWorld && this.thrownAoes
@@ -3285,6 +3291,14 @@ export class Client extends EventEmitter {
           goal: dodgeGoal,
           movementIntent: this.dodgeMovementIntent,
           routeRevision: this.pathfinder.getIntentRevisions().routeRevision,
+          combatTargetPositionAt: combatIntent
+            ? (timeOffsetMs) => this.autoCombat?.predictObjectPosition(
+                combatIntent.targetId,
+                combatTarget ?? { x: combatIntent.targetX, y: combatIntent.targetY },
+                now,
+                timeOffsetMs,
+              ) ?? { x: combatIntent.targetX, y: combatIntent.targetY }
+            : undefined,
           moveSpeed: movementSpeed(snapshot),
           intentVelocity,
           movementLeadMs: dt,
