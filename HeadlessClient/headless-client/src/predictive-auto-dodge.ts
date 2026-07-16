@@ -15,6 +15,8 @@ export interface AutoDodgeAoeThreat {
   y: number;
   radius: number;
   landingTime: number;
+  /** Duration (ms) the blast stays dangerous after landing. Falsy = single-frame. */
+  blastDurationMs?: number;
 }
 
 export interface AutoDodgeEnvironment {
@@ -88,6 +90,7 @@ const GOAL_PATH_POINT_EPSILON = 0.02;
 const MAX_TIME = 0x7fffffff;
 const MIN_SAMPLE_MS = 8;
 const CURVED_TRAJECTORY_MAX_SAMPLE_MS = 15;
+const AOE_SAMPLE_MS = 30;
 
 interface GoalDodgePlan {
   candidate: number;
@@ -363,7 +366,8 @@ export class PredictiveAutoDodgeController {
 
     for (const aoe of aoes) {
       const landingOffset = aoe.landingTime - snapshot.time;
-      if (landingOffset <= 0 || landingOffset > HORIZON_MS) continue;
+      const dwell = Math.max(0, aoe.blastDurationMs ?? 0);
+      if (landingOffset + dwell <= 0 || landingOffset > HORIZON_MS) continue;
       const movementOffset = snapshot.movementLeadMs + landingOffset;
       if (Math.hypot(aoe.x - snapshot.position.x, aoe.y - snapshot.position.y)
         > aoe.radius + snapshot.moveSpeed * movementOffset + RELEVANCE_CLEARANCE) continue;
@@ -371,17 +375,17 @@ export class PredictiveAutoDodgeController {
       let intentClearance = Infinity;
       for (let candidate = 0; candidate < CANDIDATE_COUNT; candidate++) {
         if (!this.candidateValid[candidate] || landingOffset >= this.candidateBlockMs[candidate]) continue;
-        const playerX = snapshot.position.x
-          + this.candidateX[candidate] * snapshot.moveSpeed * movementOffset;
-        const playerY = snapshot.position.y
-          + this.candidateY[candidate] * snapshot.moveSpeed * movementOffset;
-        const clearance = Math.hypot(aoe.x - playerX, aoe.y - playerY) - aoe.radius;
-        if (clearance < this.candidateScore[candidate]) this.candidateScore[candidate] = clearance;
-        if (clearance <= 0 && landingOffset < this.candidateImpactMs[candidate]) {
-          this.candidateImpactMs[candidate] = landingOffset;
+        const { minClearance, firstImpactOffset } = this.sampleAoeClearance(
+          snapshot, aoe, this.candidateX[candidate], this.candidateY[candidate],
+        );
+        if (minClearance < this.candidateScore[candidate]) {
+          this.candidateScore[candidate] = minClearance;
         }
-        if (candidate === 0) standingClearance = clearance;
-        else if (candidate === INTENT_CANDIDATE) intentClearance = clearance;
+        if (firstImpactOffset < this.candidateImpactMs[candidate]) {
+          this.candidateImpactMs[candidate] = firstImpactOffset;
+        }
+        if (candidate === 0) standingClearance = minClearance;
+        else if (candidate === INTENT_CANDIDATE) intentClearance = minClearance;
       }
       const effectiveIntentClearance = this.candidateValid[INTENT_CANDIDATE]
         ? intentClearance : standingClearance;
@@ -925,13 +929,20 @@ export class PredictiveAutoDodgeController {
 
     for (const aoe of aoes) {
       const landingTimeMs = aoe.landingTime - snapshot.time;
-      if (landingTimeMs <= startTimeMs || landingTimeMs > endTimeMs) continue;
-      const ratio = (landingTimeMs - startTimeMs) / (endTimeMs - startTimeMs);
-      const playerX = from.x + (to.x - from.x) * ratio;
-      const playerY = from.y + (to.y - from.y) * ratio;
-      const clearance = Math.hypot(aoe.x - playerX, aoe.y - playerY) - aoe.radius;
-      if (clearance < INTENT_SAFE_CLEARANCE) return undefined;
-      minThreatClearance = Math.min(minThreatClearance, clearance);
+      const dwell = Math.max(0, aoe.blastDurationMs ?? 0);
+      const dangerEnd = landingTimeMs + dwell;
+      if (dangerEnd <= startTimeMs || landingTimeMs > endTimeMs) continue;
+      const windowStart = Math.max(landingTimeMs, startTimeMs);
+      const windowEnd = Math.min(dangerEnd, endTimeMs);
+      for (let timeMs = windowStart; timeMs <= windowEnd; timeMs += AOE_SAMPLE_MS) {
+        const ratio = (timeMs - startTimeMs) / (endTimeMs - startTimeMs);
+        const playerX = from.x + (to.x - from.x) * ratio;
+        const playerY = from.y + (to.y - from.y) * ratio;
+        const clearance = Math.hypot(aoe.x - playerX, aoe.y - playerY) - aoe.radius;
+        if (clearance < INTENT_SAFE_CLEARANCE) return undefined;
+        minThreatClearance = Math.min(minThreatClearance, clearance);
+        if (dwell === 0) break;
+      }
     }
     return { minThreatClearance, minEnemyClearance };
   }
@@ -1100,12 +1111,16 @@ export class PredictiveAutoDodgeController {
     }
     for (const aoe of aoes) {
       const landingOffset = aoe.landingTime - snapshot.time;
-      if (landingOffset <= 0 || landingOffset > HORIZON_MS) continue;
-      const movementOffset = snapshot.movementLeadMs + landingOffset;
-      if (Math.hypot(
-        aoe.x - (snapshot.position.x + velocityX * movementOffset),
-        aoe.y - (snapshot.position.y + velocityY * movementOffset),
-      ) - aoe.radius < INTENT_SAFE_CLEARANCE) return false;
+      const dwell = Math.max(0, aoe.blastDurationMs ?? 0);
+      if (landingOffset + dwell <= 0 || landingOffset > HORIZON_MS) continue;
+      for (let offset = landingOffset; offset <= landingOffset + dwell; offset += AOE_SAMPLE_MS) {
+        const movementOffset = snapshot.movementLeadMs + offset;
+        if (Math.hypot(
+          aoe.x - (snapshot.position.x + velocityX * movementOffset),
+          aoe.y - (snapshot.position.y + velocityY * movementOffset),
+        ) - aoe.radius < INTENT_SAFE_CLEARANCE) return false;
+        if (dwell === 0) break;
+      }
     }
     for (const projectile of this.relevantProjectiles) {
       let previousSet = false;
@@ -1145,6 +1160,31 @@ export class PredictiveAutoDodgeController {
       }
     }
     return true;
+  }
+
+  /** Returns min clearance and first impact offset for a candidate across an AoE window. */
+  private sampleAoeClearance(
+    snapshot: AutoDodgeSnapshot,
+    aoe: AutoDodgeAoeThreat,
+    candidateX: number,
+    candidateY: number,
+  ): { minClearance: number; firstImpactOffset: number } {
+    const landingOffset = aoe.landingTime - snapshot.time;
+    const dwell = Math.max(0, aoe.blastDurationMs ?? 0);
+    let minClearance = Infinity;
+    let firstImpactOffset = MAX_TIME;
+    for (let offset = landingOffset; offset <= landingOffset + dwell; offset += AOE_SAMPLE_MS) {
+      const movementOffset = snapshot.movementLeadMs + offset;
+      const playerX = snapshot.position.x
+        + candidateX * snapshot.moveSpeed * movementOffset;
+      const playerY = snapshot.position.y
+        + candidateY * snapshot.moveSpeed * movementOffset;
+      const clearance = Math.hypot(aoe.x - playerX, aoe.y - playerY) - aoe.radius;
+      if (clearance < minClearance) minClearance = clearance;
+      if (clearance <= 0 && offset < firstImpactOffset) firstImpactOffset = offset;
+      if (dwell === 0) break;
+    }
+    return { minClearance, firstImpactOffset };
   }
 
   private isThreatTo(projectile: CombatProjectileSnapshot, snapshot: AutoDodgeSnapshot): boolean {
@@ -1288,11 +1328,13 @@ interface TrackedThrownAoe extends AutoDodgeAoeThreat {
 export class ThrownAoeTracker {
   private readonly throws: TrackedThrownAoe[] = [];
   private readonly learnedRadius = new Map<number, number>();
+  private readonly learnedBlastDuration = new Map<number, number>();
   private readonly active: AutoDodgeAoeThreat[] = [];
 
   clear(): void {
     this.throws.length = 0;
     this.learnedRadius.clear();
+    this.learnedBlastDuration.clear();
     this.active.length = 0;
   }
 
@@ -1301,18 +1343,29 @@ export class ThrownAoeTracker {
     end: { x: number; y: number },
     durationSeconds: number,
     now: number,
+    blastDurationSeconds?: number,
   ): void {
     const durationMs = Math.max(0, durationSeconds * 1000);
+    const key = effectType >>> 0;
+    const blastMs = blastDurationSeconds !== undefined
+      ? Math.max(0, blastDurationSeconds * 1000)
+      : this.learnedBlastDuration.get(key);
     this.throws.push({
-      effectType: effectType >>> 0,
+      effectType: key,
       x: end.x,
       y: end.y,
-      radius: this.learnedRadius.get(effectType >>> 0) ?? 1,
+      radius: this.learnedRadius.get(key) ?? 1,
       landingTime: now + durationMs,
+      blastDurationMs: blastMs,
     });
   }
 
-  recordAoe(position: { x: number; y: number }, radius: number, now: number): void {
+  recordAoe(
+    position: { x: number; y: number },
+    radius: number,
+    now: number,
+    blastDurationSeconds?: number,
+  ): void {
     let best: TrackedThrownAoe | undefined;
     let bestDistance = 1;
     for (const thrown of this.throws) {
@@ -1325,18 +1378,26 @@ export class ThrownAoeTracker {
     if (!best) return;
     this.learnedRadius.set(best.effectType, radius);
     best.radius = radius;
+    if (blastDurationSeconds !== undefined) {
+      const blastMs = Math.max(0, blastDurationSeconds * 1000);
+      this.learnedBlastDuration.set(best.effectType, blastMs);
+      best.blastDurationMs = blastMs;
+    }
   }
 
   getActive(now: number): readonly AutoDodgeAoeThreat[] {
     this.active.length = 0;
     for (let index = this.throws.length - 1; index >= 0; index--) {
       const thrown = this.throws[index]!;
-      if (now > thrown.landingTime + 750) {
+      const dwell = thrown.blastDurationMs ?? 0;
+      if (now > thrown.landingTime + Math.max(750, dwell)) {
         this.throws.splice(index, 1);
         continue;
       }
       if (now < thrown.landingTime) {
         thrown.radius = this.learnedRadius.get(thrown.effectType) ?? thrown.radius;
+        const learnedBlast = this.learnedBlastDuration.get(thrown.effectType);
+        if (learnedBlast !== undefined) thrown.blastDurationMs = learnedBlast;
         this.active.push(thrown);
       }
     }

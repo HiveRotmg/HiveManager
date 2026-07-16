@@ -726,3 +726,57 @@ test('long-lane preference does not perturb selection in open environments', () 
   });
   assert.equal(state.decision, 'preserve_safe_intent');
 });
+
+test('predictive auto-dodge escapes an AOE that dwells after landing', () => {
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  const state = controller.evaluate({
+    time: 0,
+    playerId: 10,
+    position: { x: 3, y: 5 },
+    moveSpeed: 0.0096,
+    intentVelocity: { x: 0.0096, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [],
+    aoes: [{ x: 5, y: 5, radius: 1, landingTime: 100, blastDurationMs: 400 }],
+    environment: openEnvironment,
+  });
+  assert.equal(state.overrideActive, true);
+});
+
+test('ThrownAoeTracker learns and propagates a blast duration', () => {
+  const tracker = new ThrownAoeTracker();
+  tracker.track(456, { x: 5, y: 5 }, 0.2, 0);
+  tracker.recordAoe({ x: 5.1, y: 5 }, 2, 200, 0.5);
+  tracker.track(456, { x: 8, y: 8 }, 0.2, 300);
+  const active = tracker.getActive(350);
+  assert.equal(active.length, 1);
+  assert.equal(active[0]?.radius, 2);
+  assert.equal(active[0]?.blastDurationMs, 500);
+});
+
+test('speed-scale selection respects AoE dwell duration', () => {
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  const state = controller.evaluate({
+    time: 0,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    moveSpeed: 0.0096,
+    intentVelocity: { x: 0.0096, y: 0 },
+    movementLeadMs: 16,
+    projectiles: [{
+      ...hostileProjectile(),
+      startX: 5,
+      startY: 4.5,
+      angle: Math.PI / 2,
+      startTime: 0,
+    }],
+    aoes: [{ x: 5.2, y: 5, radius: 0.8, landingTime: 40, blastDurationMs: 400 }],
+    environment: openEnvironment,
+  });
+  if (state.velocity.x > 0) {
+    assert.equal(state.speedScale, 1,
+      `speed-scale sneaked eastward through the dwelling blast: ${state.speedScale}`);
+  }
+});
