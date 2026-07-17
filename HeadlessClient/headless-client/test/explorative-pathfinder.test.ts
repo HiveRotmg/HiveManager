@@ -12,13 +12,19 @@ const BLOCKING_GROUND = 9;
 const DAMAGING_GROUND = 10;
 const BLOCKING_OBJECT = 100;
 const NON_BLOCKING_ENEMY = 101;
+const DESTRUCTIBLE_WALL = 102;
+const INVINCIBLE_WALL = 103;
 
 const data: PathfindingDataProvider = {
   getObject: (type) => type === BLOCKING_OBJECT
     ? { occupySquare: true }
     : type === NON_BLOCKING_ENEMY
       ? { occupySquare: false, isEnemy: true, hasProjectiles: true }
-      : undefined,
+      : type === DESTRUCTIBLE_WALL
+        ? { occupySquare: true, isEnemy: true }
+        : type === INVINCIBLE_WALL
+          ? { occupySquare: true, isEnemy: true, invincible: true }
+          : undefined,
   tileIsBlockingWalk: (type) => type === BLOCKING_GROUND,
   getTileDamage: (type) => type === DAMAGING_GROUND ? 100 : undefined,
 };
@@ -597,6 +603,34 @@ test('Client exposes no-path state, suspends goal dodge, and recovers after map 
     goalY: target.y,
     arriveThreshold: 0.5,
   });
+});
+
+test('damageable enemy walls are pathable and stalls against them are not learned', () => {
+  const pathfinder = createPathfinder(12, 3);
+  for (let x = 0; x < 12; x++) {
+    pathfinder.observeTile(x, 0, 1);
+    pathfinder.observeTile(x, 1, 1);
+    pathfinder.observeTile(x, 2, 1);
+  }
+  // Solid inert wall on the north lane; only the south lane has a shootable wall.
+  pathfinder.upsertObject(1, BLOCKING_OBJECT, 5.5, 0.5);
+  pathfinder.upsertObject(2, DESTRUCTIBLE_WALL, 5.5, 1.5);
+
+  pathfinder.setTarget({ x: 10.5, y: 1.5 }, 0.2);
+  const step = pathfinder.next({ x: 0.5, y: 1.5 });
+  assert.equal(step.noPath, undefined);
+  assert.ok(step.waypoint);
+  assert.equal(hasTile(pathfinder, 5, 1), true, 'route should cross the shootable wall tile');
+
+  const stalled = pathfinder.reportStall({ x: 4.5, y: 1.5 });
+  assert.equal(stalled, undefined, 'must not permanently learn shootable wall tiles');
+
+  pathfinder.removeObject(2);
+  pathfinder.upsertObject(3, INVINCIBLE_WALL, 5.5, 1.5);
+  pathfinder.setTarget({ x: 10.5, y: 1.5 }, 0.2);
+  const blocked = pathfinder.next({ x: 0.5, y: 1.5 });
+  assert.equal(hasTile(pathfinder, 5, 1), false, 'invincible enemy walls still block');
+  assert.ok(blocked.waypoint || blocked.noPath !== undefined);
 });
 
 test('map invalidation keeps the active route while replacement search is still searching', () => {
