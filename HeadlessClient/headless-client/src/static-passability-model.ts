@@ -4,8 +4,9 @@
  * Step 4.1: types only. Implementation lands in 4.2; A* and dodge migration in 4.3/4.4.
  *
  * Scope: terrain, occupySquare/fullOccupy objects, learned blocks, map bounds.
- * Out of scope: combat enemy exclusion zones, damaging-floor cost (dodge safeWalk is a
- * query flag here), projectile segment cover (DodgeCollisionWorld.isProjectilePathOpen).
+ * Out of scope: combat enemy exclusion zones (see enemy-clearance-overlay.ts),
+ * damaging-floor cost (dodge safeWalk is a query flag here), projectile segment cover
+ * (DodgeCollisionWorld.isProjectilePathOpen).
  */
 
 /** Integer tile coordinates on the map grid. */
@@ -25,6 +26,19 @@ export interface WorldPoint {
  * Full dual-predicate wiring is Commit 4.5; the discriminator is scaffolded here.
  */
 export type StaticPassabilityConsumer = 'pathfinding' | 'dodge';
+
+/**
+ * Passability semantics generation for cache invalidation (Commit 5.7).
+ * Bump when inflation, overlay, segment validation, or other shared predicates change
+ * so long-lived pathfinder no-path cache entries self-invalidate on upgrade/revert.
+ */
+export const PASSABILITY_SCHEMA_VERSION = 2;
+
+/** Optional store configuration (Commit 5.1+). */
+export interface StaticPassabilityConfig {
+  /** When true, apply Chebyshev obstacle/fullOccupy inflation on static queries. */
+  useInflatedPassability?: boolean;
+}
 
 /** Tile/object definition hooks shared by pathfinding and dodge data providers. */
 export interface StaticPassabilityDataProvider {
@@ -99,13 +113,13 @@ export interface StaticPassabilityModel {
 
   /**
    * Integer-tile static blockage: terrain, learned blocks, occupySquare objects.
-   * Does not apply combat enemy exclusion (ExplorativePathfinder.isPathBlocked delta).
+   * Does not apply combat enemy exclusion (EnemyClearanceOverlay overlay).
    */
   isTileStaticallyBlocked(tileX: number, tileY: number, query: StaticTileQuery): boolean;
 
   /**
    * Fractional-position static occupancy including fullOccupy neighbor checks.
-   * Does not apply enemy clearance (DodgeCollisionWorld.canOccupy delta).
+   * Does not apply enemy clearance (EnemyClearanceOverlay overlay).
    */
   canOccupyAt(x: number, y: number, query: StaticOccupancyQuery): boolean;
 
@@ -120,6 +134,9 @@ export interface StaticPassabilityModel {
 
   /** True when an occupySquare object sits on the integer tile. */
   hasOccupySquareAt(tileX: number, tileY: number): boolean;
+
+  /** Whether Commit 5.1 inflated passability is active on this store. */
+  isInflatedPassabilityEnabled(): boolean;
 }
 
 /**

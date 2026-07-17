@@ -1,6 +1,13 @@
 import type { CombatDataProvider, CombatProjectileSnapshot } from './combat-tracker';
+import {
+  ENEMY_AVOID_RADIUS,
+  ENEMY_SOFT_AVOID_RADIUS,
+  EnemyClearanceOverlay,
+} from './enemy-clearance-overlay';
 import type { StaticPassabilityStore } from './static-passability-model';
 import { createStaticPassabilityStore } from './static-passability-store';
+
+export { ENEMY_AVOID_RADIUS, ENEMY_SOFT_AVOID_RADIUS } from './enemy-clearance-overlay';
 
 interface DodgeObjectRecord {
   key: string;
@@ -13,11 +20,6 @@ interface DodgeObjectRecord {
 }
 
 const INVALID_TILE_TYPE = 0xffff;
-/** Hard movement exclusion around confirmed projectile-capable combat enemies, in tiles. */
-export const ENEMY_AVOID_RADIUS = 1.0;
-/** Outer edge of the nonlinear enemy-proximity cost, in tiles. */
-export const ENEMY_SOFT_AVOID_RADIUS = 2.3;
-const DISTANCE_EPSILON = 1e-9;
 const SNAPSHOT_REUSE_PADDING = 1;
 
 /** Compact collision data sampled from the authoritative dodge world for one local plan. */
@@ -110,9 +112,8 @@ export class DodgeCollisionWorld {
   /** OccupySquare cover for projectiles, including damageable enemy walls. */
   private readonly projectileCoverCounts = new Map<string, number>();
   private readonly confirmedCombatEnemies = new Set<number>();
-  private readonly combatEnemies = new Map<number, { x: number; y: number }>();
+  private readonly enemyOverlay = new EnemyClearanceOverlay();
   private revision = 0;
-  private enemyRevision = 0;
   private cachedSnapshot: CachedLocalSnapshot | undefined;
 
   constructor(
@@ -129,7 +130,7 @@ export class DodgeCollisionWorld {
     this.enemyOccupyCounts.clear();
     this.projectileCoverCounts.clear();
     this.confirmedCombatEnemies.clear();
-    this.combatEnemies.clear();
+    this.enemyOverlay.reset();
     this.touch(true, true);
   }
 
@@ -161,7 +162,7 @@ export class DodgeCollisionWorld {
 
   upsertObject(objectId: number, objectType: number, x: number, y: number): void {
     const previous = this.objects.get(objectId);
-    const previousCombat = this.combatEnemies.get(objectId);
+    const previousCombat = this.enemyOverlay.get(objectId);
     this.removeObjectRecord(objectId, false);
     const definition = this.data.getObject(objectType);
     if (!definition) {
@@ -190,14 +191,14 @@ export class DodgeCollisionWorld {
     this.objects.set(objectId, record);
     if (enemyCandidate && (isEnemyProximityThreat(this.data, objectType)
       || this.confirmedCombatEnemies.has(objectId))) {
-      this.combatEnemies.set(objectId, { x, y });
+      this.enemyOverlay.set(objectId, { x, y });
     }
     this.adjust(this.enemyOccupyCounts, record.key, record.enemyOccupySquare ? 1 : 0);
     // Keep projectile cover for damageable walls even though movement ignores them.
     this.adjust(this.projectileCoverCounts, record.key, record.occupySquare ? 1 : 0);
     const revisionBefore = this.staticPassability.getRevision();
     this.staticPassability.upsertObject(objectId, objectType, x, y, movement);
-    const nextCombat = this.combatEnemies.get(objectId);
+    const nextCombat = this.enemyOverlay.get(objectId);
     const staticChanged = this.staticPassability.getRevision() !== revisionBefore
       || staticCollisionChanged(previous, record);
     const enemyChanged = !sameOptionalPosition(previousCombat, nextCombat);
@@ -209,15 +210,15 @@ export class DodgeCollisionWorld {
     const record = this.objects.get(objectId);
     if (!record?.enemyCandidate) return;
     const changed = !this.confirmedCombatEnemies.has(objectId)
-      || !this.combatEnemies.has(objectId);
+      || !this.enemyOverlay.has(objectId);
     this.confirmedCombatEnemies.add(objectId);
-    this.combatEnemies.set(objectId, { x: record.x, y: record.y });
+    this.enemyOverlay.set(objectId, { x: record.x, y: record.y });
     if (changed) this.touch(false, true);
   }
 
   removeObject(objectId: number): void {
     const record = this.objects.get(objectId);
-    const combatEnemy = this.combatEnemies.has(objectId);
+    const combatEnemy = this.enemyOverlay.has(objectId);
     const removedRecord = this.removeObjectRecord(objectId, false);
     const removedConfirmation = this.confirmedCombatEnemies.delete(objectId);
     const changed = removedRecord || removedConfirmation;
@@ -228,7 +229,7 @@ export class DodgeCollisionWorld {
     const record = this.objects.get(objectId);
     if (!record) return false;
     this.objects.delete(objectId);
-    this.combatEnemies.delete(objectId);
+    this.enemyOverlay.delete(objectId);
     this.adjust(this.enemyOccupyCounts, record.key, record.enemyOccupySquare ? -1 : 0);
     this.adjust(this.projectileCoverCounts, record.key, record.occupySquare ? -1 : 0);
     const revisionBefore = this.staticPassability.getRevision();
@@ -241,8 +242,7 @@ export class DodgeCollisionWorld {
 
   canOccupy(x: number, y: number, safeWalk: boolean, avoidEnemies = true): boolean {
     if (!this.canOccupyStatic(x, y, safeWalk)) return false;
-    return !avoidEnemies
-      || this.enemyClearance(x, y) >= ENEMY_AVOID_RADIUS - DISTANCE_EPSILON;
+    return !avoidEnemies || this.enemyOverlay.satisfiesHardClearance(x, y);
   }
 
   /** Monotonic revision for local-snapshot invalidation. */
@@ -272,7 +272,7 @@ export class DodgeCollisionWorld {
       && Math.abs(center.y - cached.centerY) <= SNAPSHOT_REUSE_PADDING * 0.5;
     if (reusableLayout
       && cached.staticRevision === staticRevision
-      && cached.enemyRevision === this.enemyRevision) {
+      && cached.enemyRevision === this.enemyOverlay.getRevision()) {
       return cached.snapshot;
     }
 
@@ -313,12 +313,13 @@ export class DodgeCollisionWorld {
       }
     }
 
-    const reuseEnemy = reusableLayout && cached.enemyRevision === this.enemyRevision;
+    const reuseEnemy = reusableLayout
+      && cached.enemyRevision === this.enemyOverlay.getRevision();
     const enemyDistance = reuseEnemy
       ? cached.snapshot.enemyDistance
       : new Float32Array(size);
     if (!reuseEnemy) {
-      const enemies = [...this.combatEnemies.values()];
+      const enemies = this.enemyOverlay.copyEnemyPositions();
       if (enemies.length === 0) enemyDistance.fill(Infinity);
       for (let row = 0; row < height && enemies.length > 0; row++) {
         const y = originY + row * safeResolution;
@@ -354,7 +355,7 @@ export class DodgeCollisionWorld {
       centerY: reusableLayout ? cached.centerY : center.y,
       requestedRadius: reusableLayout ? cached.requestedRadius : safeRadius,
       staticRevision,
-      enemyRevision: this.enemyRevision,
+      enemyRevision: this.enemyOverlay.getRevision(),
       snapshot,
     };
     return snapshot;
@@ -368,14 +369,13 @@ export class DodgeCollisionWorld {
     });
   }
 
+  /** Monotonic revision for the combat-enemy overlay (not static passability). */
+  getEnemyRevision(): number {
+    return this.enemyOverlay.getRevision();
+  }
+
   enemyClearance(x: number, y: number): number {
-    let clearance = Infinity;
-    for (const enemy of this.combatEnemies.values()) {
-      const dx = x - enemy.x;
-      const dy = y - enemy.y;
-      clearance = Math.min(clearance, Math.hypot(dx, dy));
-    }
-    return clearance;
+    return this.enemyOverlay.clearanceAt(x, y);
   }
 
   isProjectileSegmentOpen(
@@ -422,7 +422,6 @@ export class DodgeCollisionWorld {
     if (!staticChanged && !enemyChanged) return;
     this.revision++;
     if (staticChanged) this.cachedSnapshot = undefined;
-    if (enemyChanged) this.enemyRevision++;
   }
 }
 

@@ -1,7 +1,14 @@
+import {
+  buildDilatedFullOccupyTiles,
+  buildDilatedObstacleTiles,
+  isBlockedByInflatedPassability,
+  updateDilatedObstacleDirtyRegion,
+} from './inflated-passability';
 import type {
   GridTile,
   StaticObjectPassabilityProfile,
   StaticOccupancyQuery,
+  StaticPassabilityConfig,
   StaticPassabilityDataProvider,
   StaticPassabilityStore,
   StaticTileQuery,
@@ -40,6 +47,7 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
   private height = 0;
   private revision = 0;
   private explorativeUnknown = false;
+  private readonly useInflatedPassability: boolean;
   /** Pathfinding: observed blocking terrain (unknown cells are absent). */
   private readonly blockedTerrain = new Set<string>();
   /** Dodge: observed tile types for unresolved-tile handling. */
@@ -48,8 +56,25 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
   private readonly objectTiles = new Map<number, StoredObjectRecord>();
   private readonly occupyCounts = new Map<string, number>();
   private readonly fullOccupyCounts = new Map<string, number>();
+  /** Rebuilt on each geometry change when inflated passability is enabled (Step 5.2). */
+  private obstacleSources = new Set<string>();
+  private fullOccupySources = new Set<string>();
+  /** Dilated integer-tile grids cached for the current revision. */
+  private dilatedObstacleTiles = new Set<string>();
+  private dilatedFullOccupyTiles = new Set<string>();
+  /** Revision that dilatedObstacleTiles/dilatedFullOccupyTiles were built for. */
+  private inflatedCacheRevision = -1;
 
-  constructor(private readonly data?: StaticPassabilityDataProvider) {}
+  constructor(
+    private readonly data?: StaticPassabilityDataProvider,
+    config?: StaticPassabilityConfig,
+  ) {
+    this.useInflatedPassability = !!config?.useInflatedPassability;
+  }
+
+  isInflatedPassabilityEnabled(): boolean {
+    return this.useInflatedPassability;
+  }
 
   getRevision(): number {
     return this.revision;
@@ -82,6 +107,12 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
   }
 
   isTileStaticallyBlocked(tileX: number, tileY: number, query: StaticTileQuery): boolean {
+    if (this.isBaseTileStaticallyBlocked(tileX, tileY, query)) return true;
+    if (!this.useInflatedPassability) return false;
+    return this.isInflatedBlockedAt(tileX + 0.5, tileY + 0.5);
+  }
+
+  private isBaseTileStaticallyBlocked(tileX: number, tileY: number, query: StaticTileQuery): boolean {
     if (tilesEqual(query.exemptTile, tileX, tileY)) return false;
     if (!this.inBounds(tileX, tileY)) return true;
 
@@ -101,6 +132,100 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
       return true;
     }
     return (this.occupyCounts.get(key) ?? 0) > 0;
+  }
+
+  private isInflatedBlockedAt(px: number, py: number): boolean {
+    if (this.inflatedCacheRevision === this.revision
+      && this.width > 0
+      && this.height > 0
+      && px === Math.floor(px) + 0.5
+      && py === Math.floor(py) + 0.5) {
+      const key = tileKey(Math.floor(px), Math.floor(py));
+      return this.dilatedObstacleTiles.has(key) || this.dilatedFullOccupyTiles.has(key);
+    }
+    return isBlockedByInflatedPassability(
+      px,
+      py,
+      this.obstacleSources,
+      this.fullOccupySources,
+    );
+  }
+
+  private rebuildObstacleSources(): void {
+    this.obstacleSources = this.collectObstacleTiles();
+  }
+
+  private rebuildFullOccupySources(): void {
+    this.fullOccupySources = this.collectFullOccupyTiles();
+  }
+
+  private rebuildInflatedPassabilityFull(): void {
+    this.rebuildObstacleSources();
+    this.rebuildFullOccupySources();
+    this.dilatedObstacleTiles = buildDilatedObstacleTiles(
+      this.obstacleSources,
+      this.width,
+      this.height,
+    );
+    this.dilatedFullOccupyTiles = buildDilatedFullOccupyTiles(
+      this.fullOccupySources,
+      this.width,
+      this.height,
+    );
+    this.inflatedCacheRevision = this.revision;
+  }
+
+  private incrementalLearnedBlockInflation(tileX: number, tileY: number): void {
+    this.obstacleSources.add(tileKey(tileX, tileY));
+    updateDilatedObstacleDirtyRegion(
+      this.dilatedObstacleTiles,
+      this.obstacleSources,
+      tileX,
+      tileY,
+      this.width,
+      this.height,
+    );
+    this.inflatedCacheRevision = this.revision;
+  }
+
+  private syncInflatedCacheRevision(): void {
+    if (!this.useInflatedPassability) return;
+    this.inflatedCacheRevision = this.revision;
+  }
+
+  private clearInflatedPassabilityCache(): void {
+    this.obstacleSources.clear();
+    this.fullOccupySources.clear();
+    this.dilatedObstacleTiles.clear();
+    this.dilatedFullOccupyTiles.clear();
+    this.inflatedCacheRevision = -1;
+  }
+
+  private touchInflatedPassabilityFull(): void {
+    if (!this.useInflatedPassability) return;
+    this.rebuildInflatedPassabilityFull();
+  }
+
+  private collectObstacleTiles(): Set<string> {
+    const obstacles = new Set<string>();
+    for (const key of this.blockedTerrain) obstacles.add(key);
+    for (const key of this.learnedBlocked) obstacles.add(key);
+    for (const [key, count] of this.occupyCounts) {
+      if (count > 0) obstacles.add(key);
+    }
+    return obstacles;
+  }
+
+  private collectFullOccupyTiles(): Set<string> {
+    const fullOccupy = new Set<string>();
+    for (const [key, count] of this.fullOccupyCounts) {
+      if (count > 0) fullOccupy.add(key);
+    }
+    return fullOccupy;
+  }
+
+  private touchInflatedSources(): void {
+    this.touchInflatedPassabilityFull();
   }
 
   // TEMPORARY SCAFFOLDING FOR COMMIT 5 — to be deleted.
@@ -140,7 +265,11 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
   canOccupyAt(x: number, y: number, query: StaticOccupancyQuery): boolean {
     const tileX = Math.floor(x);
     const tileY = Math.floor(y);
-    if (this.isTileStaticallyBlocked(tileX, tileY, query)) return false;
+    if (this.isBaseTileStaticallyBlocked(tileX, tileY, query)) return false;
+
+    if (this.useInflatedPassability) {
+      return !this.isInflatedBlockedAt(x, y);
+    }
 
     if (query.checkFullOccupyNeighbors === false) return true;
 
@@ -177,7 +306,9 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
     this.objectTiles.clear();
     this.occupyCounts.clear();
     this.fullOccupyCounts.clear();
+    this.clearInflatedPassabilityCache();
     this.revision++;
+    this.touchInflatedPassabilityFull();
   }
 
   setMapBounds(width: number, height: number): void {
@@ -187,6 +318,7 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
     this.width = nextWidth;
     this.height = nextHeight;
     this.revision++;
+    this.touchInflatedSources();
   }
 
   observeTile(x: number, y: number, tileType: number): void {
@@ -205,13 +337,19 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
       changed = true;
     }
 
-    if (changed) this.revision++;
+    if (changed) {
+      this.revision++;
+      this.touchInflatedSources();
+    }
   }
 
   markLearnedBlocked(tileX: number, tileY: number): boolean {
     const key = tileKey(Math.floor(tileX), Math.floor(tileY));
     if (!addToSet(this.learnedBlocked, key)) return false;
     this.revision++;
+    if (this.useInflatedPassability) {
+      this.incrementalLearnedBlockInflation(Math.floor(tileX), Math.floor(tileY));
+    }
     return true;
   }
 
@@ -219,6 +357,7 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
     if (this.explorativeUnknown === enabled) return;
     this.explorativeUnknown = enabled;
     this.revision++;
+    this.syncInflatedCacheRevision();
   }
 
   upsertObject(
@@ -254,7 +393,10 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
     }
 
     if (!occupySquare && !fullOccupy) {
-      if (changed) this.revision++;
+      if (changed) {
+        this.revision++;
+        this.touchInflatedSources();
+      }
       return;
     }
 
@@ -267,11 +409,17 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
       this.adjustCount(this.fullOccupyCounts, key, 1);
       changed = true;
     }
-    if (changed) this.revision++;
+    if (changed) {
+      this.revision++;
+      this.touchInflatedSources();
+    }
   }
 
   removeObject(objectId: number): void {
-    if (this.removeObjectRecord(objectId)) this.revision++;
+    if (this.removeObjectRecord(objectId)) {
+      this.revision++;
+      this.touchInflatedSources();
+    }
   }
 
   private removeObjectRecord(objectId: number): boolean {
@@ -289,10 +437,26 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
     if (count > 0) counts.set(key, count);
     else counts.delete(key);
   }
+
+  /** @internal Step 5.2 test helper — revision the dilated cache was built for. */
+  getInflatedCacheRevisionForTest(): number {
+    return this.inflatedCacheRevision;
+  }
+
+  /** @internal Step 5.2 test helper — copy of dilated obstacle tile keys. */
+  getDilatedObstacleTilesForTest(): ReadonlySet<string> {
+    return this.dilatedObstacleTiles;
+  }
+
+  /** @internal Step 5.2 test helper — copy of dilated fullOccupy tile keys. */
+  getDilatedFullOccupyTilesForTest(): ReadonlySet<string> {
+    return this.dilatedFullOccupyTiles;
+  }
 }
 
 export function createStaticPassabilityStore(
   data?: StaticPassabilityDataProvider,
+  config?: StaticPassabilityConfig,
 ): StaticPassabilityStore {
-  return new StaticPassabilityStoreImpl(data);
+  return new StaticPassabilityStoreImpl(data, config);
 }

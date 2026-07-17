@@ -14,6 +14,7 @@ import {
   type CombatRangeDodgeIntent,
   type DodgeMovementIntent,
 } from './dodge-movement-intent';
+import { isStaticSegmentSupercoverOpen, segmentOccupancySampleInTile } from './static-segment-validation';
 
 export interface DodgePlanningEnvironment {
   canOccupy(x: number, y: number, safeWalk: boolean, avoidEnemies?: boolean): boolean;
@@ -1426,6 +1427,17 @@ export class SpaceTimeDodgePlanner {
     to: { x: number; y: number },
     startEnemyDistance: number,
   ): boolean {
+    const isTileBlocked = (
+      tileX: number,
+      tileY: number,
+      segmentFrom: { x: number; y: number },
+      segmentTo: { x: number; y: number },
+    ): boolean => {
+      const sample = segmentOccupancySampleInTile(segmentFrom, segmentTo, tileX, tileY);
+      return context.collision.blocked(sample.x, sample.y);
+    };
+    if (!isStaticSegmentSupercoverOpen(from, to, isTileBlocked)) return false;
+
     const travel = distance(from, to);
     const steps = Math.max(1, Math.ceil(travel / (context.collision.resolution * 0.5)));
     let previousEnemyDistance = startEnemyDistance;
@@ -1433,7 +1445,6 @@ export class SpaceTimeDodgePlanner {
       const ratio = step / steps;
       const x = from.x + (to.x - from.x) * ratio;
       const y = from.y + (to.y - from.y) * ratio;
-      if (context.collision.blocked(x, y)) return false;
       const enemyDistance = context.collision.enemyDistance(x, y);
       if (startEnemyDistance >= ENEMY_AVOID_RADIUS
         ? enemyDistance < ENEMY_AVOID_RADIUS

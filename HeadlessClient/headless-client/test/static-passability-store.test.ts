@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { DodgeCollisionWorld } from '../src/dodge-collision-world';
 import { ExplorativePathfinder } from '../src/explorative-pathfinder';
-import { createStaticPassabilityStore } from '../src/static-passability-store';
+import { createStaticPassabilityStore, StaticPassabilityStoreImpl } from '../src/static-passability-store';
+import {
+  FULL_OCCUPY_INFLATION_CLEARANCE,
+  INFLATED_PLAYER_RADIUS,
+} from '../src/inflated-passability';
 import type { StaticPassabilityDataProvider } from '../src/static-passability-model';
 import { GOLDEN_PATHFINDING_CASES } from './fixtures/golden-pathfinding-cases';
 import {
@@ -284,4 +288,169 @@ test('dual predicates expose known A* vs dodge disagreements for Commit 5', () =
   assert.equal(store.isTileBlockedForPathfinding(3, 3), false);
   assert.equal(store.canOccupyForPathfindingAt(3.25, 3.5), true);
   assert.equal(store.canOccupyForDodgeAt(3.25, 3.5, { safeWalk: true }), false);
+});
+
+test('inflated passability blocks cells within playerRadius of obstacles when flag is on', () => {
+  const store = createStaticPassabilityStore(testData, { useInflatedPassability: true });
+  store.setMapBounds(8, 8);
+  store.observeTile(3, 2, PATHFINDING_MAP_TERRAIN.WALKABLE);
+  store.observeTile(4, 2, PATHFINDING_MAP_TERRAIN.WALKABLE);
+  store.observeTile(5, 2, PATHFINDING_MAP_TERRAIN.BLOCKING);
+
+  assert.equal(
+    store.isTileStaticallyBlocked(4, 2, { consumer: 'pathfinding' }),
+    true,
+    'tile adjacent to blocking terrain is inflated-blocked',
+  );
+  assert.equal(
+    store.isTileStaticallyBlocked(3, 2, { consumer: 'pathfinding' }),
+    false,
+    'tile two steps from wall remains passable',
+  );
+  assert.equal(
+    store.canOccupyAt(4.5, 2.5, { consumer: 'dodge', safeWalk: true }),
+    false,
+    'dodge center on inflated tile is rejected',
+  );
+  assert.equal(
+    store.canOccupyAt(3.5, 2.5, { consumer: 'dodge', safeWalk: true }),
+    true,
+    'dodge center two tiles from wall remains open',
+  );
+});
+
+test('inflated passability blocks fullOccupy neighbors with playerRadius + clearance when flag is on', () => {
+  const store = createStaticPassabilityStore(testData, { useInflatedPassability: true });
+  store.setMapBounds(8, 8);
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++) {
+      store.observeTile(x, y, PATHFINDING_MAP_TERRAIN.WALKABLE);
+    }
+  }
+  store.upsertObject(1, 999, 4.5, 4.5, { occupySquare: false, fullOccupy: true });
+
+  assert.equal(
+    store.isTileStaticallyBlocked(4, 4, { consumer: 'pathfinding' }),
+    false,
+    'fullOccupy source tile stays base-walkable',
+  );
+  assert.equal(
+    store.isTileStaticallyBlocked(3, 4, { consumer: 'pathfinding' }),
+    true,
+    'tile west of fullOccupy is inflated-blocked',
+  );
+  assert.equal(
+    store.canOccupyAt(4.5, 4.5, { consumer: 'dodge', safeWalk: true }),
+    true,
+    'player center on fullOccupy tile remains allowed',
+  );
+  assert.equal(
+    store.canOccupyAt(3.75, 4.5, { consumer: 'dodge', safeWalk: true }),
+    false,
+    'fractional position toward fullOccupy neighbor is rejected',
+  );
+  assert.equal(INFLATED_PLAYER_RADIUS + FULL_OCCUPY_INFLATION_CLEARANCE, 1.0);
+});
+
+function asInflatedStoreImpl(
+  store: ReturnType<typeof createStaticPassabilityStore>,
+): StaticPassabilityStoreImpl {
+  return store as unknown as StaticPassabilityStoreImpl;
+}
+
+function collectInflatedTileBlockage(
+  store: ReturnType<typeof createStaticPassabilityStore>,
+): boolean[][] {
+  const width = store.getWidth();
+  const height = store.getHeight();
+  const grid: boolean[][] = [];
+  for (let y = 0; y < height; y++) {
+    grid[y] = [];
+    for (let x = 0; x < width; x++) {
+      grid[y][x] = store.isTileStaticallyBlocked(x, y, { consumer: 'pathfinding' });
+    }
+  }
+  return grid;
+}
+
+function gridsEqual(a: boolean[][], b: boolean[][]): boolean {
+  if (a.length !== b.length) return false;
+  for (let y = 0; y < a.length; y++) {
+    if (a[y].length !== b[y].length) return false;
+    for (let x = 0; x < a[y].length; x++) {
+      if (a[y][x] !== b[y][x]) return false;
+    }
+  }
+  return true;
+}
+
+test('incremental learned-block dilation matches full recompute when inflated flag is on', () => {
+  const incremental = createStaticPassabilityStore(testData, { useInflatedPassability: true });
+  incremental.setMapBounds(8, 8);
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++) {
+      incremental.observeTile(x, y, PATHFINDING_MAP_TERRAIN.WALKABLE);
+    }
+  }
+  incremental.observeTile(5, 2, PATHFINDING_MAP_TERRAIN.BLOCKING);
+  incremental.upsertObject(1, 999, 4.5, 4.5, { occupySquare: false, fullOccupy: true });
+
+  const learnedBlocks = [
+    { x: 6, y: 2 },
+    { x: 1, y: 7 },
+    { x: 3, y: 3 },
+  ];
+  for (const block of learnedBlocks) {
+    incremental.markLearnedBlocked(block.x, block.y);
+    assert.equal(
+      asInflatedStoreImpl(incremental).getInflatedCacheRevisionForTest(),
+      incremental.getRevision(),
+      `cache revision after learned block (${block.x},${block.y})`,
+    );
+  }
+
+  const full = createStaticPassabilityStore(testData, { useInflatedPassability: true });
+  full.setMapBounds(8, 8);
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++) {
+      full.observeTile(x, y, PATHFINDING_MAP_TERRAIN.WALKABLE);
+    }
+  }
+  full.observeTile(5, 2, PATHFINDING_MAP_TERRAIN.BLOCKING);
+  full.upsertObject(1, 999, 4.5, 4.5, { occupySquare: false, fullOccupy: true });
+  for (const block of learnedBlocks) {
+    full.markLearnedBlocked(block.x, block.y);
+  }
+
+  assert.ok(
+    gridsEqual(collectInflatedTileBlockage(incremental), collectInflatedTileBlockage(full)),
+    'incremental learned-block updates match full rebuild',
+  );
+});
+
+test('terrain and object mutators fully rebuild inflated cache for new revision', () => {
+  const store = createStaticPassabilityStore(testData, { useInflatedPassability: true });
+  store.setMapBounds(8, 8);
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++) {
+      store.observeTile(x, y, PATHFINDING_MAP_TERRAIN.WALKABLE);
+    }
+  }
+
+  const impl = asInflatedStoreImpl(store);
+  const revisionAfterTerrain = store.getRevision();
+  assert.equal(impl.getInflatedCacheRevisionForTest(), revisionAfterTerrain);
+
+  store.observeTile(5, 2, PATHFINDING_MAP_TERRAIN.BLOCKING);
+  assert.equal(store.getRevision(), revisionAfterTerrain + 1);
+  assert.equal(impl.getInflatedCacheRevisionForTest(), store.getRevision());
+  assert.equal(impl.getDilatedObstacleTilesForTest().has('4,2'), true);
+
+  store.upsertObject(1, 999, 4.5, 4.5, { occupySquare: false, fullOccupy: true });
+  assert.equal(impl.getInflatedCacheRevisionForTest(), store.getRevision());
+  assert.equal(impl.getDilatedFullOccupyTilesForTest().has('3,4'), true);
+
+  store.setExplorativeUnknown(true);
+  assert.equal(impl.getInflatedCacheRevisionForTest(), store.getRevision());
+  assert.equal(impl.getDilatedFullOccupyTilesForTest().has('3,4'), true);
 });

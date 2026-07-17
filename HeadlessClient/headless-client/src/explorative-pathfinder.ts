@@ -1,11 +1,17 @@
 import {
   ENEMY_AVOID_RADIUS,
-  isEnemyProximityThreat,
-  staticMovementProfile,
-} from './dodge-collision-world';
+  EnemyClearanceOverlay,
+  pointViolatesCircularExclusion,
+  segmentClearsCircle,
+} from './enemy-clearance-overlay';
+import { isEnemyProximityThreat, staticMovementProfile } from './dodge-collision-world';
 import type { DodgeMovementIntentId } from './dodge-movement-intent';
-import type { StaticPassabilityStore } from './static-passability-model';
+import {
+  PASSABILITY_SCHEMA_VERSION,
+  type StaticPassabilityStore,
+} from './static-passability-model';
 import { createStaticPassabilityStore } from './static-passability-store';
+import { traceStaticSegmentSupercover } from './static-segment-validation';
 
 export interface PathfindingDataProvider {
   getObject(type: number): {
@@ -67,13 +73,11 @@ interface PlannedPath {
   revision: number;
 }
 
-/** Bumped in Commit 5 so stale no-path cache entries self-invalidate. */
-const NO_PATH_CACHE_SCHEMA_VERSION = 1;
-
 interface NoPathCacheEntry {
   startKey: string;
   goalCell: GridPoint;
   mapVersion: number;
+  /** Must match {@link PASSABILITY_SCHEMA_VERSION} or the entry is ignored. */
   schemaVersion: number;
 }
 
@@ -124,9 +128,9 @@ const DIRECTIONS: ReadonlyArray<readonly [number, number, number]> = [
  */
 export class ExplorativePathfinder {
   private readonly staticPassability: StaticPassabilityStore;
+  private readonly enemyOverlay = new EnemyClearanceOverlay();
   private readonly enemyCandidates = new Map<number, PathPoint>();
   private readonly confirmedCombatEnemies = new Set<number>();
-  private readonly combatEnemies = new Map<number, PathPoint>();
   private target: PathTarget | undefined;
   private combatRange: CombatPathfindingRange | undefined;
   private goalId: DodgeMovementIntentId | undefined;
@@ -161,9 +165,9 @@ export class ExplorativePathfinder {
 
   resetMap(): void {
     this.staticPassability.reset();
+    this.enemyOverlay.reset();
     this.enemyCandidates.clear();
     this.confirmedCombatEnemies.clear();
-    this.combatEnemies.clear();
     this.clearTarget();
     this.revision++;
   }
@@ -199,8 +203,10 @@ export class ExplorativePathfinder {
       || this.combatRange !== undefined
       || distance(this.target, target) >= GOAL_MATERIAL_CHANGE_DISTANCE
       || Math.abs(this.target.threshold - threshold) > GOAL_THRESHOLD_CHANGE_TOLERANCE;
+    const previousCombatTargetId = this.combatTargetId;
     this.combatRange = undefined;
     this.combatTargetId = undefined;
+    if (this.syncPrimaryEnemyOverlay(previousCombatTargetId, undefined)) this.invalidate();
     this.goalId = goalId;
     this.target = { x: target.x, y: target.y, threshold };
     if (routeChanged) this.clearPlan();
@@ -228,20 +234,24 @@ export class ExplorativePathfinder {
       && sameCombatRange(this.combatRange, range)
       && sameCombatIdentity(this.combatTargetId, targetId, this.target, target);
     if (!sameLogicalIntent) this.logicalIntentRevision++;
+    const previousCombatTargetId = this.combatTargetId;
     this.target = { x: target.x, y: target.y, threshold: INTERMEDIATE_THRESHOLD };
     this.combatRange = { ...range };
     this.goalId = undefined;
     this.combatTargetId = targetId;
+    if (this.syncPrimaryEnemyOverlay(previousCombatTargetId, targetId)) this.invalidate();
     this.clearPlan();
     return true;
   }
 
   clearTarget(): void {
     if (this.target) this.logicalIntentRevision++;
+    const previousCombatTargetId = this.combatTargetId;
     this.target = undefined;
     this.combatRange = undefined;
     this.goalId = undefined;
     this.combatTargetId = undefined;
+    if (this.syncPrimaryEnemyOverlay(previousCombatTargetId, undefined)) this.invalidate();
     this.clearPlan();
   }
 
@@ -258,6 +268,11 @@ export class ExplorativePathfinder {
       logicalRevision: this.logicalIntentRevision,
       routeRevision: this.routeRevision,
     };
+  }
+
+  /** Combat-enemy overlay revision; independent of static passability mapVersion. */
+  getEnemyRevision(): number {
+    return this.enemyOverlay.getRevision();
   }
 
   /** Passability revision bumped by terrain, objects, learned blocks, and map resets. */
@@ -299,14 +314,14 @@ export class ExplorativePathfinder {
     );
     let changed = this.staticPassability.getRevision() !== revisionBefore;
 
-    const oldEnemy = this.combatEnemies.get(objectId);
+    const oldEnemy = this.enemyOverlay.get(objectId);
     const enemyCandidate = !!definition?.isEnemy;
     if (!enemyCandidate) {
       this.enemyCandidates.delete(objectId);
       this.confirmedCombatEnemies.delete(objectId);
       if (oldEnemy) {
-        this.combatEnemies.delete(objectId);
-        changed = changed || !!this.combatRange;
+        const removed = this.enemyOverlay.delete(objectId);
+        changed = changed || (removed && !!this.combatRange);
       }
     } else {
       this.enemyCandidates.set(objectId, { x, y });
@@ -314,13 +329,18 @@ export class ExplorativePathfinder {
         || this.confirmedCombatEnemies.has(objectId);
       if (!isCombatThreat) {
         if (oldEnemy) {
-          this.combatEnemies.delete(objectId);
-          changed = changed || !!this.combatRange;
+          const removed = this.enemyOverlay.delete(objectId);
+          changed = changed || (removed && !!this.combatRange);
+        }
+      } else if (objectId === this.combatTargetId) {
+        if (oldEnemy) {
+          const removed = this.enemyOverlay.delete(objectId);
+          changed = changed || (removed && !!this.combatRange);
         }
       } else if (!oldEnemy || !this.combatRange
         || distance(oldEnemy, { x, y }) >= ENEMY_POSITION_REPLAN_DISTANCE) {
-        this.combatEnemies.set(objectId, { x, y });
-        changed = changed || !!this.combatRange;
+        const updated = this.enemyOverlay.set(objectId, { x, y });
+        changed = changed || (updated && !!this.combatRange);
       }
     }
 
@@ -333,7 +353,7 @@ export class ExplorativePathfinder {
     let changed = this.staticPassability.getRevision() !== revisionBefore;
     this.enemyCandidates.delete(objectId);
     this.confirmedCombatEnemies.delete(objectId);
-    if (this.combatEnemies.delete(objectId) && this.combatRange) changed = true;
+    if (this.enemyOverlay.delete(objectId) && this.combatRange) changed = true;
     if (changed) this.invalidate();
   }
 
@@ -342,8 +362,8 @@ export class ExplorativePathfinder {
     const enemy = this.enemyCandidates.get(objectId);
     if (!enemy) return;
     this.confirmedCombatEnemies.add(objectId);
-    if (this.combatEnemies.has(objectId)) return;
-    this.combatEnemies.set(objectId, { ...enemy });
+    if (objectId === this.combatTargetId || this.enemyOverlay.has(objectId)) return;
+    this.enemyOverlay.set(objectId, { ...enemy });
     if (this.combatRange) this.invalidate();
   }
 
@@ -736,57 +756,12 @@ export class ExplorativePathfinder {
    * both neighboring cells to be open, matching A*'s no-corner-cutting rule.
    */
   private traceSegment(from: PathPoint, to: PathPoint, start: GridPoint): SegmentTrace | undefined {
-    let cellX = Math.floor(from.x);
-    let cellY = Math.floor(from.y);
-    const endX = Math.floor(to.x);
-    const endY = Math.floor(to.y);
-    if (this.isPathBlocked(cellX, cellY, start) || !this.segmentAvoidsCombatEnemies(from, to)) {
-      return undefined;
-    }
-
-    const travelTiles: GridPoint[] = [{ x: cellX, y: cellY }];
-    const corridorTiles: GridPoint[] = [{ x: cellX, y: cellY }];
-    const dx = to.x - from.x;
-    const dy = to.y - from.y;
-    const stepX = Math.sign(dx);
-    const stepY = Math.sign(dy);
-    const tDeltaX = stepX === 0 ? Infinity : Math.abs(1 / dx);
-    const tDeltaY = stepY === 0 ? Infinity : Math.abs(1 / dy);
-    let tMaxX = stepX > 0
-      ? (cellX + 1 - from.x) / dx
-      : stepX < 0 ? (from.x - cellX) / -dx : Infinity;
-    let tMaxY = stepY > 0
-      ? (cellY + 1 - from.y) / dy
-      : stepY < 0 ? (from.y - cellY) / -dy : Infinity;
-
-    while (cellX !== endX || cellY !== endY) {
-      if (Math.abs(tMaxX - tMaxY) <= 1e-10) {
-        const sideX = { x: cellX + stepX, y: cellY };
-        const sideY = { x: cellX, y: cellY + stepY };
-        if (this.isPathBlocked(sideX.x, sideX.y, start)
-          || this.isPathBlocked(sideY.x, sideY.y, start)) {
-          return undefined;
-        }
-        corridorTiles.push(sideX, sideY);
-        cellX += stepX;
-        cellY += stepY;
-        tMaxX += tDeltaX;
-        tMaxY += tDeltaY;
-      } else if (tMaxX < tMaxY) {
-        cellX += stepX;
-        tMaxX += tDeltaX;
-      } else {
-        cellY += stepY;
-        tMaxY += tDeltaY;
-      }
-
-      if (this.isPathBlocked(cellX, cellY, start)) return undefined;
-      const point = { x: cellX, y: cellY };
-      travelTiles.push(point);
-      corridorTiles.push(point);
-    }
-
-    return { travelTiles, corridorTiles };
+    if (!this.segmentAvoidsCombatEnemies(from, to)) return undefined;
+    return traceStaticSegmentSupercover(
+      from,
+      to,
+      (tileX, tileY) => this.isPathBlocked(tileX, tileY, start),
+    );
   }
 
   private nearbyGoals(goal: GridPoint, start: GridPoint, radius: number): GridPoint[] {
@@ -908,22 +883,16 @@ export class ExplorativePathfinder {
     if (!this.combatRange || !this.target || start && x === start.x && y === start.y) return false;
     const point = tileCenter({ x, y });
     const startPoint = start ? tileCenter(start) : undefined;
-    if (violatesExclusion(point, this.target, this.combatRange.minimumDistance, startPoint)) {
+    if (pointViolatesCircularExclusion(point, this.target, this.combatRange.minimumDistance, startPoint)) {
       return true;
     }
-    for (const enemy of this.combatEnemies.values()) {
-      if (violatesExclusion(point, enemy, ENEMY_AVOID_RADIUS, startPoint)) return true;
-    }
-    return false;
+    return this.enemyOverlay.tileCenterViolatesHardClearance(x, y, startPoint);
   }
 
   private segmentAvoidsCombatEnemies(from: PathPoint, to: PathPoint): boolean {
     if (!this.combatRange || !this.target) return true;
     if (!segmentClearsCircle(from, to, this.target, this.combatRange.minimumDistance)) return false;
-    for (const enemy of this.combatEnemies.values()) {
-      if (!segmentClearsCircle(from, to, enemy, ENEMY_AVOID_RADIUS)) return false;
-    }
-    return true;
+    return this.enemyOverlay.segmentAvoidsHardClearance(from, to);
   }
 
   private inBounds(x: number, y: number): boolean {
@@ -932,6 +901,25 @@ export class ExplorativePathfinder {
 
   private invalidate(): void {
     this.revision++;
+  }
+
+  /** Primary combat targets use combatRange; overlay tracks other threats only. */
+  private syncPrimaryEnemyOverlay(
+    previousId: number | undefined,
+    nextId: number | undefined,
+  ): boolean {
+    let changed = false;
+    if (previousId !== undefined && previousId > 0 && previousId !== nextId
+      && this.confirmedCombatEnemies.has(previousId)) {
+      const candidate = this.enemyCandidates.get(previousId);
+      if (candidate) {
+        changed = this.enemyOverlay.set(previousId, { ...candidate }) || changed;
+      }
+    }
+    if (nextId !== undefined && nextId > 0) {
+      changed = this.enemyOverlay.delete(nextId) || changed;
+    }
+    return changed;
   }
 
   private resolveGoalCell(target: PathTarget): GridPoint {
@@ -945,7 +933,7 @@ export class ExplorativePathfinder {
       && cache.goalCell.x === goalCell.x
       && cache.goalCell.y === goalCell.y
       && cache.mapVersion === this.revision
-      && cache.schemaVersion === NO_PATH_CACHE_SCHEMA_VERSION;
+      && cache.schemaVersion === PASSABILITY_SCHEMA_VERSION;
   }
 
   private writeNoPathCache(startKey: string, goalCell: GridPoint): void {
@@ -953,7 +941,7 @@ export class ExplorativePathfinder {
       startKey,
       goalCell: { ...goalCell },
       mapVersion: this.revision,
-      schemaVersion: NO_PATH_CACHE_SCHEMA_VERSION,
+      schemaVersion: PASSABILITY_SCHEMA_VERSION,
     };
   }
 
@@ -1337,50 +1325,5 @@ function withinCombatRange(
 ): boolean {
   const targetDistance = distance(position, target);
   return targetDistance >= range.minimumDistance && targetDistance <= range.maximumDistance;
-}
-
-function segmentClearsCircle(
-  from: PathPoint,
-  to: PathPoint,
-  center: PathPoint,
-  radius: number,
-): boolean {
-  const dx = to.x - from.x;
-  const dy = to.y - from.y;
-  const lengthSquared = dx * dx + dy * dy;
-  const fromX = from.x - center.x;
-  const fromY = from.y - center.y;
-  const fromDistanceSquared = fromX * fromX + fromY * fromY;
-  const radiusSquared = radius * radius;
-  if (lengthSquared <= DISTANCE_EPSILON) {
-    return fromDistanceSquared >= radiusSquared - DISTANCE_EPSILON;
-  }
-
-  const projection = -(fromX * dx + fromY * dy) / lengthSquared;
-  const toX = to.x - center.x;
-  const toY = to.y - center.y;
-  const toDistanceSquared = toX * toX + toY * toY;
-  if (fromDistanceSquared < radiusSquared - DISTANCE_EPSILON) {
-    return projection <= 0 && toDistanceSquared > fromDistanceSquared;
-  }
-
-  const closest = Math.max(0, Math.min(1, projection));
-  const closestX = fromX + dx * closest;
-  const closestY = fromY + dy * closest;
-  return closestX * closestX + closestY * closestY >= radiusSquared - DISTANCE_EPSILON;
-}
-
-function violatesExclusion(
-  point: PathPoint,
-  center: PathPoint,
-  radius: number,
-  start: PathPoint | undefined,
-): boolean {
-  const pointDistance = distance(point, center);
-  if (pointDistance >= radius - DISTANCE_EPSILON) return false;
-  if (!start) return true;
-  const startDistance = distance(start, center);
-  return startDistance >= radius - DISTANCE_EPSILON
-    || pointDistance <= startDistance + DISTANCE_EPSILON;
 }
 
