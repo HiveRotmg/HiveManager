@@ -37,7 +37,9 @@ const PROJECTILE_DEFINITION: CombatProjectileDefinition = {
 
 const OPEN_ENVIRONMENT: DodgePlanningEnvironment = {
   canOccupy: () => true,
+  enemyClearance: () => Infinity,
   isProjectileSegmentOpen: () => true,
+  getRevision: () => 0,
 };
 
 test('1. projectile-free planning follows the global pathfinding intent', () => {
@@ -83,6 +85,7 @@ test('goal mode passes a combat enemy without combat-range attraction', () => {
       canOccupy: () => true,
       enemyClearance: (x, y) => Math.hypot(x - enemy.x, y - enemy.y),
       isProjectileSegmentOpen: () => true,
+      getRevision: () => 0,
     },
   }));
 
@@ -356,6 +359,7 @@ test('9. enemy hard-radius exclusion invalidates otherwise direct movement', () 
       canOccupy: () => true,
       enemyClearance: (x, y) => Math.hypot(x - enemy.x, y - enemy.y),
       isProjectileSegmentOpen: () => true,
+      getRevision: () => 0,
     },
   }));
 
@@ -370,6 +374,7 @@ test('10. nonlinear enemy soft cost keeps the route off the hard boundary', () =
       canOccupy: () => true,
       enemyClearance: (x, y) => Math.hypot(x - enemy.x, y - enemy.y),
       isProjectileSegmentOpen: () => true,
+      getRevision: () => 0,
     },
   }));
 
@@ -660,6 +665,8 @@ test('21. no valid trajectory produces a finite controlled stop', () => {
     environment: {
       canOccupy: () => false,
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   }));
 
@@ -818,6 +825,8 @@ function timedCorridorInput(): DodgePlanningInput {
     environment: {
       canOccupy: (_x, y) => Math.abs(y - 5) < 0.03,
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   });
 }
@@ -833,6 +842,8 @@ function retreatInput(): DodgePlanningInput {
     environment: {
       canOccupy: (x, y) => x >= 0 && x <= 12 && Math.abs(y - 5) < 0.03,
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   });
 }
@@ -853,6 +864,8 @@ function emergencyJumpInput(): DodgePlanningInput & {
     environment: {
       canOccupy: (x, y) => x >= 0 && x <= 12 && Math.abs(y - 5) < 0.03,
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   });
 }

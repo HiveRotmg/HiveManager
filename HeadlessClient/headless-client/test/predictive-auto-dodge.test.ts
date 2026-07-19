@@ -7,10 +7,10 @@ import type {
 } from '../src/combat-tracker';
 import { DodgeCollisionWorld, ENEMY_AVOID_RADIUS } from '../src/dodge-collision-world';
 import { MovementController } from '../src/movement-controller';
+import type { DodgePlanningEnvironment } from '../src/dodge-trajectory-planner';
 import {
   PredictiveAutoDodgeController,
   ThrownAoeTracker,
-  type AutoDodgeEnvironment,
 } from '../src/predictive-auto-dodge';
 
 const definition: CombatProjectileDefinition = {
@@ -29,9 +29,11 @@ const definition: CombatProjectileDefinition = {
   speedClamp: -1,
 };
 
-const openEnvironment: AutoDodgeEnvironment = {
+const openEnvironment: DodgePlanningEnvironment = {
   canOccupy: () => true,
+  enemyClearance: () => Infinity,
   isProjectileSegmentOpen: () => true,
+  getRevision: () => 0,
 };
 
 test('predictive auto-dodge escapes an imminent projectile from standstill', () => {
@@ -229,6 +231,8 @@ test('projectile jump remains unused while a legal continuous trajectory survive
     environment: {
       canOccupy: (_x, y) => y >= 5,
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   });
 
@@ -737,6 +741,8 @@ test('goal-owned dodge stops instead of bypassing local collision when no route 
     environment: {
       canOccupy: () => false,
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   });
 
@@ -761,6 +767,8 @@ test('goal-blocked dodge throttles repeated searches while the collision snapsho
     environment: {
       canOccupy: () => false,
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   });
 
@@ -795,6 +803,8 @@ test('goal-owned dodge can leave an occupied starting tile accepted by global pa
     environment: {
       canOccupy: (x, y) => Math.floor(x) !== 5 || Math.floor(y) !== 5,
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   });
 
@@ -878,6 +888,8 @@ test('time-layered danger search uses non-cardinal vectors in a narrow angular r
       canOccupy: (x, y) => x >= 6.5
         || x >= 5 && Math.abs(y - (5 + (x - 5) * slope)) <= 0.03,
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   });
 
@@ -937,6 +949,8 @@ test('goal path searches around threats without crossing static collision', () =
         return y >= 5;
       },
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   });
 
@@ -964,6 +978,7 @@ test('goal path arcs around an enemy exclusion circle while advancing', () => {
       canOccupy: () => true,
       enemyClearance: (x, y) => Math.hypot(x - enemy.x, y - enemy.y),
       isProjectileSegmentOpen: () => true,
+      getRevision: () => 0,
     },
   });
 
@@ -1035,6 +1050,7 @@ test('predictive auto-dodge may cross an enemy buffer when it is the safe escape
       },
       enemyClearance: () => 0.5,
       isProjectileSegmentOpen: () => true,
+      getRevision: () => 0,
     },
   });
 
@@ -1057,6 +1073,8 @@ test('predictive auto-dodge prefers a broad safe corridor over an isolated direc
     environment: {
       canOccupy: (x, y) => x <= 5 || Math.abs(y - 5) < 1e-8,
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   });
 

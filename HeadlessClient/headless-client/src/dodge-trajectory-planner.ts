@@ -18,7 +18,13 @@ import { isStaticSegmentSupercoverOpen, segmentOccupancySampleInTile } from './s
 
 export interface DodgePlanningEnvironment {
   canOccupy(x: number, y: number, safeWalk: boolean, avoidEnemies?: boolean): boolean;
-  enemyClearance?(x: number, y: number): number;
+  /**
+   * Required. Return `Infinity` when there are no enemies within reach. Making
+   * this optional silently disabled enemy avoidance when a consumer forgot to
+   * implement it — every candidate passed both the hard reject and the soft
+   * cost, and the player walked onto combat enemies unopposed.
+   */
+  enemyClearance(x: number, y: number): number;
   isProjectileSegmentOpen(
     fromX: number,
     fromY: number,
@@ -31,7 +37,13 @@ export interface DodgePlanningEnvironment {
     radius: number,
     resolution?: number,
   ): LocalDodgeCollisionSnapshot;
-  getRevision?(): number;
+  /**
+   * Required. Return a monotonic integer that changes whenever the environment
+   * mutates. Missing revisions blocked `environmentChanged` from firing, so the
+   * committed trajectory kept steering into freshly-learned walls until the
+   * 100 ms periodic tick or trajectory drift caught up.
+   */
+  getRevision(): number;
 }
 
 export interface DodgePlanningAoe {
