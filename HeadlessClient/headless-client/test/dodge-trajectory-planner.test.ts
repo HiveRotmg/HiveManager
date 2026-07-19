@@ -695,6 +695,48 @@ test('planner metrics expose layer, rejection, merge, beam, and duration data', 
   assert.equal(result.metrics.activeProjectilesConsidered, 1);
 });
 
+test('normalizeCostWeights sanitises NaN, Infinity, and negative overrides', () => {
+  // Pollute every documented cost knob with a non-finite / negative override.
+  // If the sanitiser drops the isFinite guard or the < 0 guard, cumulativeCost
+  // / terminalScore / firstControl / earliestIntentCollisionMs would diverge
+  // from a clean planner on the same deterministic input.
+  const clean = plan(planningInput({
+    projectiles: [projectile({ startX: 4, startY: 5, angle: 0, definition: { speed: 100 } })],
+  }));
+  const polluted = plan(planningInput({
+    projectiles: [projectile({ startX: 4, startY: 5, angle: 0, definition: { speed: 100 } })],
+  }), {
+    costWeights: {
+      basePerSecond: NaN,
+      projectileRiskPerSecond: -5,
+      incompleteHorizonPerSecond: Infinity,
+      terminalGoalDistance: -0.001,
+    },
+  });
+  assert.deepStrictEqual(trajectorySignature(polluted), trajectorySignature(clean));
+});
+
+test('normalizeTimeLayers falls back to DEFAULT_TIME_LAYERS_MS on pathological inputs', () => {
+  const baseline = plan(planningInput({
+    projectiles: [projectile({ startX: 4, startY: 5, angle: 0, definition: { speed: 100 } })],
+  }));
+  // Case (a): first layer != 0.
+  const nonZeroStart = plan(planningInput({
+    projectiles: [projectile({ startX: 4, startY: 5, angle: 0, definition: { speed: 100 } })],
+  }), { timeLayersMs: [100, 200, 300] });
+  assert.deepStrictEqual(trajectorySignature(nonZeroStart), trajectorySignature(baseline));
+  // Case (b): fewer than 3 layers.
+  const tooShort = plan(planningInput({
+    projectiles: [projectile({ startX: 4, startY: 5, angle: 0, definition: { speed: 100 } })],
+  }), { timeLayersMs: [0, 100] });
+  assert.deepStrictEqual(trajectorySignature(tooShort), trajectorySignature(baseline));
+  // Case (c): non-monotonic (duplicate) layers.
+  const duplicate = plan(planningInput({
+    projectiles: [projectile({ startX: 4, startY: 5, angle: 0, definition: { speed: 100 } })],
+  }), { timeLayersMs: [0, 200, 200, 400] });
+  assert.deepStrictEqual(trajectorySignature(duplicate), trajectorySignature(baseline));
+});
+
 test('projectile iteration order does not affect plan result (determinism)', () => {
   const a = projectile({
     ownerId: 100, bulletId: 1, startX: 4, startY: 5, angle: 0,
