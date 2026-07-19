@@ -1708,7 +1708,13 @@ class ProjectileSpatialIndex {
     const maxRow = this.row(Math.max(from.y, to.y));
     for (let row = minRow; row <= maxRow; row++) {
       for (let column = minColumn; column <= maxColumn; column++) {
-        for (const index of this.cells.get(row * this.width + column) ?? []) {
+        // Avoid `?? []` — allocates a fresh empty array per empty-cell miss.
+        // At ~13k query calls per plan × 9 cells × ~7 empty cells for typical
+        // sparse-projectile scenarios, that's ~90k allocations per plan.
+        const values = this.cells.get(row * this.width + column);
+        if (!values) continue;
+        for (let i = 0; i < values.length; i++) {
+          const index = values[i]!;
           if (this.visited[index] === this.visitRevision) continue;
           this.visited[index] = this.visitRevision;
           visit(this.segments[index]!);
