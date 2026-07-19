@@ -695,6 +695,121 @@ test('planner metrics expose layer, rejection, merge, beam, and duration data', 
   assert.equal(result.metrics.activeProjectilesConsidered, 1);
 });
 
+test('combat-range findEmergencyJump respects hardMinimumRange and retreatPenaltyScale', () => {
+  const planner = testPlanner();
+  // Combat target at (7.5, 5). Player at (5, 5) with combat_range intent.
+  // hardMinimumRange=1.3 defines the "must not enter" ring around the target.
+  const combatInput: DodgePlanningInput = {
+    ...emergencyJumpInput(),
+    intent: combatIntent({
+      targetId: 42,
+      targetX: 7.5,
+      targetY: 5,
+      hardMinimumRange: 1.3,
+      preferredMinimumRange: 2,
+      preferredMaximumRange: 3,
+    }),
+    // Open environment on the plane so many directions are landable.
+    environment: OPEN_ENVIRONMENT,
+    retreatPenaltyScale: 1,
+  };
+
+  const pressured = planner.findEmergencyJump(combatInput, 1.5);
+  assert.ok(pressured !== undefined,
+    'expected findEmergencyJump to return a landing under retreatPenaltyScale=1');
+  assert.ok(
+    Math.hypot(pressured.target.x - 7.5, pressured.target.y - 5) >= 1.3 - 1e-6,
+    `landing must respect hardMinimumRange (>=1.3), got distance ${Math.hypot(pressured.target.x - 7.5, pressured.target.y - 5)}`,
+  );
+
+  // Sub-case (b): retreatPenaltyScale=0 zeroes the terminalCombatTooFar
+  // contribution to the score. Regardless of that, hardMinimumRange must
+  // still hold — pinning the invariant against a regression that ties
+  // hardMinimumRange enforcement to the retreat-scale multiplier.
+  const relaxed = planner.findEmergencyJump({
+    ...combatInput,
+    retreatPenaltyScale: 0,
+  }, 1.5);
+  assert.ok(relaxed !== undefined);
+  assert.ok(
+    Math.hypot(relaxed.target.x - 7.5, relaxed.target.y - 5) >= 1.3 - 1e-6,
+    'hardMinimumRange must hold regardless of retreatPenaltyScale',
+  );
+});
+
+test('evaluateEdge rejects candidates moving toward an enemy already inside the hard zone', () => {
+  // Player starts inside ENEMY_AVOID_RADIUS of the enemy: monotonic escape
+  // is the only legal move. Any candidate that steps closer must be rejected
+  // (candidatesRejectedByGeometry increments); any that steps away must be
+  // acceptable (some trajectory ending with monotonic distances survives).
+  const enemy = { x: 5.5, y: 5 };
+  const result = plan(planningInput({
+    position: { x: 5, y: 5 },
+    goal: undefined,
+    intentVelocity: { x: -0.006, y: 0 },
+    environment: {
+      canOccupy: () => true,
+      enemyClearance: (x, y) => Math.hypot(x - enemy.x, y - enemy.y),
+      isProjectileSegmentOpen: () => true,
+    },
+  }));
+  assert.ok(result.metrics.candidatesRejectedByGeometry > 0,
+    'some inward candidates must have been rejected by the monotonic-escape guard');
+  const distances = result.trajectory.waypoints.map((waypoint) => (
+    Math.hypot(waypoint.x - enemy.x, waypoint.y - enemy.y)
+  ));
+  let prior = Math.hypot(5 - enemy.x, 5 - enemy.y);
+  for (const distance of distances) {
+    if (prior >= ENEMY_AVOID_RADIUS - 1e-6) break;
+    assert.ok(distance + 1e-6 >= prior,
+      `trajectory must monotonically escape while inside hard zone; ${prior} -> ${distance}`);
+    prior = distance;
+  }
+  assert.ok(result.minimumEnemyClearance >= 0,
+    'no waypoint may be closer to the enemy than the enemy centre');
+});
+
+test('predictProjectileSegments skips non-enemy, hit, future, and expired projectiles', () => {
+  // Baseline: one live enemy projectile that WILL be considered.
+  const live = projectile({
+    startX: 4, startY: 5, angle: 0,
+    definition: { speed: 100, lifetimeMs: 1000 },
+  });
+  const nonEnemy: CombatProjectileSnapshot = {
+    ...projectile({ startX: 4, startY: 5, angle: 0, bulletId: 2 }),
+    side: 'own',
+  };
+  const alreadyHit: CombatProjectileSnapshot = {
+    ...projectile({ startX: 4, startY: 5, angle: 0, bulletId: 3 }),
+    hitObjects: new Set<number>([10]),
+  };
+  const horizonMs = 1000;
+  // startTime = input.time + horizonMs + 1 clears the strict `>` inequality
+  // that gates the "future" case in predictProjectileSegments.
+  const future: CombatProjectileSnapshot = projectile({
+    startX: 4, startY: 5, angle: 0, bulletId: 4,
+    startTime: 0 + horizonMs + 1,
+  });
+  const expired: CombatProjectileSnapshot = projectile({
+    startX: 4, startY: 5, angle: 0, bulletId: 5,
+    // startTime + lifetimeMs < input.time (0). lifetimeMs default is 1000,
+    // so startTime = -1001 puts startTime+lifetimeMs = -1 < 0.
+    startTime: -1001,
+  });
+
+  const skippedOnly = plan(planningInput({
+    projectiles: [nonEnemy, alreadyHit, future, expired],
+  }));
+  assert.equal(skippedOnly.metrics.activeProjectilesConsidered, 0,
+    'projectiles matching any of the four skip guards must not be counted');
+
+  const withLive = plan(planningInput({
+    projectiles: [nonEnemy, alreadyHit, future, expired, live],
+  }));
+  assert.equal(withLive.metrics.activeProjectilesConsidered, 1,
+    'only the single live enemy projectile survives all four guards');
+});
+
 function testPlanner(options: ConstructorParameters<typeof SpaceTimeDodgePlanner>[0] = {}) {
   return new SpaceTimeDodgePlanner({ maxStatesPerLayer: 64, ...options });
 }
