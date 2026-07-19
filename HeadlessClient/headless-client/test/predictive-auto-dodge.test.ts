@@ -1046,6 +1046,38 @@ test('thrown AOE tracker learns a radius for later matching effects', () => {
   assert.equal(active[0]?.landingTime, 500);
 });
 
+test('thrown AOE tracker learns a blast dwell duration and propagates it', () => {
+  const tracker = new ThrownAoeTracker();
+  // First throw of effectType=456 lands at t=100ms; recordAoe teaches us that
+  // this effect stays dangerous for 500ms after landing. Second throw at
+  // t=1000ms should inherit the learned dwell.
+  tracker.track(456, { x: 2, y: 2 }, 0.1, 0);
+  tracker.recordAoe({ x: 2, y: 2 }, 2, 150, 0.5);
+  tracker.track(456, { x: 8, y: 8 }, 0.1, 1000);
+
+  const secondThrowLandingMs = 1100;
+  const preActive = tracker.getActive(secondThrowLandingMs - 50);
+  assert.equal(preActive.length, 1);
+  assert.equal(preActive[0]?.blastDurationMs, 500);
+});
+
+test('thrown AOE tracker keeps during-dwell throws in getActive', () => {
+  const tracker = new ThrownAoeTracker();
+  // Throw lands at t=100ms with 500ms dwell -> dangerous through t=600ms.
+  tracker.track(789, { x: 5, y: 5 }, 0.1, 0, 0.5);
+
+  const preLanding = tracker.getActive(50);
+  assert.equal(preLanding.length, 1);
+  assert.equal(preLanding[0]?.blastDurationMs, 500);
+
+  const duringDwell = tracker.getActive(300);
+  assert.equal(duringDwell.length, 1, 'during-dwell throws must remain active');
+
+  const postDwellButPreExpiry = tracker.getActive(700);
+  assert.equal(postDwellButPreExpiry.length, 0,
+    'past landing+dwell (600ms), the throw should no longer appear as active');
+});
+
 test('dodge collision world rejects damaging and occupied tiles', () => {
   const data: CombatDataProvider = {
     getObject: (type) => type === 1
