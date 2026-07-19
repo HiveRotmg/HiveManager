@@ -16,9 +16,11 @@ import {
   CombatDataProvider,
   CombatObjectDefinition,
   CombatProjectileDefinition,
+  CombatProjectileSnapshot,
   CombatTracker,
   CombatWorldSnapshot,
   isNonlinearProjectile,
+  predictProjectilePosition,
 } from '../src/combat-tracker';
 
 const projectile: CombatProjectileDefinition = {
@@ -310,6 +312,70 @@ test('multi-hit projectiles keep accuracy within a 0-1 fraction', () => {
   }));
 
   assert.equal(tracker.accuracy(), 1);
+});
+
+test('predictProjectilePosition advances unclamped-accelerated projectiles across mid-flight samples', () => {
+  const accelDef: CombatProjectileDefinition = {
+    ...projectile,
+    speed: 100,
+    lifetimeMs: 2000,
+    acceleration: 200,
+    accelerationDelay: 0,
+    speedClamp: -1,
+  };
+  const shot: CombatProjectileSnapshot = {
+    side: 'enemy', bulletId: 42, bulletType: 0, ownerId: 20, containerType: 100,
+    startX: 0, startY: 5, angle: 0, startTime: 0,
+    definition: accelDef, damage: 100, hitObjects: new Set(),
+  };
+  const p500 = predictProjectilePosition(shot, 500);
+  const p1000 = predictProjectilePosition(shot, 1000);
+  assert.ok(Math.abs(p500.x - 7.5) < 1e-6,
+    `expected x approx 7.5 at t=500 (integrated 500 ms of quadratic motion), got ${p500.x}`);
+  assert.ok(Math.abs(p1000.x - 20) < 1e-6,
+    `expected x approx 20 at t=1000 (integrated 1000 ms of quadratic motion), got ${p1000.x}`);
+  assert.notEqual(p500.x, p1000.x);
+});
+
+test('predictProjectilePosition respects speedClamp for clamped-accelerated projectiles', () => {
+  const clampedDef: CombatProjectileDefinition = {
+    ...projectile,
+    speed: 100,
+    lifetimeMs: 2000,
+    acceleration: 200,
+    accelerationDelay: 0,
+    speedClamp: 200,
+  };
+  const shot: CombatProjectileSnapshot = {
+    side: 'enemy', bulletId: 43, bulletType: 0, ownerId: 20, containerType: 100,
+    startX: 0, startY: 5, angle: 0, startTime: 0,
+    definition: clampedDef, damage: 100, hitObjects: new Set(),
+  };
+  const p1000 = predictProjectilePosition(shot, 1000);
+  assert.ok(Math.abs(p1000.x - 17.5) < 1e-6,
+    `expected x approx 17.5 at t=1000 (500 ms accel to clamp + 500 ms cruise at clamped speed), got ${p1000.x}`);
+});
+
+test('predictProjectilePosition treats pre-delay time as pure linear motion, then accelerates', () => {
+  const delayedDef: CombatProjectileDefinition = {
+    ...projectile,
+    speed: 100,
+    lifetimeMs: 2000,
+    acceleration: 200,
+    accelerationDelay: 400,
+    speedClamp: -1,
+  };
+  const shot: CombatProjectileSnapshot = {
+    side: 'enemy', bulletId: 44, bulletType: 0, ownerId: 20, containerType: 100,
+    startX: 0, startY: 5, angle: 0, startTime: 0,
+    definition: delayedDef, damage: 100, hitObjects: new Set(),
+  };
+  const p200 = predictProjectilePosition(shot, 200);
+  assert.ok(Math.abs(p200.x - 2) < 1e-6,
+    `expected x approx 2 at t=200 (linear before delay), got ${p200.x}`);
+  const p600 = predictProjectilePosition(shot, 600);
+  assert.ok(Math.abs(p600.x - 6.4) < 1e-6,
+    `expected x approx 6.4 at t=600 (delay linear + 200 ms of quadratic accel), got ${p600.x}`);
 });
 
 function data(): CombatDataProvider {

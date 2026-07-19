@@ -616,7 +616,7 @@ function positionAt(
     distance = elapsed * baseSpeed;
   } else {
     const accelerationElapsed = elapsed - definition.accelerationDelay;
-    let accelerationTime = definition.lifetimeMs - definition.accelerationDelay;
+    let accelerationTime = accelerationElapsed;
     let clampedTime = 0;
     let clampedSpeed = 0;
     if (definition.speedClamp !== -1) {
