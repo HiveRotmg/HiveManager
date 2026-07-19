@@ -638,15 +638,18 @@ test('repeated combat target refreshes search without rotating the committed tra
       y: position.y + state.velocity.y * 50,
     };
     const refresh = Math.floor(time / 250);
+    // Keep cumulative target drift within GOAL_CHANGE_TOLERANCE (0.5) so the
+    // sameMovementIntent position check (post-P2-Commit-3 fix) does not force
+    // a replan. Per-refresh delta 0.1; two refreshes = 0.2 total drift.
     state = controller.evaluate({
       time,
       playerId: 10,
       position,
-      goal: { x: 9 + refresh * 0.4, y: 5 },
+      goal: { x: 9 + refresh * 0.1, y: 5 },
       movementIntent: {
         mode: 'combat_range',
         targetId: 42,
-        targetX: 12 + refresh * 0.4,
+        targetX: 12 + refresh * 0.1,
         targetY: 5,
         hardMinimumRange: 1.3,
         preferredMinimumRange: 2,
@@ -665,6 +668,57 @@ test('repeated combat target refreshes search without rotating the committed tra
 
   assert.ok(state.plannerMetrics.totalPlans >= 6);
   assert.equal(state.planReused, true);
+});
+
+test('combat-range intent forces replan when targetId matches but target position drifts past tolerance', () => {
+  const controller = new PredictiveAutoDodgeController({ maxStatesPerLayer: 64 });
+  controller.setEnabled(true);
+  const baseSnapshot = {
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    goal: { x: 9, y: 5 },
+    routeRevision: 0,
+    moveSpeed: 0.004,
+    intentVelocity: { x: 0.004, y: 0 },
+    movementLeadMs: 0,
+    projectiles: [],
+    aoes: [],
+    environment: openEnvironment,
+  } as const;
+
+  const first = controller.evaluate({
+    time: 0,
+    ...baseSnapshot,
+    movementIntent: {
+      mode: 'combat_range',
+      targetId: 42,
+      targetX: 12,
+      targetY: 5,
+      hardMinimumRange: 1.3,
+      preferredMinimumRange: 2,
+      preferredMaximumRange: 3,
+    },
+  });
+  assert.equal(first.planRevision, 1);
+
+  // Server tick relocates target 20 tiles east; targetId unchanged. Pre-fix,
+  // sameMovementIntent short-circuited on targetId, missing this motion. Post-
+  // fix, position tolerance is applied even when targetId matches.
+  const second = controller.evaluate({
+    time: 30,
+    ...baseSnapshot,
+    movementIntent: {
+      mode: 'combat_range',
+      targetId: 42,
+      targetX: 32,
+      targetY: 5,
+      hardMinimumRange: 1.3,
+      preferredMinimumRange: 2,
+      preferredMaximumRange: 3,
+    },
+  });
+  assert.ok(second.planRevision >= 2,
+    `expected replan (planRevision >= 2) on 20-tile target drift, got ${second.planRevision}`);
 });
 
 test('goal-owned dodge stops instead of bypassing local collision when no route exists', () => {

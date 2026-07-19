@@ -1136,9 +1136,15 @@ function sameMovementIntent(
       || aDirection.x * bDirection.x + aDirection.y * bDirection.y >= GOAL_DIRECTION_CHANGE_COSINE;
   }
   if (a.mode !== 'combat_range' || b.mode !== 'combat_range') return false;
+  // Combat-range intents must match on BOTH targetId AND position tolerance:
+  // a targetId is stable across ticks even when the server relocates the
+  // enemy, so `targetId ===` alone lets a target that moved 20 tiles between
+  // frames read as unchanged. Mirror the goal-branch position check.
+  const withinDistance = Math.hypot(a.targetX - b.targetX, a.targetY - b.targetY)
+    < GOAL_CHANGE_TOLERANCE;
   const sameTarget = a.targetId > 0 || b.targetId > 0
-    ? a.targetId === b.targetId
-    : Math.hypot(a.targetX - b.targetX, a.targetY - b.targetY) < GOAL_CHANGE_TOLERANCE;
+    ? a.targetId === b.targetId && withinDistance
+    : withinDistance;
   return sameTarget
     && Math.abs(a.hardMinimumRange - b.hardMinimumRange) <= RANGE_CHANGE_TOLERANCE
     && Math.abs(a.preferredMinimumRange - b.preferredMinimumRange) <= RANGE_CHANGE_TOLERANCE
