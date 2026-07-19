@@ -695,6 +695,38 @@ test('planner metrics expose layer, rejection, merge, beam, and duration data', 
   assert.equal(result.metrics.activeProjectilesConsidered, 1);
 });
 
+test('dwelling AoE catches a player transiting through the blast during dwell', () => {
+  // Player at (3, 5) moving east at 0.006 tile/ms toward goal (10, 5).
+  // AoE lands at t=100ms centered at (5, 5) with radius=1 and dwells 400 ms.
+  // Player positions along the intent line: t=100 -> 3.6 (clearance 1.4, safe),
+  // t=250 -> 4.5 (clearance 0.5, INSIDE the blast), t=500 -> 6.0 (exit).
+  // Pre-fix: sampled only at t=100 (landing), single-clearance 1.4, safe.
+  // Post-fix: sweeps the [100, 500] window and catches the impact around t=250.
+  const result = plan(planningInput({
+    position: { x: 3, y: 5 },
+    goal: { x: 10, y: 5 },
+    aoes: [{ x: 5, y: 5, radius: 1, landingTime: 100, blastDurationMs: 400 }],
+  }));
+  assert.ok(result.earliestIntentCollisionMs !== null,
+    'expected the dwelling AoE to be detected as a first-impact');
+  assert.ok((result.earliestIntentCollisionMs ?? Infinity) <= 300,
+    `expected first-impact <= 300ms (mid-dwell transit), got ${result.earliestIntentCollisionMs}`);
+});
+
+test('single-frame AoE (no blastDurationMs) preserves pre-P3 semantics', () => {
+  // Explicit blastDurationMs === 0 and blastDurationMs === undefined must both
+  // produce identical planner output — the P3 windowed loop's fast-path for
+  // dwellMs=0 is single-sample-at-landing, byte-for-byte matching the old
+  // single-frame behavior.
+  const undefinedDwell = plan(planningInput({
+    aoes: [{ x: 6, y: 5, radius: 0.6, landingTime: 200 }],
+  }));
+  const zeroDwell = plan(planningInput({
+    aoes: [{ x: 6, y: 5, radius: 0.6, landingTime: 200, blastDurationMs: 0 }],
+  }));
+  assert.deepStrictEqual(trajectorySignature(zeroDwell), trajectorySignature(undefinedDwell));
+});
+
 function testPlanner(options: ConstructorParameters<typeof SpaceTimeDodgePlanner>[0] = {}) {
   return new SpaceTimeDodgePlanner({ maxStatesPerLayer: 64, ...options });
 }
