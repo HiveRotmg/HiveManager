@@ -1178,6 +1178,131 @@ test('dodge collision world stops non-passing projectiles at cover', () => {
   assert.equal(world.isProjectileSegmentOpen(3.5, 5.5, 5.5, 5.5, passing), true);
 });
 
+test('predictive auto-dodge commits a controlled stop on movementLocked or moveSpeed<=0', () => {
+  const controller = new PredictiveAutoDodgeController();
+  controller.setEnabled(true);
+  // First: commit a trajectory under normal conditions.
+  const first = controller.evaluate({
+    time: 0,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    goal: { x: 10, y: 5 },
+    moveSpeed: 0.004,
+    intentVelocity: { x: 0.004, y: 0 },
+    movementLeadMs: 0,
+    projectiles: [],
+    aoes: [],
+    environment: openEnvironment,
+  });
+  const invalidationsBefore = first.plannerMetrics.trajectoryInvalidations;
+  assert.notEqual(first.decision, 'movement_locked');
+
+  // Second: same snapshot with movementLocked=true forces the controlled stop.
+  const locked = controller.evaluate({
+    time: 50,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    goal: { x: 10, y: 5 },
+    moveSpeed: 0.004,
+    intentVelocity: { x: 0.004, y: 0 },
+    movementLeadMs: 0,
+    movementLocked: true,
+    projectiles: [],
+    aoes: [{ x: 6, y: 5, radius: 0.5, landingTime: 200 }],
+    environment: openEnvironment,
+  });
+  assert.equal(locked.velocity.x, 0);
+  assert.equal(locked.velocity.y, 0);
+  assert.equal(locked.target, null);
+  assert.equal(locked.trajectory, null);
+  assert.equal(locked.overrideActive, false);
+  assert.equal(locked.decision, 'movement_locked');
+  // threatCount = projectiles.length + aoes.length = 0 + 1
+  assert.equal(locked.threatCount, 1);
+  // Committed trajectory from the first frame gets invalidated.
+  assert.equal(
+    locked.plannerMetrics.trajectoryInvalidations,
+    invalidationsBefore + 1,
+    'movement_locked path must recordTrajectoryInvalidation() on any committed plan',
+  );
+
+  // Third: moveSpeed=0 fires the same branch.
+  const zeroSpeed = controller.evaluate({
+    time: 100,
+    playerId: 10,
+    position: { x: 5, y: 5 },
+    goal: { x: 10, y: 5 },
+    moveSpeed: 0,
+    intentVelocity: { x: 0.004, y: 0 },
+    movementLeadMs: 0,
+    projectiles: [],
+    aoes: [],
+    environment: openEnvironment,
+  });
+  assert.equal(zeroSpeed.decision, 'movement_locked');
+  assert.equal(zeroSpeed.velocity.x, 0);
+  assert.equal(zeroSpeed.velocity.y, 0);
+});
+
+test('ThrownAoeTracker.clear resets throws, learned radii, and next id', () => {
+  const tracker = new ThrownAoeTracker();
+  // Set up learned state: track then recordAoe teaches radius=3 for effect 42
+  // (and splices the matched throw from the queue).
+  tracker.track(42, { x: 5, y: 5 }, 0.1, 0);
+  tracker.recordAoe({ x: 5, y: 5 }, 3, 100);
+
+  // Sanity: a NEW track for effect 42 now inherits the learned radius=3.
+  tracker.track(42, { x: 8, y: 8 }, 0.1, 200);
+  const beforeClear = tracker.getActive(250);
+  assert.equal(beforeClear.length, 1);
+  assert.equal(beforeClear[0]?.radius, 3,
+    'sanity: pre-clear, learned radius must propagate to new throws');
+
+  // clear() must flush throws + learnedRadius. A fresh track of the same
+  // effect returns radius=1 (default), and no residual throws remain active.
+  tracker.clear();
+  assert.equal(tracker.getActive(250).length, 0);
+  tracker.track(42, { x: 0, y: 0 }, 0.1, 300);
+  const afterClear = tracker.getActive(350);
+  assert.equal(afterClear.length, 1);
+  assert.equal(afterClear[0]?.radius, 1,
+    'clear() must flush the learnedRadius map');
+});
+
+test('ThrownAoeTracker.recordAoe outside +/-150/+750ms window does not learn', () => {
+  // Throw lands at t=100ms; matching window is [-50, 850].
+  // recordAoe at t=-100 (100 < landing-150 = -50) is OUTSIDE the window.
+  // recordAoe at t=900 (900 > landing+750 = 850) is OUTSIDE the window.
+  // Both should NOT teach the tracker anything about this effectType.
+  const outside = new ThrownAoeTracker();
+  outside.track(99, { x: 5, y: 5 }, 0.1, 0);
+  outside.recordAoe({ x: 5, y: 5 }, 3, -100);
+  outside.recordAoe({ x: 5, y: 5 }, 3, 900);
+  outside.track(99, { x: 2, y: 2 }, 0.1, 1000);
+  const stillDefault = outside.getActive(1050);
+  assert.equal(stillDefault[0]?.radius, 1,
+    'recordAoe outside +/-150/+750ms window must not populate learnedRadius');
+
+  // Positive control: same fixture but with recordAoe inside the window
+  // (t=200 for a throw landing at t=100) correctly teaches radius=3.
+  const inside = new ThrownAoeTracker();
+  inside.track(99, { x: 5, y: 5 }, 0.1, 0);
+  inside.recordAoe({ x: 5, y: 5 }, 3, 200);
+  inside.track(99, { x: 2, y: 2 }, 0.1, 1000);
+  const learned = inside.getActive(1050);
+  assert.equal(learned[0]?.radius, 3,
+    'recordAoe inside window IS the reference — this pair proves the window is checked');
+});
+
+test('ThrownAoeTracker unknown effect type reports default radius=1', () => {
+  const tracker = new ThrownAoeTracker();
+  tracker.track(0xdead, { x: 0, y: 0 }, 0.1, 0);
+  const active = tracker.getActive(50);
+  assert.equal(active.length, 1);
+  assert.equal(active[0]?.radius, 1,
+    'unknown effect type without a prior recordAoe should default to radius=1');
+});
+
 function hostileProjectile(): CombatProjectileSnapshot {
   return {
     side: 'enemy',
