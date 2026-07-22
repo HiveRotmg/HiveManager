@@ -192,7 +192,7 @@ export class HeadlessFleet extends EventEmitter {
     };
     const requestOptions = account.proxy ? { proxy: account.proxy } : undefined;
     const { accessToken, clientToken } = await login(authAccount, requestOptions);
-    const { char, servers } = await getCharAndServers(accessToken, requestOptions);
+    const { char, servers, tutorialDone } = await getCharAndServers(accessToken, requestOptions);
     const preferred = servers.find((server) => server.name.toLowerCase() === String(account.serverName || '').toLowerCase());
     const server = preferred ?? servers[0];
     if (!server) throw new Error('No game servers were returned for this account.');
@@ -203,6 +203,7 @@ export class HeadlessFleet extends EventEmitter {
       clientToken,
       charId: char.charId,
       needsNewChar: char.needsNewChar,
+      tutorialDone,
       host: server.address,
       proxy: account.proxy,
       servers,

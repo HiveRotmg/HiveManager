@@ -476,6 +476,7 @@ export class Client extends EventEmitter {
     this.setMaxListeners(config.maxEventListeners);
     this.host = opts.host;
     this.nexusHost = opts.host;
+    this.gameId = opts.tutorialDone === false ? GAME_ID.TUTORIAL : GAME_ID.NEXUS;
     this.accessToken = opts.accessToken;
     this.clientToken = opts.clientToken;
     this.wantVault = opts.autoEnterVault ?? config.autoEnterVault;
@@ -2719,7 +2720,11 @@ export class Client extends EventEmitter {
     }
     this.reconnectTimer = this.timers.setTimeout(() => {
       this.reconnectTimer = undefined;
+      // A not-yet-completed tutorial uses an unkeyed connection just like the
+      // Nexus. Keep retrying it until the server redirects us elsewhere.
+      const retryTutorial = this.gameId === GAME_ID.TUTORIAL;
       this.resetForNexus();
+      if (retryTutorial) this.gameId = GAME_ID.TUTORIAL;
       this.connect();
     }, ms);
   }
