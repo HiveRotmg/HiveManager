@@ -37,7 +37,9 @@ const PROJECTILE_DEFINITION: CombatProjectileDefinition = {
 
 const OPEN_ENVIRONMENT: DodgePlanningEnvironment = {
   canOccupy: () => true,
+  enemyClearance: () => Infinity,
   isProjectileSegmentOpen: () => true,
+  getRevision: () => 0,
 };
 
 test('1. projectile-free planning follows the global pathfinding intent', () => {
@@ -83,6 +85,7 @@ test('goal mode passes a combat enemy without combat-range attraction', () => {
       canOccupy: () => true,
       enemyClearance: (x, y) => Math.hypot(x - enemy.x, y - enemy.y),
       isProjectileSegmentOpen: () => true,
+      getRevision: () => 0,
     },
   }));
 
@@ -356,6 +359,7 @@ test('9. enemy hard-radius exclusion invalidates otherwise direct movement', () 
       canOccupy: () => true,
       enemyClearance: (x, y) => Math.hypot(x - enemy.x, y - enemy.y),
       isProjectileSegmentOpen: () => true,
+      getRevision: () => 0,
     },
   }));
 
@@ -370,6 +374,7 @@ test('10. nonlinear enemy soft cost keeps the route off the hard boundary', () =
       canOccupy: () => true,
       enemyClearance: (x, y) => Math.hypot(x - enemy.x, y - enemy.y),
       isProjectileSegmentOpen: () => true,
+      getRevision: () => 0,
     },
   }));
 
@@ -660,6 +665,8 @@ test('21. no valid trajectory produces a finite controlled stop', () => {
     environment: {
       canOccupy: () => false,
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   }));
 
@@ -727,6 +734,70 @@ test('single-frame AoE (no blastDurationMs) preserves pre-P3 semantics', () => {
   assert.deepStrictEqual(trajectorySignature(zeroDwell), trajectorySignature(undefinedDwell));
 });
 
+test('normalizeCostWeights sanitises NaN, Infinity, and negative overrides', () => {
+  // Pollute every documented cost knob with a non-finite / negative override.
+  // If the sanitiser drops the isFinite guard or the < 0 guard, cumulativeCost
+  // / terminalScore / firstControl / earliestIntentCollisionMs would diverge
+  // from a clean planner on the same deterministic input.
+  const clean = plan(planningInput({
+    projectiles: [projectile({ startX: 4, startY: 5, angle: 0, definition: { speed: 100 } })],
+  }));
+  const polluted = plan(planningInput({
+    projectiles: [projectile({ startX: 4, startY: 5, angle: 0, definition: { speed: 100 } })],
+  }), {
+    costWeights: {
+      basePerSecond: NaN,
+      projectileRiskPerSecond: -5,
+      incompleteHorizonPerSecond: Infinity,
+      terminalGoalDistance: -0.001,
+    },
+  });
+  assert.deepStrictEqual(trajectorySignature(polluted), trajectorySignature(clean));
+});
+
+test('normalizeTimeLayers falls back to DEFAULT_TIME_LAYERS_MS on pathological inputs', () => {
+  const baseline = plan(planningInput({
+    projectiles: [projectile({ startX: 4, startY: 5, angle: 0, definition: { speed: 100 } })],
+  }));
+  // Case (a): first layer != 0.
+  const nonZeroStart = plan(planningInput({
+    projectiles: [projectile({ startX: 4, startY: 5, angle: 0, definition: { speed: 100 } })],
+  }), { timeLayersMs: [100, 200, 300] });
+  assert.deepStrictEqual(trajectorySignature(nonZeroStart), trajectorySignature(baseline));
+  // Case (b): fewer than 3 layers.
+  const tooShort = plan(planningInput({
+    projectiles: [projectile({ startX: 4, startY: 5, angle: 0, definition: { speed: 100 } })],
+  }), { timeLayersMs: [0, 100] });
+  assert.deepStrictEqual(trajectorySignature(tooShort), trajectorySignature(baseline));
+  // Case (c): non-monotonic (duplicate) layers.
+  const duplicate = plan(planningInput({
+    projectiles: [projectile({ startX: 4, startY: 5, angle: 0, definition: { speed: 100 } })],
+  }), { timeLayersMs: [0, 200, 200, 400] });
+  assert.deepStrictEqual(trajectorySignature(duplicate), trajectorySignature(baseline));
+});
+
+test('projectile iteration order does not affect plan result (determinism)', () => {
+  const a = projectile({
+    ownerId: 100, bulletId: 1, startX: 4, startY: 5, angle: 0,
+    definition: { speed: 100 },
+  });
+  const b = projectile({
+    ownerId: 200, bulletId: 2, startX: 4, startY: 4.5, angle: 0,
+    definition: { speed: 100 },
+  });
+  const forward = plan(planningInput({ projectiles: [a, b] }));
+  const reversed = plan(planningInput({ projectiles: [b, a] }));
+  assert.deepStrictEqual(trajectorySignature(reversed), trajectorySignature(forward));
+});
+
+test('aoe iteration order does not affect plan result (determinism)', () => {
+  const a = { x: 6, y: 4.8, radius: 0.7, landingTime: 150 };
+  const b = { x: 6.5, y: 5.1, radius: 0.6, landingTime: 250 };
+  const forward = plan(planningInput({ aoes: [a, b] }));
+  const reversed = plan(planningInput({ aoes: [b, a] }));
+  assert.deepStrictEqual(trajectorySignature(reversed), trajectorySignature(forward));
+});
+
 function testPlanner(options: ConstructorParameters<typeof SpaceTimeDodgePlanner>[0] = {}) {
   return new SpaceTimeDodgePlanner({ maxStatesPerLayer: 64, ...options });
 }
@@ -786,6 +857,8 @@ function timedCorridorInput(): DodgePlanningInput {
     environment: {
       canOccupy: (_x, y) => Math.abs(y - 5) < 0.03,
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   });
 }
@@ -801,6 +874,8 @@ function retreatInput(): DodgePlanningInput {
     environment: {
       canOccupy: (x, y) => x >= 0 && x <= 12 && Math.abs(y - 5) < 0.03,
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   });
 }
@@ -821,6 +896,8 @@ function emergencyJumpInput(): DodgePlanningInput & {
     environment: {
       canOccupy: (x, y) => x >= 0 && x <= 12 && Math.abs(y - 5) < 0.03,
       isProjectileSegmentOpen: () => true,
+      enemyClearance: () => Infinity,
+      getRevision: () => 0,
     },
   });
 }
