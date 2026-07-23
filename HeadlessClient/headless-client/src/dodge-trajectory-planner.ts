@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import {
+  isNonlinearProjectile,
   isProjectileAliveAt,
   predictProjectilePosition,
   type CombatProjectileSnapshot,
@@ -1589,11 +1590,7 @@ export class SpaceTimeDodgePlanner {
         projectile.startTime + projectile.definition.lifetimeMs - input.time,
       );
       if (finalOffset < firstOffset) continue;
-      const nonlinear = projectile.definition.wavy
-        || projectile.definition.parametric
-        || projectile.definition.boomerang
-        || projectile.definition.amplitude !== 0
-        || projectile.definition.acceleration !== 0;
+      const nonlinear = isNonlinearProjectile(projectile.definition);
       const stepMs = nonlinear
         ? Math.min(this.config.projectilePredictionStepMs, 15)
         : Math.max(1, finalOffset - firstOffset);

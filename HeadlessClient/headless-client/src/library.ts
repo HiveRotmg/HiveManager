@@ -51,7 +51,7 @@ export type {
   AutoNexusTrigger,
   AutoNexusTriggerSource,
 } from './auto-nexus';
-export { CombatTracker } from './combat-tracker';
+export { CombatTracker, isNonlinearProjectile } from './combat-tracker';
 export type {
   CombatDataProvider,
   CombatEntity,

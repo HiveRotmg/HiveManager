@@ -32,6 +32,25 @@ export interface CombatProjectileDefinition {
   armorPiercing?: boolean;
 }
 
+/**
+ * Returns `true` when a projectile's motion cannot be modelled as a single
+ * constant-velocity segment — used by the dodge planner to decide between
+ * fine-step sub-sampling (~15 ms) and a single analytic ProjectileSegment.
+ *
+ * Add any new nonlinear-motion flag here; the planner and every other coarse
+ * "is this projectile nonlinear" caller then picks up the update automatically.
+ * Per-flag motion math (wavy / parametric / boomerang / amplitude deflection /
+ * quadratic accel) still lives in `positionAt` — this helper is only the
+ * category check.
+ */
+export function isNonlinearProjectile(definition: CombatProjectileDefinition): boolean {
+  return definition.wavy
+    || definition.parametric
+    || definition.boomerang
+    || definition.amplitude !== 0
+    || definition.acceleration !== 0;
+}
+
 export interface CombatPlayerHit {
   bulletId: number;
   ownerId: number;

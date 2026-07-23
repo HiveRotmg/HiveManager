@@ -19,6 +19,7 @@ import {
   CombatProjectileSnapshot,
   CombatTracker,
   CombatWorldSnapshot,
+  isNonlinearProjectile,
   predictProjectilePosition,
 } from '../src/combat-tracker';
 
@@ -37,6 +38,16 @@ const projectile: CombatProjectileDefinition = {
   accelerationDelay: 0,
   speedClamp: -1,
 };
+
+test('isNonlinearProjectile flags each of the five nonlinear-motion attributes', () => {
+  assert.equal(isNonlinearProjectile(projectile), false,
+    'baseline projectile fixture has every nonlinear flag off — must return false');
+  assert.equal(isNonlinearProjectile({ ...projectile, wavy: true }), true);
+  assert.equal(isNonlinearProjectile({ ...projectile, parametric: true }), true);
+  assert.equal(isNonlinearProjectile({ ...projectile, boomerang: true }), true);
+  assert.equal(isNonlinearProjectile({ ...projectile, amplitude: 1 }), true);
+  assert.equal(isNonlinearProjectile({ ...projectile, acceleration: 200 }), true);
+});
 
 test('enemy projectile reports PLAYERHIT once when it reaches the local player', () => {
   const sent: Packet[] = [];
