@@ -18,7 +18,13 @@ import { isStaticSegmentSupercoverOpen, segmentOccupancySampleInTile } from './s
 
 export interface DodgePlanningEnvironment {
   canOccupy(x: number, y: number, safeWalk: boolean, avoidEnemies?: boolean): boolean;
-  enemyClearance?(x: number, y: number): number;
+  /**
+   * Required. Return `Infinity` when there are no enemies within reach. Making
+   * this optional silently disabled enemy avoidance when a consumer forgot to
+   * implement it — every candidate passed both the hard reject and the soft
+   * cost, and the player walked onto combat enemies unopposed.
+   */
+  enemyClearance(x: number, y: number): number;
   isProjectileSegmentOpen(
     fromX: number,
     fromY: number,
@@ -31,7 +37,13 @@ export interface DodgePlanningEnvironment {
     radius: number,
     resolution?: number,
   ): LocalDodgeCollisionSnapshot;
-  getRevision?(): number;
+  /**
+   * Required. Return a monotonic integer that changes whenever the environment
+   * mutates. Missing revisions blocked `environmentChanged` from firing, so the
+   * committed trajectory kept steering into freshly-learned walls until the
+   * 100 ms periodic tick or trajectory drift caught up.
+   */
+  getRevision(): number;
 }
 
 export interface DodgePlanningAoe {
@@ -335,6 +347,13 @@ interface PlannerContext {
   collision: CollisionQuery;
   projectileSegments: ProjectileSegment[];
   projectileIndex: ProjectileSpatialIndex;
+  /**
+   * A defensive copy of `input.aoes` sorted by (landingTime, x, y, radius) so
+   * AoE iteration order is deterministic across replays. IEEE-754
+   * non-associativity would otherwise let iteration-order permutations flip
+   * ULP-scale rankScore ties.
+   */
+  sortedAoes: readonly DodgePlanningAoe[];
   controls: MovementControl[];
   counters: PlanCounters;
   startEnemyDistance: number;
@@ -670,6 +689,12 @@ export class SpaceTimeDodgePlanner {
       this.config.timeLayersMs,
       horizonMs,
     );
+    const sortedAoes = [...input.aoes].sort((a, b) => {
+      return a.landingTime - b.landingTime
+        || a.x - b.x
+        || a.y - b.y
+        || a.radius - b.radius;
+    });
     return {
       input,
       intent,
@@ -681,6 +706,7 @@ export class SpaceTimeDodgePlanner {
       collision,
       projectileSegments,
       projectileIndex,
+      sortedAoes,
       controls: createPlanningControls(input, projectileSegments),
       counters,
       startEnemyDistance: collision.enemyDistance(input.position.x, input.position.y),
@@ -1038,7 +1064,13 @@ export class SpaceTimeDodgePlanner {
     let enemyExposure = 0;
     let damagingExposure = 0;
     const spatialSteps = Math.ceil(travel / Math.max(0.05, context.collision.resolution));
-    const temporalSteps = travel <= DISTANCE_EPSILON ? 1 : Math.ceil(durationMs / STATIC_SAMPLE_MAX_MS);
+    // Wait edges (travel == 0) get sampled only once at ratio=1 (end of interval),
+    // which misses mid-wait combat-target dips inside `hardMinimumRange`. Force
+    // multi-sampling whenever combat-range intent is active so mobile-target
+    // range violations are caught.
+    const temporalSteps = travel <= DISTANCE_EPSILON && !combatIntent
+      ? 1
+      : Math.ceil(durationMs / STATIC_SAMPLE_MAX_MS);
     const sampleCount = Math.max(1, spatialSteps, temporalSteps);
     for (let sample = 1; sample <= sampleCount; sample++) {
       const ratio = sample / sampleCount;
@@ -1143,9 +1175,12 @@ export class SpaceTimeDodgePlanner {
       return undefined;
     }
 
-    for (const aoe of context.input.aoes) {
+    for (const aoe of context.sortedAoes) {
       const landingMs = aoe.landingTime - context.input.time;
-      if (landingMs < startMs || landingMs > endMs) continue;
+      // Half-open interval [startMs, endMs): an AoE landing exactly at a shared
+      // layer boundary is now included in the LATER edge only, not both edges,
+      // so soft projectileCost isn't accumulated twice for the same AoE.
+      if (landingMs < startMs || landingMs >= endMs) continue;
       const ratio = clamp((landingMs - startMs) / durationMs, 0, 1);
       const x = from.x + dx * ratio;
       const y = from.y + dy * ratio;
@@ -1461,7 +1496,16 @@ export class SpaceTimeDodgePlanner {
   ): ProjectileSegment[] {
     const segments: ProjectileSegment[] = [];
     const maximumReach = input.moveSpeed * horizonMs + PROJECTILE_NEAR_BAND + 2;
-    for (const projectile of input.projectiles) {
+    // Iterate projectiles in stable (ownerId, bulletId, startTime) order so the
+    // segment insertion order — and therefore the per-edge projectileCost sum
+    // order — is deterministic across replays. IEEE-754 non-associativity would
+    // otherwise let iteration-order permutations flip rankScore ties.
+    const sortedProjectiles = [...input.projectiles].sort((a, b) => {
+      return a.ownerId - b.ownerId
+        || a.bulletId - b.bulletId
+        || a.startTime - b.startTime;
+    });
+    for (const projectile of sortedProjectiles) {
       if (projectile.side !== 'enemy'
         || projectile.hitObjects.has(input.playerId)
         || projectile.startTime > input.time + horizonMs
@@ -1594,9 +1638,13 @@ export class SpaceTimeDodgePlanner {
           );
         }
       });
-      for (const aoe of input.aoes) {
+      for (const aoe of context.sortedAoes) {
         const landingMs = aoe.landingTime - input.time;
-        if (landingMs < startMs || landingMs > endMs) continue;
+        // Half-open interval [startMs, endMs) — see the same fix in evaluateEdge's
+        // AoE loop above. earliestIntentCollision's use of Math.min is
+        // idempotent so double-counting here was harmless, but the parity keeps
+        // the two AoE-sample sites reading identically.
+        if (landingMs < startMs || landingMs >= endMs) continue;
         const ratio = (landingMs - startMs) / durationMs;
         const x = current.x + (next.x - current.x) * ratio;
         const y = current.y + (next.y - current.y) * ratio;
@@ -1672,7 +1720,13 @@ class ProjectileSpatialIndex {
     const maxRow = this.row(Math.max(from.y, to.y));
     for (let row = minRow; row <= maxRow; row++) {
       for (let column = minColumn; column <= maxColumn; column++) {
-        for (const index of this.cells.get(row * this.width + column) ?? []) {
+        // Avoid `?? []` — allocates a fresh empty array per empty-cell miss.
+        // At ~13k query calls per plan × 9 cells × ~7 empty cells for typical
+        // sparse-projectile scenarios, that's ~90k allocations per plan.
+        const values = this.cells.get(row * this.width + column);
+        if (!values) continue;
+        for (let i = 0; i < values.length; i++) {
+          const index = values[i]!;
           if (this.visited[index] === this.visitRevision) continue;
           this.visited[index] = this.visitRevision;
           visit(this.segments[index]!);
@@ -2033,7 +2087,10 @@ function retainSpatialCandidate(bucket: CandidateState[], candidate: CandidateSt
   }
   let worstIndex = 0;
   for (let index = 1; index < bucket.length; index++) {
-    if (candidateBefore(bucket[worstIndex]!, bucket[index]!)) worstIndex = index;
+    // Use the same comparator as every downstream consumer of the bucket
+    // (candidateDominatedBeforeSafety, retained.sort, diverseBeam) so we don't
+    // drop a rank-better incoming candidate while keeping a rank-worse held one.
+    if (candidateBeforeSort(bucket[worstIndex]!, bucket[index]!) < 0) worstIndex = index;
   }
   if (candidateBeforeSort(candidate, bucket[worstIndex]!) < 0) bucket[worstIndex] = candidate;
 }
