@@ -170,6 +170,7 @@ export {
   TradeAcceptedPacket,
   TradeChangedPacket,
   TradeDonePacket,
+  TradeRequestedPacket,
   TradeStartPacket,
 } from 'realmlib';
 export type { PartyInfoData, PartyPlayerData, SlotEnchantments, TradeItem } from 'realmlib';

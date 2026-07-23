@@ -98,6 +98,12 @@ export class HeadlessFleet extends EventEmitter {
     return this.entries.size;
   }
 
+  /** Whether an account already has a live client or a connection in progress. */
+  isBusy(accountId: string): boolean {
+    const id = String(accountId);
+    return this.entries.has(id) || this.pending.has(id);
+  }
+
   get(accountId?: string | null): Client | undefined {
     if (accountId) return this.entries.get(String(accountId))?.client;
     return this.entries.values().next().value?.client;
