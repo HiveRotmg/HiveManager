@@ -3868,7 +3868,11 @@ export class Client extends EventEmitter {
   /** Processes and acknowledges an area attack using the current local frame state. */
   private handleAoe(p: AoePacket): void {
     const ackTime = this.time();
-    this.thrownAoes?.recordAoe(p.pos, p.radius, ackTime);
+    // Pass through the AoE packet's blast dwell (`p.duration`, seconds) so the
+    // tracker can learn per-effectType dwell durations and surface during-
+    // dwell throws to the dodge planner. Without this the P3 windowed
+    // sampling never fires from real packet traffic.
+    this.thrownAoes?.recordAoe(p.pos, p.radius, ackTime, p.duration);
     this.viewerAoes.push({
       id: this.nextViewerAoeId++,
       x: p.pos.x,

@@ -834,11 +834,13 @@ export interface TrackedThrownAoe extends DodgePlanningAoe {
 export class ThrownAoeTracker {
   private readonly throws: TrackedThrownAoe[] = [];
   private readonly learnedRadius = new Map<number, number>();
+  private readonly learnedBlastDuration = new Map<number, number>();
   private nextId = 1;
 
   clear(): void {
     this.throws.length = 0;
     this.learnedRadius.clear();
+    this.learnedBlastDuration.clear();
     this.nextId = 1;
   }
 
@@ -847,9 +849,14 @@ export class ThrownAoeTracker {
     end: { x: number; y: number },
     durationSeconds: number,
     now: number,
+    blastDurationSeconds?: number,
   ): void {
     const durationMs = Math.max(0, durationSeconds * 1000);
     const normalizedType = effectType >>> 0;
+    const learnedBlastMs = this.learnedBlastDuration.get(normalizedType);
+    const explicitBlastMs = blastDurationSeconds !== undefined
+      ? Math.max(0, blastDurationSeconds * 1000)
+      : undefined;
     this.throws.push({
       id: this.nextId++,
       effectType: normalizedType,
@@ -857,12 +864,17 @@ export class ThrownAoeTracker {
       y: end.y,
       radius: this.learnedRadius.get(normalizedType) ?? 1,
       landingTime: now + durationMs,
+      blastDurationMs: explicitBlastMs ?? learnedBlastMs,
     });
   }
 
-  recordAoe(position: { x: number; y: number }, radius: number, now: number): void {
+  recordAoe(
+    position: { x: number; y: number },
+    radius: number,
+    now: number,
+    blastDurationSeconds?: number,
+  ): void {
     let best: TrackedThrownAoe | undefined;
-    let bestIndex = -1;
     let bestDistance = 1;
     for (let index = 0; index < this.throws.length; index++) {
       const thrown = this.throws[index]!;
@@ -871,11 +883,19 @@ export class ThrownAoeTracker {
       if (distance > bestDistance) continue;
       bestDistance = distance;
       best = thrown;
-      bestIndex = index;
     }
     if (!best) return;
     this.learnedRadius.set(best.effectType, radius);
-    if (bestIndex >= 0) this.throws.splice(bestIndex, 1);
+    best.radius = radius;
+    if (blastDurationSeconds !== undefined) {
+      const blastMs = Math.max(0, blastDurationSeconds * 1000);
+      this.learnedBlastDuration.set(best.effectType, blastMs);
+      best.blastDurationMs = blastMs;
+    }
+    // Do NOT splice the matched throw here — leaving it in place lets
+    // getActive() surface it to the planner during the dwell window (see
+    // spec docs/superpowers/specs/2026-07-19-aoe-blast-dwell-rewrite-design.md
+    // touchpoint 3). Post-dwell expiry happens in getActive() below.
   }
 
   getActive(now: number): readonly TrackedThrownAoe[] {
@@ -887,12 +907,18 @@ export class ThrownAoeTracker {
     const active: TrackedThrownAoe[] = [];
     for (let index = this.throws.length - 1; index >= 0; index--) {
       const thrown = this.throws[index]!;
-      if (now > thrown.landingTime + 750) {
+      const dwellMs = thrown.blastDurationMs ?? 0;
+      const expiresAt = thrown.landingTime + Math.max(750, dwellMs);
+      if (now > expiresAt) {
         this.throws.splice(index, 1);
         continue;
       }
-      if (now < thrown.landingTime) {
-        thrown.radius = this.learnedRadius.get(thrown.effectType) ?? thrown.radius;
+      thrown.radius = this.learnedRadius.get(thrown.effectType) ?? thrown.radius;
+      const learnedBlast = this.learnedBlastDuration.get(thrown.effectType);
+      if (learnedBlast !== undefined) thrown.blastDurationMs = learnedBlast;
+      // Include pre-landing throws (existing behavior) AND during-dwell throws
+      // (new for P3). Post-dwell throws are cleaned up above.
+      if (now < thrown.landingTime + (thrown.blastDurationMs ?? 0)) {
         active.push({ ...thrown });
       }
     }

@@ -51,6 +51,14 @@ export interface DodgePlanningAoe {
   y: number;
   radius: number;
   landingTime: number;
+  /**
+   * Duration in ms the blast stays dangerous after `landingTime`. Falsy or
+   * missing = single-frame (existing behavior). When set, both AoE-sample
+   * sites sweep `[landingTime, landingTime + blastDurationMs]` at
+   * `AOE_SAMPLE_STEP_MS` steps, catching player trajectories that transit the
+   * blast during the dwell window (dammah rings, cultist rings, grenades).
+   */
+  blastDurationMs?: number;
 }
 
 export interface TimedDodgeWaypoint {
@@ -187,6 +195,13 @@ const DODGE_HITBOX_HALF_SIZE = 0.5;
 const AOE_SAFETY_MARGIN = 0.08;
 const PROJECTILE_NEAR_BAND = 0.9;
 const AOE_NEAR_BAND = 0.75;
+/**
+ * Sample step (ms) for sweeping AoE clearance across a dwell window
+ * (`landingTime .. landingTime + blastDurationMs`). Only applies when a
+ * blast carries `blastDurationMs > 0`; single-frame AoE inputs still
+ * evaluate at exactly `landingTime` and pay no extra cost.
+ */
+const AOE_SAMPLE_STEP_MS = 30;
 const PROJECTILE_INDEX_CELL_SIZE = 2;
 const STATIC_SAMPLE_MAX_MS = 25;
 const DISTANCE_EPSILON = 1e-9;
@@ -1214,25 +1229,44 @@ export class SpaceTimeDodgePlanner {
 
     for (const aoe of context.sortedAoes) {
       const landingMs = aoe.landingTime - context.input.time;
-      // Half-open interval [startMs, endMs): an AoE landing exactly at a shared
-      // layer boundary is now included in the LATER edge only, not both edges,
-      // so soft projectileCost isn't accumulated twice for the same AoE.
-      if (landingMs < startMs || landingMs >= endMs) continue;
-      const ratio = clamp((landingMs - startMs) / durationMs, 0, 1);
-      const x = from.x + dx * ratio;
-      const y = from.y + dy * ratio;
-      const clearance = Math.hypot(x - aoe.x, y - aoe.y)
-        - Math.max(0, aoe.radius) - AOE_SAFETY_MARGIN;
-      minimumProjectileClearance = Math.min(minimumProjectileClearance, clearance);
-      if (clearance <= 0) {
-        collision = true;
-        if (!allowProjectileCollision) {
-          context.counters.candidatesRejectedByProjectiles++;
-          return undefined;
-        }
+      const dwellMs = Math.max(0, aoe.blastDurationMs ?? 0);
+      // The AoE is dangerous over [landingMs, landingMs + dwellMs].
+      // Intersect it with this edge's half-open range [startMs, endMs)
+      // so a shared layer boundary is evaluated by the later edge only.
+      const windowStart = Math.max(startMs, landingMs);
+      const windowEnd = Math.min(endMs, landingMs + dwellMs);
+      if (dwellMs === 0) {
+        if (landingMs < startMs || landingMs >= endMs) continue;
+      } else if (windowEnd <= windowStart) {
+        continue;
       }
-      if (clearance < AOE_NEAR_BAND) {
-        const normalized = clamp((AOE_NEAR_BAND - clearance) / AOE_NEAR_BAND, 0, 1);
+      const lastSample = dwellMs === 0
+        ? landingMs
+        : windowEnd >= endMs
+          ? Math.max(windowStart, endMs - 1e-6)
+          : windowEnd;
+      let minClearance = Infinity;
+      let t = windowStart;
+      while (true) {
+        const ratio = clamp((t - startMs) / durationMs, 0, 1);
+        const x = from.x + dx * ratio;
+        const y = from.y + dy * ratio;
+        const clearance = Math.hypot(x - aoe.x, y - aoe.y)
+          - Math.max(0, aoe.radius) - AOE_SAFETY_MARGIN;
+        if (clearance < minClearance) minClearance = clearance;
+        if (clearance <= 0) {
+          collision = true;
+          if (!allowProjectileCollision) {
+            context.counters.candidatesRejectedByProjectiles++;
+            return undefined;
+          }
+        }
+        if (t >= lastSample) break;
+        t = Math.min(lastSample, t + AOE_SAMPLE_STEP_MS);
+      }
+      minimumProjectileClearance = Math.min(minimumProjectileClearance, minClearance);
+      if (minClearance < AOE_NEAR_BAND) {
+        const normalized = clamp((AOE_NEAR_BAND - minClearance) / AOE_NEAR_BAND, 0, 1);
         projectileCost += this.weights.projectileRiskPerSecond
           * 0.05 * normalized * normalized;
       }
@@ -1677,16 +1711,34 @@ export class SpaceTimeDodgePlanner {
       });
       for (const aoe of context.sortedAoes) {
         const landingMs = aoe.landingTime - input.time;
-        // Half-open interval [startMs, endMs) — see the same fix in evaluateEdge's
-        // AoE loop above. earliestIntentCollision's use of Math.min is
-        // idempotent so double-counting here was harmless, but the parity keeps
-        // the two AoE-sample sites reading identically.
-        if (landingMs < startMs || landingMs >= endMs) continue;
-        const ratio = (landingMs - startMs) / durationMs;
-        const x = current.x + (next.x - current.x) * ratio;
-        const y = current.y + (next.y - current.y) * ratio;
-        if (Math.hypot(x - aoe.x, y - aoe.y) <= aoe.radius + AOE_SAFETY_MARGIN) {
-          earliest = Math.min(earliest, landingMs);
+        const dwellMs = Math.max(0, aoe.blastDurationMs ?? 0);
+        // Sweep the dwell window using the same half-open edge ownership as
+        // evaluateEdge above.
+        // Report the FIRST-impact time so speed-scale down-shifts can't
+        // sneak the player under a dwelling blast.
+        const windowStart = Math.max(startMs, landingMs);
+        const windowEnd = Math.min(endMs, landingMs + dwellMs);
+        if (dwellMs === 0) {
+          if (landingMs < startMs || landingMs >= endMs) continue;
+        } else if (windowEnd <= windowStart) {
+          continue;
+        }
+        const lastSample = dwellMs === 0
+          ? landingMs
+          : windowEnd >= endMs
+            ? Math.max(windowStart, endMs - 1e-6)
+            : windowEnd;
+        let t = windowStart;
+        while (true) {
+          const ratio = (t - startMs) / durationMs;
+          const x = current.x + (next.x - current.x) * ratio;
+          const y = current.y + (next.y - current.y) * ratio;
+          if (Math.hypot(x - aoe.x, y - aoe.y) <= aoe.radius + AOE_SAFETY_MARGIN) {
+            earliest = Math.min(earliest, t);
+            break;
+          }
+          if (t >= lastSample) break;
+          t = Math.min(lastSample, t + AOE_SAMPLE_STEP_MS);
         }
       }
       current = next;
