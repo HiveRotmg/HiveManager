@@ -69,6 +69,55 @@ test('a non-turning projectile is unaffected', () => {
   assert.ok(Math.abs(p.y) < 1e-12);
 });
 
+/** Jailer's Scythe proj 0: CircleTurnAngle 90, CircleTurnDelay 200, life 350ms. */
+const jailer: CombatProjectileDefinition = {
+  ...base(), speed: 260, lifetimeMs: 350,
+  circleTurnAngle: 90 * DEG, circleTurnDelay: 200,
+};
+
+test('circle-turn freezes the radius after the delay', () => {
+  const frozen = projectileDistanceAt(jailer, 200);
+  for (const ms of [200, 250, 300, 350]) {
+    const p = turningPositionAt(jailer, 0, 0, 0, ms);
+    const radius = Math.hypot(p.x, p.y);
+    assert.ok(
+      Math.abs(radius - frozen) < 1e-6,
+      `at ${ms}ms the projectile must stay at the frozen radius ${frozen}, got ${radius}`,
+    );
+  }
+});
+
+test('circle-turn travels straight before the delay', () => {
+  const p = turningPositionAt(jailer, 0, 0, 0, 100);
+  assert.ok(Math.abs(p.x - projectileDistanceAt(jailer, 100)) < 1e-9);
+  assert.ok(Math.abs(p.y) < 1e-9);
+});
+
+test('circle-turn sweeps after the delay', () => {
+  const a = turningPositionAt(jailer, 0, 0, 0, 220);
+  const b = turningPositionAt(jailer, 0, 0, 0, 300);
+  const angA = Math.atan2(a.y, a.x);
+  const angB = Math.atan2(b.y, b.x);
+  assert.ok(angB > angA, 'the orbit angle must advance with time');
+});
+
+test('circle-turn resolves the sweep to turnRate when both are set', () => {
+  // Stated as authoritative in the plan's semantics table but otherwise
+  // untested: with TurnRate set, the XML CircleTurnAngle is discarded.
+  const both: CombatProjectileDefinition = { ...jailer, turnRate: 45 * DEG };
+  const p = turningPositionAt(both, 0, 0, 0, 300);
+  // stopMs falls back to circleTurnDelay (200), so 100ms past the delay sweeps
+  // half of turnRate: 22.5 degrees, not the 45 that CircleTurnAngle would give.
+  assert.ok(
+    Math.abs(Math.atan2(p.y, p.x) - 22.5 * DEG) < 1e-9,
+    `expected the turnRate sweep, got ${Math.atan2(p.y, p.x) / DEG} degrees`,
+  );
+  assert.ok(
+    Math.abs(Math.hypot(p.x, p.y) - projectileDistanceAt(both, 200)) < 1e-6,
+    'the radius must still freeze at the delay',
+  );
+});
+
 test('the path is continuous across turnStopTime', () => {
   // The stop branch and the turning branch must agree at the boundary, or the
   // projectile teleports at exactly the moment turning ends.

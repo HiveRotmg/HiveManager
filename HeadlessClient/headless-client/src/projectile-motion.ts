@@ -218,6 +218,29 @@ export function turningPositionAt(
   options: ProjectileDistanceOptions = {},
 ): { x: number; y: number } {
   const distance = projectileDistanceAt(definition, elapsedMs, options);
+
+  // Circle-turn: after the delay, travelled distance FREEZES and the projectile
+  // orbits on a fixed-length arm. It stops advancing outward entirely, which is
+  // why treating it as straight-line travel is maximally wrong.
+  if (definition.circleTurnDelay !== 0) {
+    if (elapsedMs < definition.circleTurnDelay) {
+      out.x = startX + Math.cos(launchAngle) * distance;
+      out.y = startY + Math.sin(launchAngle) * distance;
+      return out;
+    }
+    const frozen = projectileDistanceAt(definition, definition.circleTurnDelay, options);
+    // When TurnRate is also set, the client resolves the circle sweep to
+    // turnRate and discards the XML CircleTurnAngle.
+    const sweep = definition.turnRate !== 0 ? definition.turnRate : definition.circleTurnAngle;
+    const stopMs = effectiveTurnStopTime(definition);
+    const offset = stopMs > 0
+      ? (sweep / stopMs) * (elapsedMs - definition.circleTurnDelay)
+      : 0;
+    out.x = startX + Math.cos(launchAngle + offset) * frozen;
+    out.y = startY + Math.sin(launchAngle + offset) * frozen;
+    return out;
+  }
+
   if (definition.turnRate === 0) {
     out.x = startX + Math.cos(launchAngle) * distance;
     out.y = startY + Math.sin(launchAngle) * distance;

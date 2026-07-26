@@ -633,7 +633,7 @@ function positionAt(
   // Turning projectiles own the whole position calculation: their heading
   // rotates, so the wavy/parametric branches below do not apply. Checked before
   // the shared setup because Task 6 makes this the hot sampling path.
-  if (definition.turnRate !== 0) {
+  if (definition.turnRate !== 0 || definition.circleTurnDelay !== 0) {
     return turningPositionAt(
       definition, projectile.angle, projectile.startX, projectile.startY, elapsed, out,
       { clampElapsed: false },
