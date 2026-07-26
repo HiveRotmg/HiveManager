@@ -30,6 +30,25 @@ export interface CombatProjectileDefinition {
   accelerationDelay: number;
   speedClamp: number;
   armorPiercing?: boolean;
+  /**
+   * Turning model. Mirrors the client's ProjectileProperties turn fields.
+   * `turnRate` and `turnClamp` and `circleTurnAngle` are RADIANS of total
+   * sweep, not rates: the sweep completes over `turnStopTime`.
+   * `turnStopTime` and `circleTurnDelay` are milliseconds; `turnStopTime === 0`
+   * means "no explicit stop, fall back to the projectile lifetime".
+   * `turnRateDelay` and `turnAccelerationDelay` are SECONDS, matching the
+   * reference implementation's elapsed-seconds comparison.
+   */
+  turnRate: number;
+  turnRateDelay: number;
+  turnAcceleration: number;
+  turnAccelerationDelay: number;
+  turnClamp: number;
+  turnStopTime: number;
+  circleTurnAngle: number;
+  circleTurnDelay: number;
+  /** Projectile collision half-extent multiplier; 1 when the XML omits it. */
+  collisionMult: number;
 }
 
 /**
