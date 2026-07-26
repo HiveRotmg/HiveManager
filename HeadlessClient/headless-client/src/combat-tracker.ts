@@ -10,7 +10,11 @@ import {
   StatType,
   SquareHitPacket,
 } from 'realmlib';
-import { projectileDistanceAt, turningPositionAt } from './projectile-motion';
+import {
+  projectileCollisionHalfSize,
+  projectileDistanceAt,
+  turningPositionAt,
+} from './projectile-motion';
 
 export interface CombatProjectileDefinition {
   speed: number;
@@ -450,6 +454,9 @@ export class CombatTracker {
     pos: { x: number; y: number },
     world: PreparedWorld,
   ): boolean {
+    // Shared with the dodge planner's segment collisionRadius; see
+    // projectileCollisionHalfSize.
+    const halfSize = projectileCollisionHalfSize(projectile.definition);
     const tileX = Math.floor(pos.x);
     const tileY = Math.floor(pos.y);
     const outside = tileX < 0 || tileY < 0
@@ -484,7 +491,7 @@ export class CombatTracker {
     }
 
     if (projectile.side === 'enemy') {
-      if (withinHitBox(pos, world.snapshot.playerPos)
+      if (withinHitBox(pos, world.snapshot.playerPos, halfSize)
         && !projectile.hitObjects.has(world.snapshot.playerId)) {
         const intercepted = this.onPlayerHit?.({
           bulletId: projectile.bulletId,
@@ -500,7 +507,7 @@ export class CombatTracker {
         this.send(hit);
         return !projectile.definition.multiHit;
       }
-      const player = nearestHit(pos, world.players, projectile.hitObjects);
+      const player = nearestHit(pos, world.players, projectile.hitObjects, halfSize);
       if (player) {
         projectile.hitObjects.add(player.objectId);
         if (!projectile.definition.multiHit) {
@@ -511,7 +518,7 @@ export class CombatTracker {
       return false;
     }
 
-    const enemy = firstHit(pos, world.enemies, projectile.hitObjects);
+    const enemy = firstHit(pos, world.enemies, projectile.hitObjects, halfSize);
     if (!enemy) {
       return false;
     }
@@ -580,19 +587,31 @@ function rawNumber(entity: CombatEntity, stat: number): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function withinHitBox(a: { x: number; y: number }, b: { x: number; y: number }): boolean {
-  return Math.abs(a.x - b.x) <= 0.5 && Math.abs(a.y - b.y) <= 0.5;
+/**
+ * `halfSize` is required rather than defaulted to 0.5 so that a new call site
+ * cannot silently reintroduce the hardcoded extent. It must always come from
+ * projectileCollisionHalfSize, which the dodge planner uses for the same
+ * projectile — if the two disagree the planner dodges a differently-sized
+ * bullet than the one that actually connects.
+ */
+function withinHitBox(
+  a: { x: number; y: number },
+  b: { x: number; y: number },
+  halfSize: number,
+): boolean {
+  return Math.abs(a.x - b.x) <= halfSize && Math.abs(a.y - b.y) <= halfSize;
 }
 
 function nearestHit(
   pos: { x: number; y: number },
   entities: CombatEntity[],
   ignored: Set<number>,
+  halfSize: number,
 ): CombatEntity | undefined {
   let nearest: CombatEntity | undefined;
   let nearestDistance = Infinity;
   for (const entity of entities) {
-    if (ignored.has(entity.objectId) || !withinHitBox(pos, entity)) {
+    if (ignored.has(entity.objectId) || !withinHitBox(pos, entity, halfSize)) {
       continue;
     }
     const dx = entity.x - pos.x;
@@ -610,8 +629,11 @@ function firstHit(
   pos: { x: number; y: number },
   entities: CombatEntity[],
   ignored: Set<number>,
+  halfSize: number,
 ): CombatEntity | undefined {
-  return entities.find((entity) => !ignored.has(entity.objectId) && withinHitBox(pos, entity));
+  return entities.find(
+    (entity) => !ignored.has(entity.objectId) && withinHitBox(pos, entity, halfSize),
+  );
 }
 
 /** Predicts a projectile's analytic world position at an absolute client time. */

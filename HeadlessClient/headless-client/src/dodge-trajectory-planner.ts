@@ -10,6 +10,7 @@ import {
   ENEMY_SOFT_AVOID_RADIUS,
   type LocalDodgeCollisionSnapshot,
 } from './dodge-collision-world';
+import { projectileCollisionHalfSize } from './projectile-motion';
 import {
   normalizeDodgeMovementIntent,
   type CombatRangeDodgeIntent,
@@ -189,10 +190,13 @@ const URGENT_MAX_STATES_PER_LAYER = 32;
 const DEFAULT_SPATIAL_BUCKET_SIZE = 0.075;
 const DEFAULT_COLLISION_RESOLUTION = 0.1;
 const DEFAULT_PROJECTILE_STEP_MS = 20;
-// CombatTracker resolves projectile hits with a single relative AABB half-extent.
-// Keep the planner's hard collision box identical instead of adding projectile
-// metadata or prediction margins that would silently turn 0.5 into 0.55+.
-const DODGE_HITBOX_HALF_SIZE = 0.5;
+// The planner's per-projectile collision half-extent is projectileCollisionHalfSize,
+// which CombatTracker's hit resolver uses for the same projectile. Keep it that
+// way rather than adding prediction margins that would silently inflate it, and
+// do not reintroduce a local constant here - a second source of truth is exactly
+// how the planner ends up dodging a differently-sized bullet than the one that
+// connects. The unscaled base lives in projectile-motion as
+// BASE_COLLISION_HALF_SIZE.
 const AOE_SAFETY_MARGIN = 0.08;
 const PROJECTILE_NEAR_BAND = 0.9;
 const AOE_NEAR_BAND = 0.75;
@@ -1597,7 +1601,7 @@ export class SpaceTimeDodgePlanner {
       const previous = predictProjectilePosition(projectile, input.time + firstOffset);
       let previousOffset = firstOffset;
       let previousPoint = { ...previous };
-      const collisionRadius = DODGE_HITBOX_HALF_SIZE;
+      const collisionRadius = projectileCollisionHalfSize(projectile.definition);
 
       while (previousOffset < finalOffset - 1e-9) {
         const nextOffset = Math.min(finalOffset, previousOffset + stepMs);

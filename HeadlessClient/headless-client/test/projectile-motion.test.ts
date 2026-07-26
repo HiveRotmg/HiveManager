@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { isNonlinearProjectile, type CombatProjectileDefinition } from '../src/combat-tracker';
-import { projectileDistanceAt, effectiveTurnStopTime, turnAngleAt } from '../src/projectile-motion';
+import {
+  projectileDistanceAt,
+  effectiveTurnStopTime,
+  turnAngleAt,
+  projectileCollisionHalfSize,
+} from '../src/projectile-motion';
 
 const DEG = Math.PI / 180;
 
@@ -127,6 +132,16 @@ test('turn delay suppresses turning until turnRateDelay seconds', () => {
   const d = { ...scythe(), turnRateDelay: 0.1 };   // 100ms, expressed in seconds
   assert.equal(turnAngleAt(d, 50), 0, 'before the delay there is no turn');
   assert.ok(turnAngleAt(d, 200) > 0, 'after the delay it turns');
+});
+
+test('collision half-extent scales with collisionMult', () => {
+  assert.equal(projectileCollisionHalfSize(straight()), 0.5, 'default mult 1 => 0.5');
+  assert.equal(projectileCollisionHalfSize({ ...straight(), collisionMult: 2 }), 1.0);
+  assert.equal(
+    projectileCollisionHalfSize({ ...straight(), collisionMult: 0 }),
+    0.5,
+    'a zero/absent mult must fall back to 1, never collapse the hitbox to nothing',
+  );
 });
 
 test('turning projectiles are classified nonlinear', () => {

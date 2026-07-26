@@ -195,6 +195,37 @@ export function turnAngleAt(
   return applyTurnAcceleration(definition, angle, elapsedSeconds);
 }
 
+/** Base half-extent, identical to the planner's DODGE_HITBOX_HALF_SIZE. */
+export const BASE_COLLISION_HALF_SIZE = 0.5;
+
+/**
+ * Collision half-extent for a projectile. The client scales its square
+ * half-extent by CollisionMult; a missing or zero multiplier means 1.
+ *
+ * The planner and CombatTracker must both use this — if they disagree the
+ * planner dodges a differently-sized bullet than the one that actually hits.
+ * Both do: dodge-trajectory-planner's segment collisionRadius and
+ * combat-tracker's resolveAt half-extent are each this function.
+ *
+ * This REPLACES the old hardcoded 0.5 rather than adding to it. The reading is
+ * not obvious — combat-tracker's withinHitBox tests the projectile centre
+ * against a box around the target, so 0.5 could equally have been the target's
+ * half-extent, to which the projectile's would then be added. The reference
+ * semantics settle it: "collision half-extent is 0.5 x CollisionMult,
+ * confirming the hardcoded 0.5 is only correct for CollisionMult == 1", i.e.
+ * the single existing threshold is the thing being scaled. At mult 1 both
+ * readings give 0.5, so no fixture can distinguish them; at mult 10.5 they
+ * differ by a whole tile. Still owed validation against golden fixtures and
+ * live server-confirmed hit events, which the design doc flags as outstanding
+ * for all of these semantics.
+ */
+export function projectileCollisionHalfSize(
+  definition: CombatProjectileDefinition,
+): number {
+  const mult = definition.collisionMult > 0 ? definition.collisionMult : 1;
+  return BASE_COLLISION_HALF_SIZE * mult;
+}
+
 /**
  * Position of a turning projectile.
  *

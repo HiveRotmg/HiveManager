@@ -74,6 +74,25 @@ test('enemy projectile reports PLAYERHIT once when it reaches the local player',
   assert.equal(tracker.size, 0);
 });
 
+test('the hit resolver honours collisionMult, not a hardcoded 0.5', () => {
+  // The projectile flies along y=1 from x=0; the player sits 0.75 tiles off
+  // that line, i.e. outside the default half-extent but inside a doubled one.
+  const playerPos = { x: 5, y: 1.75 };
+  const fire = (mult: number): Packet[] => {
+    const sent: Packet[] = [];
+    const tracker = new CombatTracker(dataWithCollisionMult(mult), (p) => sent.push(p));
+    tracker.trackEnemyShoot(enemyShot(), 100, 0);
+    for (const t of [400, 600, 800]) tracker.update(t, world({ playerPos }));
+    return sent;
+  };
+
+  assert.equal(fire(1).length, 0, '0.75 tiles is outside the default 0.5 half-extent');
+
+  const wide = fire(2);
+  assert.equal(wide.length, 1, 'collisionMult 2 widens the half-extent to 1.0, so it connects');
+  assert.ok(wide[0] instanceof PlayerHitPacket);
+});
+
 test('enemy projectile interception suppresses PLAYERHIT before reconnecting', () => {
   const sent: Packet[] = [];
   const intercepted: number[] = [];
@@ -397,6 +416,16 @@ function data(): CombatDataProvider {
   return {
     getObject: (type) => objects.get(type),
     getProjectile: (type, id) => (type === 100 || type === 500) && id === 0 ? projectile : undefined,
+  };
+}
+
+/** Like `data()`, but the projectile carries a non-default CollisionMult. */
+function dataWithCollisionMult(collisionMult: number): CombatDataProvider {
+  const scaled: CombatProjectileDefinition = { ...projectile, collisionMult };
+  const provider = data();
+  return {
+    getObject: provider.getObject,
+    getProjectile: (type, id) => (provider.getProjectile(type, id) ? scaled : undefined),
   };
 }
 
