@@ -68,7 +68,12 @@ export function isNonlinearProjectile(definition: CombatProjectileDefinition): b
     || definition.parametric
     || definition.boomerang
     || definition.amplitude !== 0
-    || definition.acceleration !== 0;
+    || definition.acceleration !== 0
+    // Turning projectiles arc. Classifying one as linear makes
+    // predictProjectileSegments emit a single straight segment across the whole
+    // planning horizon for a path that curves - the defect this model fixes.
+    || definition.turnRate !== 0
+    || definition.circleTurnDelay !== 0;
 }
 
 export interface CombatPlayerHit {

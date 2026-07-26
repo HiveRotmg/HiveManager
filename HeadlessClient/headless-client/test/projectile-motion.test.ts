@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { CombatProjectileDefinition } from '../src/combat-tracker';
+import { isNonlinearProjectile, type CombatProjectileDefinition } from '../src/combat-tracker';
 import { projectileDistanceAt, effectiveTurnStopTime, turnAngleAt } from '../src/projectile-motion';
 
 const DEG = Math.PI / 180;
@@ -127,6 +127,21 @@ test('turn delay suppresses turning until turnRateDelay seconds', () => {
   const d = { ...scythe(), turnRateDelay: 0.1 };   // 100ms, expressed in seconds
   assert.equal(turnAngleAt(d, 50), 0, 'before the delay there is no turn');
   assert.ok(turnAngleAt(d, 200) > 0, 'after the delay it turns');
+});
+
+test('turning projectiles are classified nonlinear', () => {
+  const DEGR = Math.PI / 180;
+  assert.equal(isNonlinearProjectile(straight()), false, 'a plain projectile is linear');
+  assert.equal(
+    isNonlinearProjectile({ ...straight(), turnRate: 90 * DEGR }),
+    true,
+    'TurnRate alone must force sub-sampling',
+  );
+  assert.equal(
+    isNonlinearProjectile({ ...straight(), circleTurnDelay: 200, circleTurnAngle: 90 * DEGR }),
+    true,
+    'circle-turn alone must force sub-sampling',
+  );
 });
 
 test('turn acceleration adds a quadratic phase after its delay', () => {
