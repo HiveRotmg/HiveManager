@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { CombatProjectileDefinition } from '../src/combat-tracker';
-import { projectileDistanceAt, effectiveTurnStopTime } from '../src/projectile-motion';
+import { projectileDistanceAt, effectiveTurnStopTime, turnAngleAt } from '../src/projectile-motion';
+
+const DEG = Math.PI / 180;
 
 /** A plain non-turning projectile: every turn field is inert. */
 function straight(): CombatProjectileDefinition {
@@ -97,5 +99,46 @@ test('floorAtZero:true stops a folded boomerang at the origin, as auto-combat do
     projectileDistanceAt(d, 1_000, { ...options, floorAtZero: true }),
     0,
     'auto-combat floored the result at zero',
+  );
+});
+
+/** Ferryman's Scythe proj 0: 90 degrees of sweep across a 250ms life. */
+function scythe(): CombatProjectileDefinition {
+  return { ...straight(), speed: 243, lifetimeMs: 250, turnRate: 90 * DEG };
+}
+
+test('turn angle sweeps the full TurnRate across turnStopTime', () => {
+  const d = scythe();                       // turnStopTime 0 => lifetime 250ms
+  assert.ok(Math.abs(turnAngleAt(d, 0)) < 1e-12);
+  assert.ok(Math.abs(turnAngleAt(d, 125) - 45 * DEG) < 1e-9, 'half way => half the sweep');
+  assert.ok(Math.abs(turnAngleAt(d, 250) - 90 * DEG) < 1e-9, 'full sweep at turnStopTime');
+});
+
+test('turn angle is zero past turnStopTime unless ignoreStop', () => {
+  const d = { ...scythe(), turnStopTime: 100 };
+  assert.equal(turnAngleAt(d, 150), 0, 'past the stop, no turn offset');
+  assert.ok(
+    Math.abs(turnAngleAt(d, 150, true) - 135 * DEG) < 1e-9,
+    'ignoreStop keeps extrapolating, used to sample the stop heading',
+  );
+});
+
+test('turn delay suppresses turning until turnRateDelay seconds', () => {
+  const d = { ...scythe(), turnRateDelay: 0.1 };   // 100ms, expressed in seconds
+  assert.equal(turnAngleAt(d, 50), 0, 'before the delay there is no turn');
+  assert.ok(turnAngleAt(d, 200) > 0, 'after the delay it turns');
+});
+
+test('turn acceleration adds a quadratic phase after its delay', () => {
+  const base = { ...scythe(), turnStopTime: 1_000, lifetimeMs: 1_000 };
+  const accel = { ...base, turnAcceleration: 90 * DEG, turnClamp: 180 * DEG };
+  assert.equal(
+    turnAngleAt({ ...accel, turnAccelerationDelay: 10 }, 100),
+    turnAngleAt(base, 100),
+    'before the acceleration delay it matches the un-accelerated curve',
+  );
+  assert.ok(
+    turnAngleAt(accel, 500) > turnAngleAt(base, 500),
+    'after the delay the accelerated curve has swept further',
   );
 });

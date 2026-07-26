@@ -128,3 +128,69 @@ export function projectileDistanceAt(
   }
   return floorAtZero ? Math.max(0, distance) : distance;
 }
+
+/**
+ * Quadratic turn-acceleration phase. Returns `angle` unchanged when the
+ * projectile has no turn acceleration or has not reached its delay.
+ *
+ * `turnClamp` bounds the angular velocity acceleration may add beyond
+ * `turnRate`; once that bound is reached the extra sweep accumulates linearly
+ * at the clamped velocity. Note this reads `turnRate` as a velocity, whereas
+ * the base sweep reads it as a total angle spread over turnStopTime - the two
+ * interpretations coexist in the reference and are not yet reconciled against
+ * golden fixtures. Reachable only for the 161 TurnAcceleration entries in
+ * Manager/data/objects.xml, against 890 TurnRate ones, so the unreconciled
+ * reading is confined to a small minority of turners. Tracked as plan-v9r.
+ */
+function applyTurnAcceleration(
+  definition: CombatProjectileDefinition,
+  angle: number,
+  elapsedSeconds: number,
+): number {
+  if (definition.turnAcceleration === 0) return angle;
+  if (elapsedSeconds < definition.turnAccelerationDelay) return angle;
+
+  const dt = elapsedSeconds - definition.turnAccelerationDelay;
+  const positive = definition.turnAcceleration > 0;
+  const clampSpan = positive
+    ? Math.max(definition.turnClamp, definition.turnRate) - definition.turnRate
+    : Math.min(definition.turnClamp, definition.turnRate) - definition.turnRate;
+  if (clampSpan === 0) return angle;
+
+  // Time to reach the clamp under constant turn acceleration.
+  const timeToClamp = clampSpan / definition.turnAcceleration;
+  if (dt <= timeToClamp) {
+    return angle + definition.turnAcceleration * dt * dt * 0.5;
+  }
+  const atClamp = definition.turnAcceleration * timeToClamp * timeToClamp * 0.5;
+  return angle + atClamp + (dt - timeToClamp) * clampSpan;
+}
+
+/**
+ * Turn offset in radians at `elapsedMs`, to be added to the launch angle.
+ *
+ * `turnRate` is a TOTAL sweep, not a rate: the whole sweep completes over
+ * `effectiveTurnStopTime`. Past that point the projectile stops turning and
+ * this returns 0 — callers wanting the heading AT the stop pass
+ * `ignoreStop = true` to keep extrapolating.
+ */
+export function turnAngleAt(
+  definition: CombatProjectileDefinition,
+  elapsedMs: number,
+  ignoreStop = false,
+): number {
+  if (definition.turnRate === 0) return 0;
+  const stopMs = effectiveTurnStopTime(definition);
+  if (stopMs <= 0) return 0;
+  if (!ignoreStop && elapsedMs > stopMs) return 0;
+
+  const elapsedSeconds = elapsedMs / 1000;
+  let angle: number;
+  if (definition.turnRateDelay !== 0) {
+    if (elapsedSeconds < definition.turnRateDelay) return 0;
+    angle = (elapsedMs - definition.turnRateDelay * 1000) * (definition.turnRate / stopMs);
+  } else {
+    angle = elapsedMs * (definition.turnRate / stopMs);
+  }
+  return applyTurnAcceleration(definition, angle, elapsedSeconds);
+}
