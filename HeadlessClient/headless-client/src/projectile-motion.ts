@@ -194,3 +194,59 @@ export function turnAngleAt(
   }
   return applyTurnAcceleration(definition, angle, elapsedSeconds);
 }
+
+/**
+ * Position of a turning projectile.
+ *
+ * The path is a growing "clock hand": travelled distance along a heading that
+ * rotates by `turnAngleAt`. Once `effectiveTurnStopTime` passes, turning stops
+ * and the projectile continues straight from the stop position, along the
+ * heading it had at that instant — sampled by finite difference over +16ms,
+ * matching the reference implementation.
+ *
+ * `options` is forwarded to every distance call so that a caller's clamping and
+ * boomerang choices apply uniformly across the turning and straight branches;
+ * combat-tracker passes `clampElapsed: false` to match its own straight path.
+ */
+export function turningPositionAt(
+  definition: CombatProjectileDefinition,
+  launchAngle: number,
+  startX: number,
+  startY: number,
+  elapsedMs: number,
+  out: { x: number; y: number } = { x: 0, y: 0 },
+  options: ProjectileDistanceOptions = {},
+): { x: number; y: number } {
+  const distance = projectileDistanceAt(definition, elapsedMs, options);
+  if (definition.turnRate === 0) {
+    out.x = startX + Math.cos(launchAngle) * distance;
+    out.y = startY + Math.sin(launchAngle) * distance;
+    return out;
+  }
+
+  const stopMs = effectiveTurnStopTime(definition);
+  if (elapsedMs >= stopMs && stopMs > 0) {
+    const stopDistance = projectileDistanceAt(definition, stopMs, options);
+    const stopAngle = launchAngle + turnAngleAt(definition, stopMs, true);
+    const stopX = startX + Math.cos(stopAngle) * stopDistance;
+    const stopY = startY + Math.sin(stopAngle) * stopDistance;
+
+    // Heading at the stop, by finite difference just past it.
+    const aheadMs = stopMs + 16;
+    const aheadDistance = projectileDistanceAt(definition, aheadMs, options);
+    const aheadAngle = launchAngle + turnAngleAt(definition, aheadMs, true);
+    const aheadX = startX + Math.cos(aheadAngle) * aheadDistance;
+    const aheadY = startY + Math.sin(aheadAngle) * aheadDistance;
+
+    const heading = Math.atan2(aheadY - stopY, aheadX - stopX);
+    const remaining = distance - stopDistance;
+    out.x = stopX + Math.cos(heading) * remaining;
+    out.y = stopY + Math.sin(heading) * remaining;
+    return out;
+  }
+
+  const angle = launchAngle + turnAngleAt(definition, elapsedMs, false);
+  out.x = startX + Math.cos(angle) * distance;
+  out.y = startY + Math.sin(angle) * distance;
+  return out;
+}

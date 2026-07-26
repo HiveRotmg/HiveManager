@@ -10,7 +10,7 @@ import {
   StatType,
   SquareHitPacket,
 } from 'realmlib';
-import { projectileDistanceAt } from './projectile-motion';
+import { projectileDistanceAt, turningPositionAt } from './projectile-motion';
 
 export interface CombatProjectileDefinition {
   speed: number;
@@ -629,6 +629,17 @@ function positionAt(
   out: { x: number; y: number } = { x: 0, y: 0 },
 ): { x: number; y: number } {
   const definition = projectile.definition;
+
+  // Turning projectiles own the whole position calculation: their heading
+  // rotates, so the wavy/parametric branches below do not apply. Checked before
+  // the shared setup because Task 6 makes this the hot sampling path.
+  if (definition.turnRate !== 0) {
+    return turningPositionAt(
+      definition, projectile.angle, projectile.startX, projectile.startY, elapsed, out,
+      { clampElapsed: false },
+    );
+  }
+
   const trajectoryLifetime = definition.trajectoryLifetimeMs ?? definition.lifetimeMs;
   const baseSpeed = definition.speed / 10000;
   // No clamp and no zero floor: this call site never had either. See the
