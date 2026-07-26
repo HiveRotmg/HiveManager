@@ -10,6 +10,7 @@ import {
   StatType,
   SquareHitPacket,
 } from 'realmlib';
+import { projectileDistanceAt } from './projectile-motion';
 
 export interface CombatProjectileDefinition {
   speed: number;
@@ -630,26 +631,9 @@ function positionAt(
   const definition = projectile.definition;
   const trajectoryLifetime = definition.trajectoryLifetimeMs ?? definition.lifetimeMs;
   const baseSpeed = definition.speed / 10000;
-  let distance: number;
-  if (definition.acceleration === 0 || elapsed < definition.accelerationDelay) {
-    distance = elapsed * baseSpeed;
-  } else {
-    const accelerationElapsed = elapsed - definition.accelerationDelay;
-    let accelerationTime = accelerationElapsed;
-    let clampedTime = 0;
-    let clampedSpeed = 0;
-    if (definition.speedClamp !== -1) {
-      clampedSpeed = definition.speedClamp / 10000;
-      const speedNeeded = Math.abs(definition.speedClamp - definition.speed);
-      const timeToClamp = speedNeeded / Math.abs(definition.acceleration) * 1000;
-      accelerationTime = Math.min(accelerationElapsed, timeToClamp);
-      clampedTime = Math.max(0, accelerationElapsed - accelerationTime);
-    }
-    distance = definition.accelerationDelay * baseSpeed
-      + accelerationTime * baseSpeed
-      + (accelerationTime * accelerationTime / 1000) * 0.5 * (definition.acceleration / 10000)
-      + clampedTime * clampedSpeed;
-  }
+  // No clamp and no zero floor: this call site never had either. See the
+  // divergence note at the top of projectile-motion.ts.
+  let distance = projectileDistanceAt(definition, elapsed, { clampElapsed: false });
 
   const phase = projectile.bulletId % 2 === 0 ? 0 : Math.PI;
   let x = projectile.startX;
