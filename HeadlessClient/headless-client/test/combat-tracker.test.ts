@@ -37,6 +37,15 @@ const projectile: CombatProjectileDefinition = {
   acceleration: 0,
   accelerationDelay: 0,
   speedClamp: -1,
+  turnRate: 0,
+  turnRateDelay: 0,
+  turnAcceleration: 0,
+  turnAccelerationDelay: 0,
+  turnClamp: 0,
+  turnStopTime: 0,
+  circleTurnAngle: 0,
+  circleTurnDelay: 0,
+  collisionMult: 1,
 };
 
 test('isNonlinearProjectile flags each of the five nonlinear-motion attributes', () => {
@@ -63,6 +72,25 @@ test('enemy projectile reports PLAYERHIT once when it reaches the local player',
   assert.equal(sent[0].bulletId, 7);
   assert.equal(sent[0].objectId, 20);
   assert.equal(tracker.size, 0);
+});
+
+test('the hit resolver honours collisionMult, not a hardcoded 0.5', () => {
+  // The projectile flies along y=1 from x=0; the player sits 0.75 tiles off
+  // that line, i.e. outside the default half-extent but inside a doubled one.
+  const playerPos = { x: 5, y: 1.75 };
+  const fire = (mult: number): Packet[] => {
+    const sent: Packet[] = [];
+    const tracker = new CombatTracker(dataWithCollisionMult(mult), (p) => sent.push(p));
+    tracker.trackEnemyShoot(enemyShot(), 100, 0);
+    for (const t of [400, 600, 800]) tracker.update(t, world({ playerPos }));
+    return sent;
+  };
+
+  assert.equal(fire(1).length, 0, '0.75 tiles is outside the default 0.5 half-extent');
+
+  const wide = fire(2);
+  assert.equal(wide.length, 1, 'collisionMult 2 widens the half-extent to 1.0, so it connects');
+  assert.ok(wide[0] instanceof PlayerHitPacket);
 });
 
 test('enemy projectile interception suppresses PLAYERHIT before reconnecting', () => {
@@ -388,6 +416,16 @@ function data(): CombatDataProvider {
   return {
     getObject: (type) => objects.get(type),
     getProjectile: (type, id) => (type === 100 || type === 500) && id === 0 ? projectile : undefined,
+  };
+}
+
+/** Like `data()`, but the projectile carries a non-default CollisionMult. */
+function dataWithCollisionMult(collisionMult: number): CombatDataProvider {
+  const scaled: CombatProjectileDefinition = { ...projectile, collisionMult };
+  const provider = data();
+  return {
+    getObject: provider.getObject,
+    getProjectile: (type, id) => (provider.getProjectile(type, id) ? scaled : undefined),
   };
 }
 

@@ -1,11 +1,19 @@
 /**
  * Commit 5.1 — Chebyshev morphological dilation for unified static passability.
  *
- * playerRadius matches DODGE_HITBOX_HALF_SIZE (1.0×1.0 player hitbox half-extent).
+ * playerRadius is the 1.0×1.0 player hitbox half-extent.
  * clearance reproduces the inlined 0.5 fractional neighbor window in canOccupyAt().
  */
 
-/** Half-extent of the 1.0×1.0 player hitbox; aligned with DODGE_HITBOX_HALF_SIZE. */
+/**
+ * Half-extent of the 1.0×1.0 player hitbox.
+ *
+ * Numerically equal to projectile-motion's BASE_COLLISION_HALF_SIZE but a
+ * distinct concept: this is how much space the PLAYER occupies, whereas that is
+ * the unscaled base for a PROJECTILE's collision box. They are not required to
+ * track each other, and projectile extents now scale per definition via
+ * projectileCollisionHalfSize.
+ */
 export const INFLATED_PLAYER_RADIUS = 0.5;
 
 /**

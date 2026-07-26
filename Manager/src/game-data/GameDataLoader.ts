@@ -31,6 +31,15 @@ export interface ProjectileDef {
   acceleration: number;
   accelerationDelay: number;
   speedClamp: number;
+  turnRate: number;
+  turnRateDelay: number;
+  turnAcceleration: number;
+  turnAccelerationDelay: number;
+  turnClamp: number;
+  turnStopTime: number;
+  circleTurnAngle: number;
+  circleTurnDelay: number;
+  collisionMult: number;
 }
 
 export interface WeaponPatternDef {
@@ -564,6 +573,17 @@ export class GameDataLoader {
             acceleration: Number(proj.Acceleration ?? 0),
             accelerationDelay: Number(proj.AccelerationDelay ?? 0),
             speedClamp: Number(proj.SpeedClamp ?? -1),
+            // Turn fields. XML angles are degrees; store radians. XML omits
+            // most of these on most projectiles, hence the zero defaults.
+            turnRate: Number(proj.TurnRate ?? 0) * Math.PI / 180,
+            turnRateDelay: Number(proj.TurnRateDelay ?? 0),
+            turnAcceleration: Number(proj.TurnAcceleration ?? 0) * Math.PI / 180,
+            turnAccelerationDelay: Number(proj.TurnAccelerationDelay ?? 0),
+            turnClamp: Number(proj.TurnClamp ?? 0) * Math.PI / 180,
+            turnStopTime: Number(proj.TurnStopTime ?? 0),
+            circleTurnAngle: Number(proj.CircleTurnAngle ?? 0) * Math.PI / 180,
+            circleTurnDelay: Number(proj.CircleTurnDelay ?? 0),
+            collisionMult: Number(proj.CollisionMult ?? 1),
           });
         }
       }

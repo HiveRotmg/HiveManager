@@ -10,6 +10,11 @@ import {
   StatType,
   SquareHitPacket,
 } from 'realmlib';
+import {
+  projectileCollisionHalfSize,
+  projectileDistanceAt,
+  turningPositionAt,
+} from './projectile-motion';
 
 export interface CombatProjectileDefinition {
   speed: number;
@@ -30,6 +35,25 @@ export interface CombatProjectileDefinition {
   accelerationDelay: number;
   speedClamp: number;
   armorPiercing?: boolean;
+  /**
+   * Turning model. Mirrors the client's ProjectileProperties turn fields.
+   * `turnRate` and `turnClamp` and `circleTurnAngle` are RADIANS of total
+   * sweep, not rates: the sweep completes over `turnStopTime`.
+   * `turnStopTime` and `circleTurnDelay` are milliseconds; `turnStopTime === 0`
+   * means "no explicit stop, fall back to the projectile lifetime".
+   * `turnRateDelay` and `turnAccelerationDelay` are SECONDS, matching the
+   * reference implementation's elapsed-seconds comparison.
+   */
+  turnRate: number;
+  turnRateDelay: number;
+  turnAcceleration: number;
+  turnAccelerationDelay: number;
+  turnClamp: number;
+  turnStopTime: number;
+  circleTurnAngle: number;
+  circleTurnDelay: number;
+  /** Projectile collision half-extent multiplier; 1 when the XML omits it. */
+  collisionMult: number;
 }
 
 /**
@@ -48,7 +72,12 @@ export function isNonlinearProjectile(definition: CombatProjectileDefinition): b
     || definition.parametric
     || definition.boomerang
     || definition.amplitude !== 0
-    || definition.acceleration !== 0;
+    || definition.acceleration !== 0
+    // Turning projectiles arc. Classifying one as linear makes
+    // predictProjectileSegments emit a single straight segment across the whole
+    // planning horizon for a path that curves - the defect this model fixes.
+    || definition.turnRate !== 0
+    || definition.circleTurnDelay !== 0;
 }
 
 export interface CombatPlayerHit {
@@ -425,6 +454,9 @@ export class CombatTracker {
     pos: { x: number; y: number },
     world: PreparedWorld,
   ): boolean {
+    // Shared with the dodge planner's segment collisionRadius; see
+    // projectileCollisionHalfSize.
+    const halfSize = projectileCollisionHalfSize(projectile.definition);
     const tileX = Math.floor(pos.x);
     const tileY = Math.floor(pos.y);
     const outside = tileX < 0 || tileY < 0
@@ -459,7 +491,7 @@ export class CombatTracker {
     }
 
     if (projectile.side === 'enemy') {
-      if (withinHitBox(pos, world.snapshot.playerPos)
+      if (withinHitBox(pos, world.snapshot.playerPos, halfSize)
         && !projectile.hitObjects.has(world.snapshot.playerId)) {
         const intercepted = this.onPlayerHit?.({
           bulletId: projectile.bulletId,
@@ -475,7 +507,7 @@ export class CombatTracker {
         this.send(hit);
         return !projectile.definition.multiHit;
       }
-      const player = nearestHit(pos, world.players, projectile.hitObjects);
+      const player = nearestHit(pos, world.players, projectile.hitObjects, halfSize);
       if (player) {
         projectile.hitObjects.add(player.objectId);
         if (!projectile.definition.multiHit) {
@@ -486,7 +518,7 @@ export class CombatTracker {
       return false;
     }
 
-    const enemy = firstHit(pos, world.enemies, projectile.hitObjects);
+    const enemy = firstHit(pos, world.enemies, projectile.hitObjects, halfSize);
     if (!enemy) {
       return false;
     }
@@ -555,19 +587,31 @@ function rawNumber(entity: CombatEntity, stat: number): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function withinHitBox(a: { x: number; y: number }, b: { x: number; y: number }): boolean {
-  return Math.abs(a.x - b.x) <= 0.5 && Math.abs(a.y - b.y) <= 0.5;
+/**
+ * `halfSize` is required rather than defaulted to 0.5 so that a new call site
+ * cannot silently reintroduce the hardcoded extent. It must always come from
+ * projectileCollisionHalfSize, which the dodge planner uses for the same
+ * projectile — if the two disagree the planner dodges a differently-sized
+ * bullet than the one that actually connects.
+ */
+function withinHitBox(
+  a: { x: number; y: number },
+  b: { x: number; y: number },
+  halfSize: number,
+): boolean {
+  return Math.abs(a.x - b.x) <= halfSize && Math.abs(a.y - b.y) <= halfSize;
 }
 
 function nearestHit(
   pos: { x: number; y: number },
   entities: CombatEntity[],
   ignored: Set<number>,
+  halfSize: number,
 ): CombatEntity | undefined {
   let nearest: CombatEntity | undefined;
   let nearestDistance = Infinity;
   for (const entity of entities) {
-    if (ignored.has(entity.objectId) || !withinHitBox(pos, entity)) {
+    if (ignored.has(entity.objectId) || !withinHitBox(pos, entity, halfSize)) {
       continue;
     }
     const dx = entity.x - pos.x;
@@ -585,8 +629,11 @@ function firstHit(
   pos: { x: number; y: number },
   entities: CombatEntity[],
   ignored: Set<number>,
+  halfSize: number,
 ): CombatEntity | undefined {
-  return entities.find((entity) => !ignored.has(entity.objectId) && withinHitBox(pos, entity));
+  return entities.find(
+    (entity) => !ignored.has(entity.objectId) && withinHitBox(pos, entity, halfSize),
+  );
 }
 
 /** Predicts a projectile's analytic world position at an absolute client time. */
@@ -609,28 +656,22 @@ function positionAt(
   out: { x: number; y: number } = { x: 0, y: 0 },
 ): { x: number; y: number } {
   const definition = projectile.definition;
+
+  // Turning projectiles own the whole position calculation: their heading
+  // rotates, so the wavy/parametric branches below do not apply. Checked before
+  // the shared setup because Task 6 makes this the hot sampling path.
+  if (definition.turnRate !== 0 || definition.circleTurnDelay !== 0) {
+    return turningPositionAt(
+      definition, projectile.angle, projectile.startX, projectile.startY, elapsed, out,
+      { clampElapsed: false },
+    );
+  }
+
   const trajectoryLifetime = definition.trajectoryLifetimeMs ?? definition.lifetimeMs;
   const baseSpeed = definition.speed / 10000;
-  let distance: number;
-  if (definition.acceleration === 0 || elapsed < definition.accelerationDelay) {
-    distance = elapsed * baseSpeed;
-  } else {
-    const accelerationElapsed = elapsed - definition.accelerationDelay;
-    let accelerationTime = accelerationElapsed;
-    let clampedTime = 0;
-    let clampedSpeed = 0;
-    if (definition.speedClamp !== -1) {
-      clampedSpeed = definition.speedClamp / 10000;
-      const speedNeeded = Math.abs(definition.speedClamp - definition.speed);
-      const timeToClamp = speedNeeded / Math.abs(definition.acceleration) * 1000;
-      accelerationTime = Math.min(accelerationElapsed, timeToClamp);
-      clampedTime = Math.max(0, accelerationElapsed - accelerationTime);
-    }
-    distance = definition.accelerationDelay * baseSpeed
-      + accelerationTime * baseSpeed
-      + (accelerationTime * accelerationTime / 1000) * 0.5 * (definition.acceleration / 10000)
-      + clampedTime * clampedSpeed;
-  }
+  // No clamp and no zero floor: this call site never had either. See the
+  // divergence note at the top of projectile-motion.ts.
+  let distance = projectileDistanceAt(definition, elapsed, { clampElapsed: false });
 
   const phase = projectile.bulletId % 2 === 0 ? 0 : Math.PI;
   let x = projectile.startX;

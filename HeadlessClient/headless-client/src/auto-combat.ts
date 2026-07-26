@@ -6,6 +6,7 @@ import {
 import type { CombatDataProvider, CombatProjectileDefinition } from './combat-tracker';
 import type { WeaponAimPreview } from './command-sender';
 import type { TrackedObject } from './models';
+import { projectileDistanceAt as sharedProjectileDistanceAt } from './projectile-motion';
 import { TargetMotionPredictor, type MotionObservation } from './target-motion-predictor';
 
 export type AutoAimMode = 'closest' | 'maxHp' | 'lowestHp' | 'random';
@@ -541,39 +542,16 @@ function projectileDistanceAt(
   speedMultiplier = 1,
   lifetimeMultiplier = 1,
 ): number {
-  const elapsed = Math.max(0, Math.min(
-    projectile.lifetimeMs * validMultiplier(lifetimeMultiplier),
-    elapsedMs,
-  ));
-  const scaledSpeed = projectile.speed * validMultiplier(speedMultiplier);
-  const baseSpeed = scaledSpeed / 10_000;
-  let distance: number;
-  if (projectile.acceleration === 0 || elapsed < projectile.accelerationDelay) {
-    distance = elapsed * baseSpeed;
-  } else {
-    const accelerationElapsed = elapsed - projectile.accelerationDelay;
-    let accelerationTime = accelerationElapsed;
-    let clampedTime = 0;
-    let clampedSpeed = 0;
-    if (projectile.speedClamp !== -1 && projectile.acceleration !== 0) {
-      clampedSpeed = projectile.speedClamp / 10_000;
-      const speedNeeded = Math.abs(projectile.speedClamp - scaledSpeed);
-      const timeToClamp = speedNeeded / Math.abs(projectile.acceleration) * 1000;
-      accelerationTime = Math.min(accelerationElapsed, timeToClamp);
-      clampedTime = Math.max(0, accelerationElapsed - accelerationTime);
-    }
-    distance = projectile.accelerationDelay * baseSpeed
-      + accelerationTime * baseSpeed
-      + accelerationTime * accelerationTime / 1000 * 0.5 * (projectile.acceleration / 10_000)
-      + clampedTime * clampedSpeed;
-  }
-
-  if (projectile.boomerang) {
-    const trajectoryLifetime = projectile.trajectoryLifetimeMs ?? projectile.lifetimeMs;
-    const halfway = trajectoryLifetime * baseSpeed * 0.5;
-    if (distance > halfway) distance = halfway - (distance - halfway);
-  }
-  return Math.max(0, distance);
+  return sharedProjectileDistanceAt(projectile, elapsedMs, {
+    speedMultiplier,
+    lifetimeMultiplier,
+    // auto-combat folds boomerangs unconditionally, clamps elapsed, and floors
+    // the result at zero; combat-tracker does none of the three. Preserving each
+    // call site exactly - see the divergence note in projectile-motion.ts.
+    applyBoomerang: true,
+    clampElapsed: true,
+    floorAtZero: true,
+  });
 }
 
 function validMultiplier(value: number | undefined): number {

@@ -27,6 +27,15 @@ const definition: CombatProjectileDefinition = {
   acceleration: 0,
   accelerationDelay: 0,
   speedClamp: -1,
+  turnRate: 0,
+  turnRateDelay: 0,
+  turnAcceleration: 0,
+  turnAccelerationDelay: 0,
+  turnClamp: 0,
+  turnStopTime: 0,
+  circleTurnAngle: 0,
+  circleTurnDelay: 0,
+  collisionMult: 1,
 };
 
 const openEnvironment: DodgePlanningEnvironment = {
