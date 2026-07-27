@@ -4952,6 +4952,50 @@
     });
   }
 
+  var dodgeFileLoggingToggle = document.getElementById('setting-dodge-file-logging');
+  var packetFileLoggingToggle = document.getElementById('setting-packet-file-logging');
+  var diagnosticLoggingSettings = { dodge: false, packets: false };
+
+  function applyDiagnosticLoggingSettings(settings) {
+    diagnosticLoggingSettings = {
+      dodge: settings && settings.dodge === true,
+      packets: settings && settings.packets === true,
+    };
+    if (dodgeFileLoggingToggle) dodgeFileLoggingToggle.checked = diagnosticLoggingSettings.dodge;
+    if (packetFileLoggingToggle) packetFileLoggingToggle.checked = diagnosticLoggingSettings.packets;
+  }
+
+  async function saveDiagnosticLoggingSettings() {
+    var requested = {
+      dodge: !!(dodgeFileLoggingToggle && dodgeFileLoggingToggle.checked),
+      packets: !!(packetFileLoggingToggle && packetFileLoggingToggle.checked),
+    };
+    try {
+      var response = await fetch('/api/diagnostic-logging', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requested),
+      });
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      applyDiagnosticLoggingSettings(await response.json());
+    } catch (error) {
+      applyDiagnosticLoggingSettings(diagnosticLoggingSettings);
+      console.error('Failed to save diagnostic logging settings', error);
+    }
+  }
+
+  if (dodgeFileLoggingToggle) dodgeFileLoggingToggle.addEventListener('change', saveDiagnosticLoggingSettings);
+  if (packetFileLoggingToggle) packetFileLoggingToggle.addEventListener('change', saveDiagnosticLoggingSettings);
+  fetch('/api/diagnostic-logging')
+    .then(function (response) {
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.json();
+    })
+    .then(applyDiagnosticLoggingSettings)
+    .catch(function (error) {
+      console.error('Failed to load diagnostic logging settings', error);
+    });
+
   var accountLayoutModeSelect = document.getElementById('setting-account-layout-mode');
   if (accountLayoutModeSelect) {
     accountLayoutModeSelect.value = accountLayoutMode;

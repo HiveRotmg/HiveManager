@@ -40,6 +40,7 @@ interface CycleModel {
 }
 
 type MotionModel = CycleModel | HarmonicModel | TurnModel;
+export type TargetMotionModel = 'enhanced' | 'prodMafia';
 
 interface MotionTrack {
   raw: MotionPoint;
@@ -68,6 +69,8 @@ const POSITION_EPSILON = 1e-9;
  */
 export class TargetMotionPredictor {
   private readonly tracks = new Map<number, MotionTrack>();
+
+  constructor(private readonly model: TargetMotionModel = 'enhanced') {}
 
   clear(): void {
     this.tracks.clear();
@@ -175,7 +178,7 @@ export class TargetMotionPredictor {
     const anchor = track.segmentEnd;
     const beyondMs = queryAt - track.segmentEndAt;
     if (track.modelDirty) {
-      track.model = fitMotionModel(track.samples);
+      track.model = fitMotionModel(track.samples, this.model);
       track.modelDirty = false;
     }
     if (track.model?.kind === 'cycle') {
@@ -261,8 +264,66 @@ function appendSample(track: MotionTrack, sample: TimedPoint): void {
   }
 }
 
-function fitMotionModel(samples: TimedPoint[]): MotionModel | undefined {
+function fitMotionModel(
+  samples: TimedPoint[],
+  model: TargetMotionModel,
+): MotionModel | undefined {
+  if (model === 'prodMafia') return fitProdMafiaTurnModel(samples);
   return fitCycleModel(samples) ?? fitHarmonicModel(samples) ?? fitTurnModel(samples);
+}
+
+/**
+ * Exact Auto Aim turn admission from ProdMafia's GameObject.onTickPos:
+ * require two consecutive, similarly sized turns in the same direction before
+ * trusting a circular extrapolation. One server correction must stay linear.
+ */
+function fitProdMafiaTurnModel(samples: TimedPoint[]): TurnModel | undefined {
+  if (samples.length < 4) return undefined;
+  const velocities: Array<MotionPoint & { duration: number }> = [];
+  for (let index = 1; index < samples.length; index++) {
+    const previous = samples[index - 1]!;
+    const current = samples[index]!;
+    const duration = current.at - previous.at;
+    if (duration <= 0) continue;
+    velocities.push({
+      x: (current.x - previous.x) / duration,
+      y: (current.y - previous.y) / duration,
+      duration,
+    });
+  }
+  if (velocities.length < 3) return undefined;
+
+  const before = velocities[velocities.length - 3]!;
+  const previous = velocities[velocities.length - 2]!;
+  const current = velocities[velocities.length - 1]!;
+  const first = prodMafiaTurnCandidate(before, previous);
+  const second = prodMafiaTurnCandidate(previous, current);
+  if (first === undefined || second === undefined || first * second <= 0) return undefined;
+  const ratio = second / first;
+  if (Math.abs(ratio) < 0.4 || Math.abs(ratio) > 2.5) return undefined;
+
+  return {
+    kind: 'turn',
+    speed: Math.hypot(current.x, current.y),
+    angle: Math.atan2(current.y, current.x),
+    omega: (first + second) * 0.5,
+  };
+}
+
+function prodMafiaTurnCandidate(
+  previous: MotionPoint & { duration: number },
+  current: MotionPoint & { duration: number },
+): number | undefined {
+  const previousSpeed = Math.hypot(previous.x, previous.y);
+  const currentSpeed = Math.hypot(current.x, current.y);
+  if (previousSpeed <= 0.0001 || currentSpeed <= 0.0001) return undefined;
+  const speedRatio = currentSpeed / previousSpeed;
+  let delta = Math.atan2(current.y, current.x) - Math.atan2(previous.y, previous.x);
+  delta = normalizeAngle(delta);
+  if (speedRatio < 0.65 || speedRatio > 1.35 || Math.abs(delta) < 0.02 || Math.abs(delta) > 0.9) {
+    return undefined;
+  }
+  return delta / current.duration;
 }
 
 function fitCycleModel(samples: TimedPoint[]): CycleModel | undefined {

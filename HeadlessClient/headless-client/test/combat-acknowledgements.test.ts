@@ -254,7 +254,7 @@ test('AOE is retained briefly for the viewer with its server radius and color', 
 test('thrown AOEs are exposed to the viewer as pending landing telegraphs', () => {
   const { client } = harness();
   Object.assign(client as unknown as Record<string, unknown>, {
-    thrownAoes: new ThrownAoeTracker(),
+    aoeThreats: new ThrownAoeTracker(),
   });
   const effect = new ShowEffectPacket();
   effect.effectType = VisualEffect.THROW_PROJECTILE;
@@ -294,6 +294,30 @@ test('thrown AOEs are exposed to the viewer as pending landing telegraphs', () =
   assert.equal(visible.length, 1);
   assert.equal(visible[0]?.pending, undefined);
   assert.equal(visible[0]?.radius, 2.5);
+});
+
+test('authoritative dwelling AOE enters the unified dodge threat stream', () => {
+  const { client } = harness();
+  const tracker = new ThrownAoeTracker();
+  Object.assign(client as unknown as Record<string, unknown>, {
+    aoeThreats: tracker,
+  });
+  const aoe = new AoePacket();
+  aoe.pos.x = 8.5;
+  aoe.pos.y = 12.25;
+  aoe.radius = 2.5;
+  aoe.duration = 0.5;
+  aoe.damage = 120;
+  aoe.armorPiercing = true;
+  aoe.origType = 0x1234;
+
+  invoke(client, 'handleAoe', aoe);
+
+  const active = tracker.getActive(600);
+  assert.equal(active.length, 1);
+  assert.equal(active[0]?.source, 'authoritative_aoe');
+  assert.equal(active[0]?.blastDurationMs, 500);
+  assert.equal(active[0]?.effectType, 0x1234);
 });
 
 test('AOE without a player is acknowledged at zero even if stale position state remains', () => {

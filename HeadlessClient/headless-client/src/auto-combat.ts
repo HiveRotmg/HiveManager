@@ -3,13 +3,22 @@ import {
   PlayerData,
   StatType,
 } from 'realmlib';
-import type { CombatDataProvider, CombatProjectileDefinition } from './combat-tracker';
+import type {
+  CombatDataProvider,
+  CombatObjectDefinition,
+  CombatProjectileDefinition,
+} from './combat-tracker';
 import type { WeaponAimPreview } from './command-sender';
 import type { TrackedObject } from './models';
 import { projectileDistanceAt as sharedProjectileDistanceAt } from './projectile-motion';
 import { TargetMotionPredictor, type MotionObservation } from './target-motion-predictor';
 
-export type AutoAimMode = 'closest' | 'maxHp' | 'lowestHp' | 'random';
+/**
+ * The four ProdMafia modes plus the retained `lowestHp` compatibility mode.
+ * `closestToAim` is the client's "closest to cursor" mode; scripts supply its
+ * cursor-equivalent world coordinate through `aimPoint`.
+ */
+export type AutoAimMode = 'closest' | 'closestToAim' | 'maxHp' | 'lowestHp' | 'random';
 
 export interface AutoAimOptions {
   mode?: AutoAimMode;
@@ -18,6 +27,22 @@ export interface AutoAimOptions {
   bossPriority?: boolean;
   leadTargets?: boolean;
   includeInvulnerable?: boolean;
+  /** Source `shootAtWalls`: false skips non-Character structures by default. */
+  shootAtWalls?: boolean;
+  /** Source `damageIgnored`: include types listed in `ignoredTypes`. */
+  includeIgnored?: boolean;
+  /** Source `onlyAimAtExcepted`: restrict to `exceptedTypes`. */
+  onlyExcepted?: boolean;
+  /** Runtime equivalent of ProdMafia's AAIgnore type list. */
+  ignoredTypes?: readonly number[];
+  /** Runtime equivalent of ProdMafia's AAException type list. */
+  exceptedTypes?: readonly number[];
+  /** Runtime equivalent of ProdMafia's CustomPriorityList. */
+  priorityTypes?: readonly number[];
+  /** World-space cursor/reference point used by `closestToAim`. */
+  aimPoint?: { x: number; y: number };
+  /** Source `AABoundingDist`, in tiles, for `closestToAim`. */
+  boundingDistance?: number;
   weaponSlot?: number;
 }
 
@@ -62,6 +87,7 @@ export interface AutoCombatActions {
 
 interface TargetCandidate {
   object: TrackedObject;
+  definition: CombatObjectDefinition;
   hp: number;
   maxHp: number;
   distance: number;
@@ -74,6 +100,14 @@ const DEFAULT_AUTO_AIM: Required<AutoAimOptions> = {
   bossPriority: true,
   leadTargets: true,
   includeInvulnerable: false,
+  shootAtWalls: false,
+  includeIgnored: false,
+  onlyExcepted: false,
+  ignoredTypes: [],
+  exceptedTypes: [],
+  priorityTypes: [],
+  aimPoint: { x: 0, y: 0 },
+  boundingDistance: 4,
   weaponSlot: 0,
 };
 
@@ -103,7 +137,10 @@ export class AutoCombatController {
   private selectedObjectId: number | null = null;
   private lastAbilityAt = -Infinity;
   private lastUpdateAt = -Infinity;
-  private readonly motion = new TargetMotionPredictor();
+  // Auto Aim deliberately uses ProdMafia's conservative two-confirming-turn
+  // model. The broader predictor remains available for other consumers/tests,
+  // but Auto Aim must not hallucinate a circular path from one correction.
+  private readonly motion = new TargetMotionPredictor('prodMafia');
 
   constructor(private readonly data: CombatDataProvider) {}
 
@@ -150,6 +187,14 @@ export class AutoCombatController {
       bossPriority: next.bossPriority ?? this.aim.bossPriority,
       leadTargets: next.leadTargets ?? this.aim.leadTargets,
       includeInvulnerable: next.includeInvulnerable ?? this.aim.includeInvulnerable,
+      shootAtWalls: next.shootAtWalls ?? this.aim.shootAtWalls,
+      includeIgnored: next.includeIgnored ?? this.aim.includeIgnored,
+      onlyExcepted: next.onlyExcepted ?? this.aim.onlyExcepted,
+      ignoredTypes: next.ignoredTypes === undefined ? this.aim.ignoredTypes : normalizeObjectTypes(next.ignoredTypes),
+      exceptedTypes: next.exceptedTypes === undefined ? this.aim.exceptedTypes : normalizeObjectTypes(next.exceptedTypes),
+      priorityTypes: next.priorityTypes === undefined ? this.aim.priorityTypes : normalizeObjectTypes(next.priorityTypes),
+      aimPoint: next.aimPoint === undefined ? this.aim.aimPoint : finitePoint(next.aimPoint, this.aim.aimPoint),
+      boundingDistance: finiteNonNegative(next.boundingDistance, this.aim.boundingDistance),
       weaponSlot: Math.trunc(finiteNonNegative(next.weaponSlot, this.aim.weaponSlot)),
     };
     return true;
@@ -184,7 +229,7 @@ export class AutoCombatController {
       mode: this.aim.mode,
       targetObjectId: this.selectedObjectId,
       fixedPosition: this.fixedPosition ? { ...this.fixedPosition } : null,
-      autoAim: { ...this.aim },
+      autoAim: { ...this.aim, aimPoint: { ...this.aim.aimPoint } },
       autoAbility: { ...this.ability },
     };
   }
@@ -316,6 +361,9 @@ export class AutoCombatController {
     for (const object of objects) {
       const definition = this.data.getObject(object.type);
       if (!definition?.isEnemy || definition.invincible) continue;
+      if (!this.aim.shootAtWalls && definition.isCharacter === false) continue;
+      if (!this.aim.includeIgnored && this.aim.ignoredTypes.includes(object.type)) continue;
+      if (this.aim.onlyExcepted && !this.aim.exceptedTypes.includes(object.type)) continue;
       const condition = object.player?.condition ?? rawNumber(object, StatType.CONDITION_STAT, 0);
       const blocked = ConditionEffectBits.PAUSED | ConditionEffectBits.STASIS | ConditionEffectBits.INVINCIBLE;
       if ((condition & blocked) !== 0) continue;
@@ -323,14 +371,17 @@ export class AutoCombatController {
       const hp = object.player?.hp ?? rawNumber(object, StatType.HP_STAT, definition.maxHp ?? 0);
       if (hp <= 0) continue;
       const distance = Math.hypot(object.x - playerPos.x, object.y - playerPos.y);
-      if (distance > range) continue;
+      // ProdMafia's `< range` range test intentionally does not select a
+      // target exactly on the outer edge.
+      if (distance >= range) continue;
       const maxHp = object.player?.maxHP ?? rawNumber(object, StatType.MAX_HP_STAT, definition.maxHp ?? hp);
       result.push({
         object,
+        definition,
         hp,
         maxHp,
         distance,
-        boss: !!definition.quest && maxHp >= 5_000,
+        boss: !!definition.boss || !!definition.quest || this.aim.priorityTypes.includes(object.type),
       });
     }
     return result;
@@ -345,9 +396,20 @@ export class AutoCombatController {
 
   private selectCandidate(candidates: TargetCandidate[]): TargetCandidate | null {
     if (candidates.length === 0) return null;
+    // Matches ProdMafia's two-pass scan: prefer any boss, then retry all
+    // eligible enemies if no boss was found. A Quest flag is sufficient; the
+    // old HP threshold incorrectly discarded low-HP quest targets.
     const bosses = this.aim.bossPriority ? candidates.filter((candidate) => candidate.boss) : [];
     const pool = bosses.length > 0 ? bosses : candidates;
     switch (this.aim.mode) {
+      case 'closestToAim': {
+        const origin = this.aim.aimPoint;
+        const bound = this.aim.boundingDistance;
+        return [...pool]
+          .filter((candidate) => Math.hypot(candidate.object.x - origin.x, candidate.object.y - origin.y) <= bound)
+          .sort((a, b) => Math.hypot(a.object.x - origin.x, a.object.y - origin.y)
+            - Math.hypot(b.object.x - origin.x, b.object.y - origin.y))[0] ?? null;
+      }
       case 'maxHp':
         return [...pool].sort((a, b) => b.maxHp - a.maxHp || b.hp - a.hp || a.distance - b.distance)[0] ?? null;
       case 'lowestHp':
@@ -399,11 +461,30 @@ function projectileRange(
 function normalizeMode(mode: string): AutoAimMode | null {
   switch (String(mode).trim().toLowerCase().replace(/[\s_-]+/g, '')) {
     case 'closest': return 'closest';
+    case 'closesttoaim':
+    case 'closesttocursor':
+    case 'cursor': return 'closestToAim';
     case 'maxhp': return 'maxHp';
     case 'lowesthp': return 'lowestHp';
     case 'random': return 'random';
     default: return null;
   }
+}
+
+function normalizeObjectTypes(values: readonly number[]): number[] {
+  return [...new Set(values
+    .map((value) => Number(value))
+    .filter((value) => Number.isInteger(value) && value >= 0)
+    .map((value) => Math.trunc(value)))];
+}
+
+function finitePoint(
+  value: { x: number; y: number },
+  fallback: { x: number; y: number },
+): { x: number; y: number } {
+  const x = Number(value?.x);
+  const y = Number(value?.y);
+  return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : { ...fallback };
 }
 
 function finiteNonNegative(value: number | undefined, fallback: number): number {

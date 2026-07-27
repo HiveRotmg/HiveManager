@@ -26,6 +26,25 @@ test('circular tick history predicts continued turning after the known segment',
   assertPointNear(predicted, position(2_800), 0.01);
 });
 
+test('ProdMafia motion mode waits for two compatible turns before curving its lead', () => {
+  const predictor = new TargetMotionPredictor('prodMafia');
+  const speed = 0.01;
+  const duration = 100;
+  let point = { x: 0, y: 0 };
+  for (let index = 0; index < 4; index++) {
+    const angle = index * 0.2;
+    point = {
+      x: point.x + Math.cos(angle) * speed * duration,
+      y: point.y + Math.sin(angle) * speed * duration,
+    };
+    predictor.observeTick(index * duration, duration, [{ objectId: 1, ...point }]);
+  }
+
+  const predicted = predictor.predictPosition(1, point, 400, 100);
+  assert.ok(predicted.y > point.y + Math.sin(0.6) * speed * duration,
+    'the confirmed positive turn bends the future position beyond a straight tangent');
+});
+
 test('two matching back-and-forth cycles are replayed through the next reversal', () => {
   const predictor = new TargetMotionPredictor();
   const position = (time: number) => {

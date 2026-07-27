@@ -54,6 +54,72 @@ test('auto aim prioritizes a visible boss and supports maxHp selection', () => {
   assert.equal(controller.getState().targetObjectId, 2);
 });
 
+test('ProdMafia boss priority includes every Quest target, not only high-HP quests', () => {
+  const provider = data();
+  const objects = providerObjects(provider);
+  objects.set(104, { isEnemy: true, occupySquare: false, maxHp: 50, quest: true });
+  const controller = new AutoCombatController(provider);
+  const state = snapshot();
+  state.objects = [
+    { objectId: 1, type: 101, x: 2, y: 0, rawStats: { '0': 1_000, '1': 900 } },
+    { objectId: 4, type: 104, x: 4, y: 0, rawStats: { '0': 50, '1': 50 } },
+  ];
+  const shots: Array<{ x: number; y: number }> = [];
+  controller.enableAutoAim({ leadTargets: false });
+  controller.update(1_000, state, {
+    shootAt: (target) => { shots.push(target); return true; },
+    useAbilityAt: () => false,
+  });
+  assert.deepEqual(shots, [{ x: 4, y: 0 }]);
+  assert.equal(controller.getState().targetObjectId, 4);
+});
+
+test('closestToAim reproduces ProdMafia cursor-mode bounding selection', () => {
+  const controller = new AutoCombatController(data());
+  const shots: Array<{ x: number; y: number }> = [];
+  controller.enableAutoAim({
+    mode: 'closestToAim',
+    aimPoint: { x: 5.1, y: 0 },
+    boundingDistance: 2,
+    bossPriority: false,
+    leadTargets: false,
+  });
+  controller.update(1_000, snapshot(), {
+    shootAt: (target) => { shots.push(target); return true; },
+    useAbilityAt: () => false,
+  });
+  assert.deepEqual(shots, [{ x: 5, y: 0 }]);
+  assert.equal(controller.getState().targetObjectId, 2);
+});
+
+test('ProdMafia target filters skip walls and honour ignored/exception type lists', () => {
+  const provider = data();
+  const objects = providerObjects(provider);
+  objects.set(104, { isEnemy: true, occupySquare: true, isCharacter: false, maxHp: 9_999 });
+  objects.set(105, { isEnemy: true, occupySquare: false, isCharacter: true, maxHp: 400 });
+  const state = snapshot();
+  state.objects = [
+    { objectId: 4, type: 104, x: 1, y: 0, rawStats: { '0': 9_999, '1': 9_999 } },
+    { objectId: 1, type: 101, x: 2, y: 0, rawStats: { '0': 1_000, '1': 900 } },
+    { objectId: 5, type: 105, x: 3, y: 0, rawStats: { '0': 400, '1': 400 } },
+  ];
+  const shots: Array<{ x: number; y: number }> = [];
+  const controller = new AutoCombatController(provider);
+  controller.enableAutoAim({ leadTargets: false, bossPriority: false, ignoredTypes: [101] });
+  controller.update(1_000, state, {
+    shootAt: (target) => { shots.push(target); return true; },
+    useAbilityAt: () => false,
+  });
+  assert.deepEqual(shots, [{ x: 3, y: 0 }], 'the nearer wall and ignored enemy are skipped');
+
+  controller.configureAutoAim({ onlyExcepted: true, exceptedTypes: [101], includeIgnored: true });
+  controller.update(1_100, state, {
+    shootAt: (target) => { shots.push(target); return true; },
+    useAbilityAt: () => false,
+  });
+  assert.deepEqual(shots[1], { x: 2, y: 0 });
+});
+
 test('fixed target overrides automatic selection until aiming stops', () => {
   const controller = new AutoCombatController(data());
   const shots: Array<{ x: number; y: number }> = [];
@@ -184,6 +250,20 @@ function data(teleport = false): CombatDataProvider {
     getObject: (type) => objects.get(type),
     getProjectile: (type, id) => (type === 1_000 || type === 2_000) && id === 0 ? projectile : undefined,
   };
+}
+
+function providerObjects(provider: CombatDataProvider): Map<number, CombatObjectDefinition> {
+  // Test providers intentionally use this small in-memory catalog. Keep the
+  // production-facing interface read-only while allowing focused target tests
+  // to add exactly the object definitions they exercise.
+  const getObject = provider.getObject;
+  const known = new Map<number, CombatObjectDefinition>();
+  for (const type of [1_000, 2_000, 101, 102, 103]) {
+    const definition = getObject(type);
+    if (definition) known.set(type, definition);
+  }
+  provider.getObject = (type) => known.get(type);
+  return known;
 }
 
 function snapshot(): AutoCombatSnapshot {

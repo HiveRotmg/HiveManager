@@ -219,6 +219,79 @@ test('2. a direct incoming projectile produces a swept-safe route around it', ()
   assert.equal(planner.assessTrajectory(input, result.trajectory).safe, true);
 });
 
+test('fixed laser geometry blocks crossing the full beam instead of only its origin', () => {
+  const input = planningInput({
+    position: { x: 5, y: 4 },
+    goal: { x: 5, y: 8 },
+    intentVelocity: { x: 0, y: 0.006 },
+    projectiles: [projectile({
+      startX: 0,
+      startY: 5,
+      angle: 0,
+      definition: {
+        speed: 0,
+        lifetimeMs: 1000,
+        laserDistance: 10,
+        hitRadius: 0.1,
+      },
+    })],
+  });
+  const planner = testPlanner();
+  const result = planner.plan(input, 'normal');
+
+  assert.equal(result.activeProjectileCount, 1);
+  assert.ok(result.earliestIntentCollisionMs !== null);
+  assert.ok(result.trajectory.waypoints.every((waypoint) => waypoint.y < 4.9));
+  assert.equal(planner.assessTrajectory(input, result.trajectory).safe, true);
+});
+
+test('linear projectile broad phase rejects a distant volley before cover tracing', () => {
+  let coverQueries = 0;
+  const projectiles = Array.from({ length: 256 }, (_, index) => projectile({
+    bulletId: index,
+    startX: 100,
+    startY: 100 + index,
+    angle: 0,
+  }));
+  const result = plan(planningInput({
+    projectiles,
+    environment: {
+      ...OPEN_ENVIRONMENT,
+      isProjectileSegmentOpen: () => {
+        coverQueries++;
+        return true;
+      },
+    },
+  }));
+
+  assert.equal(result.activeProjectileCount, 0);
+  assert.equal(result.metrics.projectilesRejectedByBroadPhase, 256);
+  assert.equal(coverQueries, 0);
+});
+
+test('laser beam is clipped at projectile cover before dodge relevance', () => {
+  const result = plan(planningInput({
+    position: { x: 8, y: 5 },
+    goal: undefined,
+    moveSpeed: 0,
+    intentVelocity: { x: 0, y: 0 },
+    projectiles: [projectile({
+      startX: 0,
+      startY: 5,
+      angle: 0,
+      definition: { speed: 0, lifetimeMs: 1000, laserDistance: 10 },
+    })],
+    environment: {
+      ...OPEN_ENVIRONMENT,
+      isProjectileSegmentOpen: (_fromX, _fromY, toX) => toX <= 4,
+    },
+  }));
+
+  assert.equal(result.activeProjectileCount, 0);
+  assert.equal(result.earliestIntentCollisionMs, null);
+  assert.equal(result.metrics.projectilesRejectedByBroadPhase, 1);
+});
+
 test('3. two crossing projectiles are rejected by continuous swept collision', () => {
   const input = planningInput({
     moveSpeed: 0.008,

@@ -6,6 +6,8 @@
 export enum ClientEvent {
   /** Raw packet traffic in either direction. Payload: PacketTraffic. */
   PacketTraffic = 'packetTraffic',
+  /** Full predictive-dodge evaluation context for opt-in diagnostics. */
+  DodgeDiagnostic = 'dodgeDiagnostic',
   /** Socket connected; Hello sent. */
   Connected = 'connected',
   /** In-world (CreateSuccess). Payload: objectId. */

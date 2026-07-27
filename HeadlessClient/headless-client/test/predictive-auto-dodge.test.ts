@@ -1153,6 +1153,39 @@ test('thrown AOE tracker keeps during-dwell throws in getActive', () => {
     'past landing+dwell (600ms), the throw should no longer appear as active');
 });
 
+test('unmatched authoritative AOE dwell is exposed without a SHOWEFFECT prediction', () => {
+  const tracker = new ThrownAoeTracker();
+  const activeChanged = tracker.recordAoe(
+    { x: 5, y: 5 },
+    2,
+    100,
+    0.5,
+    120,
+    true,
+    0x1234,
+  );
+
+  assert.equal(activeChanged, true);
+  const active = tracker.getActive(300);
+  assert.equal(active.length, 1);
+  assert.equal(active[0]?.source, 'authoritative_aoe');
+  assert.equal(active[0]?.damage, 120);
+  assert.equal(active[0]?.armorPiercing, true);
+  assert.equal(tracker.getActive(601).length, 0);
+});
+
+test('authoritative AOE replaces its predicted throw instead of duplicating it', () => {
+  const tracker = new ThrownAoeTracker();
+  tracker.track(77, { x: 5, y: 5 }, 0.2, 0);
+  tracker.recordAoe({ x: 5.1, y: 5 }, 2, 200, 0.4, 90, false, 0x4567);
+
+  const active = tracker.getActive(250);
+  assert.equal(active.length, 1);
+  assert.equal(active[0]?.source, 'authoritative_aoe');
+  assert.equal(active[0]?.landingTime, 200);
+  assert.equal(active[0]?.radius, 2);
+});
+
 test('AutoDodgeState.plannerMetrics excludes wall-clock fields for replay determinism', () => {
   const controller = new PredictiveAutoDodgeController();
   controller.setEnabled(true);

@@ -8,6 +8,7 @@ import {
   proxyConfigToUrl,
   resolveClassType,
   type Account,
+  type ClientDodgeDiagnostic,
   type PacketTraffic,
   type ProxyConfig,
   type TextPacket,
@@ -16,6 +17,11 @@ import {
 } from 'headless-client';
 import type { GameDataLoader } from '../game-data/GameDataLoader.js';
 import { HeadlessDamageTracker, type HeadlessDamageSnapshot } from './HeadlessDamageTracker.js';
+import { getHiveDocumentsDir } from '../util/rotmgAssetExtractor.js';
+import {
+  HeadlessDiagnosticsLogger,
+  type HeadlessLoggingSettings,
+} from './HeadlessDiagnosticsLogger.js';
 
 export interface FleetAccount {
   id: string;
@@ -84,6 +90,7 @@ export class HeadlessFleet extends EventEmitter {
   private changedTimer: NodeJS.Timeout | undefined;
   private chatSequence = 0;
   private maintenanceActive = false;
+  private readonly diagnostics = new HeadlessDiagnosticsLogger(getHiveDocumentsDir());
 
   constructor(private readonly gameData: GameDataLoader) {
     super();
@@ -96,6 +103,18 @@ export class HeadlessFleet extends EventEmitter {
 
   get size(): number {
     return this.entries.size;
+  }
+
+  getLoggingSettings(): HeadlessLoggingSettings {
+    return this.diagnostics.getSettings();
+  }
+
+  setLoggingSettings(update: Partial<HeadlessLoggingSettings>): HeadlessLoggingSettings {
+    const settings = this.diagnostics.setSettings(update);
+    for (const { client } of this.entries.values()) {
+      client.setDodgeDiagnosticsEnabled(settings.dodge);
+    }
+    return settings;
   }
 
   /** Whether an account already has a live client or a connection in progress. */
@@ -221,7 +240,20 @@ export class HeadlessFleet extends EventEmitter {
     const entry: FleetEntry = { account, client, serverName: server.name, stopping: false, connectedAt: Date.now(), damage };
     this.entries.set(account.id, entry);
     damage.on('changed', (snapshot: HeadlessDamageSnapshot) => this.emit('damage', account.id, snapshot));
-    client.on(ClientEvent.PacketTraffic, (traffic) => this.emit('packet', account.id, traffic));
+    client.setDodgeDiagnosticsEnabled(this.diagnostics.getSettings().dodge);
+    const logContext = {
+      accountId: account.id,
+      alias: client.alias,
+      serverName: server.name,
+      sessionId: `${account.id}:${entry.connectedAt}`,
+    };
+    client.on(ClientEvent.PacketTraffic, (traffic) => {
+      this.diagnostics.logPacket(logContext, traffic);
+      this.emit('packet', account.id, traffic);
+    });
+    client.on(ClientEvent.DodgeDiagnostic, (diagnostic: ClientDodgeDiagnostic) => {
+      this.diagnostics.logDodge(logContext, diagnostic);
+    });
     client.onPacket<TextPacket>(PacketType.TEXT, (packet) => {
       const message = String(packet.cleanText || packet.text || '').trim();
       if (!message) return;

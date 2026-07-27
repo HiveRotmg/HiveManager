@@ -93,6 +93,7 @@ export interface DodgePlannerMetrics {
   statesMerged: number;
   statesPrunedByBeam: number;
   activeProjectilesConsidered: number;
+  projectilesRejectedByBroadPhase: number;
   trajectoryInvalidations: number;
   normalReplans: number;
   urgentReplans: number;
@@ -325,6 +326,7 @@ interface CandidateState extends Omit<SearchState, 'index'> {
 }
 
 interface ProjectileSegment {
+  kind: 'point' | 'beam';
   startMs: number;
   endMs: number;
   startX: number;
@@ -335,6 +337,8 @@ interface ProjectileSegment {
   velocityY: number;
   collisionRadius: number;
   nearRadius: number;
+  /** CollisionMult-expanded fixed beam polygon; present only for `kind === 'beam'`. */
+  beamPolygon?: readonly { x: number; y: number }[];
 }
 
 interface EdgeSafety {
@@ -361,6 +365,7 @@ interface PlanCounters {
   statesMerged: number;
   statesPrunedByBeam: number;
   activeProjectilesConsidered: number;
+  projectilesRejectedByBroadPhase: number;
 }
 
 interface PlannerContext {
@@ -613,6 +618,7 @@ export class SpaceTimeDodgePlanner {
       statesMerged: this.lastCounters.statesMerged,
       statesPrunedByBeam: this.lastCounters.statesPrunedByBeam,
       activeProjectilesConsidered: this.lastCounters.activeProjectilesConsidered,
+      projectilesRejectedByBroadPhase: this.lastCounters.projectilesRejectedByBroadPhase,
       trajectoryInvalidations: this.trajectoryInvalidations,
       normalReplans: this.normalReplans,
       urgentReplans: this.urgentReplans,
@@ -641,6 +647,7 @@ export class SpaceTimeDodgePlanner {
       statesMerged: this.lastCounters.statesMerged,
       statesPrunedByBeam: this.lastCounters.statesPrunedByBeam,
       activeProjectilesConsidered: this.lastCounters.activeProjectilesConsidered,
+      projectilesRejectedByBroadPhase: this.lastCounters.projectilesRejectedByBroadPhase,
       trajectoryInvalidations: this.trajectoryInvalidations,
       normalReplans: this.normalReplans,
       urgentReplans: this.urgentReplans,
@@ -1136,29 +1143,17 @@ export class SpaceTimeDodgePlanner {
         x: from.x + playerVelocity.x * (overlapStart - startMs),
         y: from.y + playerVelocity.y * (overlapStart - startMs),
       };
-      const projectileStart = {
-        x: segment.startX + segment.velocityX * (overlapStart - segment.startMs),
-        y: segment.startY + segment.velocityY * (overlapStart - segment.startMs),
-      };
       const duration = overlapEnd - overlapStart;
-      const closest = sweptRelativeMotion(
+      const contact = projectileSegmentContact(
+        segment,
         playerStart,
         playerVelocity,
-        projectileStart,
-        { x: segment.velocityX, y: segment.velocityY },
+        overlapStart,
         duration,
       );
-      const clearance = closest.minimumDistance - segment.collisionRadius;
+      const clearance = contact.minimumDistance - segment.collisionRadius;
       minimumProjectileClearance = Math.min(minimumProjectileClearance, clearance);
-      const aabbCollision = sweptAabbCollision(
-        playerStart.x - projectileStart.x,
-        playerStart.y - projectileStart.y,
-        playerVelocity.x - segment.velocityX,
-        playerVelocity.y - segment.velocityY,
-        segment.collisionRadius,
-        duration,
-      );
-      if (clearance <= 0 || aabbCollision) collision = true;
+      if (clearance <= 0 || contact.collision) collision = true;
       if (clearance < segment.nearRadius - segment.collisionRadius) {
         const normalized = clamp(
           (segment.nearRadius - segment.collisionRadius - clearance) / PROJECTILE_NEAR_BAND,
@@ -1536,15 +1531,74 @@ export class SpaceTimeDodgePlanner {
         horizonMs,
         projectile.startTime + projectile.definition.lifetimeMs - input.time,
       );
-      if (finalOffset < firstOffset) continue;
+      if (finalOffset <= firstOffset) continue;
+      const collisionRadius = projectileCollisionHalfSize(projectile.definition);
+      const laserDistance = Math.max(0, projectile.definition.laserDistance ?? 0);
+      if (laserDistance > 0) {
+        const beamStart = { x: projectile.startX, y: projectile.startY };
+        let beamEnd = {
+          x: beamStart.x + Math.cos(projectile.angle) * laserDistance,
+          y: beamStart.y + Math.sin(projectile.angle) * laserDistance,
+        };
+        if (!segmentNearCoordinates(beamStart, beamEnd, input.position, maximumReach)) {
+          counters.projectilesRejectedByBroadPhase++;
+          continue;
+        }
+        if (!input.environment.isProjectileSegmentOpen(
+          beamStart.x,
+          beamStart.y,
+          beamEnd.x,
+          beamEnd.y,
+          projectile,
+        )) {
+          const clipped = clipProjectileAtCover(
+            input.environment,
+            projectile,
+            beamStart,
+            beamEnd,
+          );
+          if (clipped.ratio <= 1e-3) {
+            counters.projectilesRejectedByBroadPhase++;
+            continue;
+          }
+          beamEnd = clipped.point;
+        }
+        if (!segmentNearCoordinates(beamStart, beamEnd, input.position, maximumReach)) {
+          counters.projectilesRejectedByBroadPhase++;
+          continue;
+        }
+        counters.activeProjectilesConsidered++;
+        segments.push({
+          kind: 'beam',
+          startMs: firstOffset,
+          endMs: finalOffset,
+          startX: beamStart.x,
+          startY: beamStart.y,
+          endX: beamEnd.x,
+          endY: beamEnd.y,
+          velocityX: 0,
+          velocityY: 0,
+          collisionRadius,
+          nearRadius: collisionRadius + PROJECTILE_NEAR_BAND,
+          beamPolygon: expandedSegmentPolygon(beamStart, beamEnd, collisionRadius),
+        });
+        continue;
+      }
+
       const nonlinear = isNonlinearProjectile(projectile.definition);
+      const previous = predictProjectilePosition(projectile, input.time + firstOffset);
+      if (!nonlinear) {
+        const final = predictProjectilePosition(projectile, input.time + finalOffset);
+        if (!segmentNearCoordinates(previous, final, input.position, maximumReach)) {
+          counters.projectilesRejectedByBroadPhase++;
+          continue;
+        }
+      }
       const stepMs = nonlinear
         ? Math.min(this.config.projectilePredictionStepMs, 15)
         : Math.max(1, finalOffset - firstOffset);
-      const previous = predictProjectilePosition(projectile, input.time + firstOffset);
       let previousOffset = firstOffset;
       let previousPoint = { ...previous };
-      const collisionRadius = projectileCollisionHalfSize(projectile.definition);
 
       while (previousOffset < finalOffset - 1e-9) {
         const nextOffset = Math.min(finalOffset, previousOffset + stepMs);
@@ -1574,6 +1628,7 @@ export class SpaceTimeDodgePlanner {
         const duration = endOffset - previousOffset;
         if (duration > 1e-6) {
           projectileSegments.push({
+            kind: 'point',
             startMs: previousOffset,
             endMs: endOffset,
             startX: previousPoint.x,
@@ -1595,7 +1650,10 @@ export class SpaceTimeDodgePlanner {
         segment,
         input.position,
         maximumReach,
-      ))) continue;
+      ))) {
+        counters.projectilesRejectedByBroadPhase++;
+        continue;
+      }
       counters.activeProjectilesConsidered++;
       segments.push(...projectileSegments);
     }
@@ -1624,32 +1682,18 @@ export class SpaceTimeDodgePlanner {
           x: current.x + velocity.x * (overlapStart - startMs),
           y: current.y + velocity.y * (overlapStart - startMs),
         };
-        const projectileStart = {
-          x: segment.startX + segment.velocityX * (overlapStart - segment.startMs),
-          y: segment.startY + segment.velocityY * (overlapStart - segment.startMs),
-        };
         const duration = overlapEnd - overlapStart;
-        const relative = sweptRelativeMotion(
+        const contact = projectileSegmentContact(
+          segment,
           playerStart,
           velocity,
-          projectileStart,
-          { x: segment.velocityX, y: segment.velocityY },
+          overlapStart,
           duration,
         );
-        const aabb = sweptAabbCollision(
-          playerStart.x - projectileStart.x,
-          playerStart.y - projectileStart.y,
-          velocity.x - segment.velocityX,
-          velocity.y - segment.velocityY,
-          segment.collisionRadius,
-          duration,
-        );
-        if (relative.minimumDistance <= segment.collisionRadius || aabb) {
+        if (contact.minimumDistance <= segment.collisionRadius || contact.collision) {
           earliest = Math.min(
             earliest,
-            overlapStart + (relative.minimumDistance <= segment.collisionRadius
-              ? relative.closestTimeMs
-              : 0),
+            overlapStart + contact.closestTimeMs,
           );
         }
       });
@@ -2132,6 +2176,176 @@ function candidateBeforeSort(a: CandidateState, b: CandidateState): number {
   return a.rankScore - b.rankScore || a.cumulativeCost - b.cumulativeCost || a.order - b.order;
 }
 
+function projectileSegmentContact(
+  segment: ProjectileSegment,
+  playerStart: { x: number; y: number },
+  playerVelocity: { x: number; y: number },
+  overlapStartMs: number,
+  durationMs: number,
+): { closestTimeMs: number; minimumDistance: number; collision: boolean } {
+  if (segment.kind === 'beam') {
+    const playerEnd = {
+      x: playerStart.x + playerVelocity.x * durationMs,
+      y: playerStart.y + playerVelocity.y * durationMs,
+    };
+    const entryRatio = segment.beamPolygon
+      ? segmentEntryRatio(playerStart, playerEnd, segment.beamPolygon)
+      : null;
+    return {
+      closestTimeMs: entryRatio === null ? 0 : entryRatio * durationMs,
+      minimumDistance: segmentToSegmentDistance(
+        playerStart,
+        playerEnd,
+        { x: segment.startX, y: segment.startY },
+        { x: segment.endX, y: segment.endY },
+      ),
+      collision: entryRatio !== null,
+    };
+  }
+  const projectileStart = {
+    x: segment.startX + segment.velocityX * (overlapStartMs - segment.startMs),
+    y: segment.startY + segment.velocityY * (overlapStartMs - segment.startMs),
+  };
+  const closest = sweptRelativeMotion(
+    playerStart,
+    playerVelocity,
+    projectileStart,
+    { x: segment.velocityX, y: segment.velocityY },
+    durationMs,
+  );
+  return {
+    ...closest,
+    collision: sweptAabbCollision(
+      playerStart.x - projectileStart.x,
+      playerStart.y - projectileStart.y,
+      playerVelocity.x - segment.velocityX,
+      playerVelocity.y - segment.velocityY,
+      segment.collisionRadius,
+      durationMs,
+    ),
+  };
+}
+
+/** Convex hull of a fixed segment expanded by the projectile's square hitbox. */
+function expandedSegmentPolygon(
+  start: { x: number; y: number },
+  end: { x: number; y: number },
+  halfSize: number,
+): readonly { x: number; y: number }[] {
+  const points: Array<{ x: number; y: number }> = [];
+  for (const endpoint of [start, end]) {
+    points.push(
+      { x: endpoint.x - halfSize, y: endpoint.y - halfSize },
+      { x: endpoint.x - halfSize, y: endpoint.y + halfSize },
+      { x: endpoint.x + halfSize, y: endpoint.y - halfSize },
+      { x: endpoint.x + halfSize, y: endpoint.y + halfSize },
+    );
+  }
+  points.sort((a, b) => a.x - b.x || a.y - b.y);
+  const lower: Array<{ x: number; y: number }> = [];
+  const upper: Array<{ x: number; y: number }> = [];
+  for (const point of points) {
+    while (lower.length >= 2
+      && cross(lower.at(-2)!, lower.at(-1)!, point) <= 1e-12) lower.pop();
+    lower.push(point);
+  }
+  for (let index = points.length - 1; index >= 0; index--) {
+    const point = points[index]!;
+    while (upper.length >= 2
+      && cross(upper.at(-2)!, upper.at(-1)!, point) <= 1e-12) upper.pop();
+    upper.push(point);
+  }
+  lower.pop();
+  upper.pop();
+  return [...lower, ...upper];
+}
+
+/** Earliest ratio where a path enters a CCW convex polygon, or null on no contact. */
+function segmentEntryRatio(
+  start: { x: number; y: number },
+  end: { x: number; y: number },
+  polygon: readonly { x: number; y: number }[],
+): number | null {
+  if (polygon.length < 3) return null;
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  let enter = 0;
+  let exit = 1;
+  for (let index = 0; index < polygon.length; index++) {
+    const a = polygon[index]!;
+    const b = polygon[(index + 1) % polygon.length]!;
+    const edgeX = b.x - a.x;
+    const edgeY = b.y - a.y;
+    const initial = edgeX * (start.y - a.y) - edgeY * (start.x - a.x);
+    const change = edgeX * dy - edgeY * dx;
+    if (Math.abs(change) <= 1e-12) {
+      if (initial < -1e-9) return null;
+      continue;
+    }
+    const boundary = -initial / change;
+    if (change > 0) enter = Math.max(enter, boundary);
+    else exit = Math.min(exit, boundary);
+    if (enter > exit + 1e-9) return null;
+  }
+  return enter <= 1 + 1e-9 && exit >= -1e-9 ? clamp(enter, 0, 1) : null;
+}
+
+function segmentToSegmentDistance(
+  a0: { x: number; y: number },
+  a1: { x: number; y: number },
+  b0: { x: number; y: number },
+  b1: { x: number; y: number },
+): number {
+  if (segmentsIntersect(a0, a1, b0, b1)) return 0;
+  return Math.min(
+    pointToSegmentDistance(a0, b0, b1),
+    pointToSegmentDistance(a1, b0, b1),
+    pointToSegmentDistance(b0, a0, a1),
+    pointToSegmentDistance(b1, a0, a1),
+  );
+}
+
+function segmentsIntersect(
+  a0: { x: number; y: number },
+  a1: { x: number; y: number },
+  b0: { x: number; y: number },
+  b1: { x: number; y: number },
+): boolean {
+  if (Math.max(a0.x, a1.x) < Math.min(b0.x, b1.x) - 1e-9
+    || Math.max(b0.x, b1.x) < Math.min(a0.x, a1.x) - 1e-9
+    || Math.max(a0.y, a1.y) < Math.min(b0.y, b1.y) - 1e-9
+    || Math.max(b0.y, b1.y) < Math.min(a0.y, a1.y) - 1e-9) return false;
+  const d1 = cross(a0, a1, b0);
+  const d2 = cross(a0, a1, b1);
+  const d3 = cross(b0, b1, a0);
+  const d4 = cross(b0, b1, a1);
+  return ((d1 <= 1e-9 && d2 >= -1e-9) || (d2 <= 1e-9 && d1 >= -1e-9))
+    && ((d3 <= 1e-9 && d4 >= -1e-9) || (d4 <= 1e-9 && d3 >= -1e-9));
+}
+
+function pointToSegmentDistance(
+  point: { x: number; y: number },
+  start: { x: number; y: number },
+  end: { x: number; y: number },
+): number {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const lengthSquared = dx * dx + dy * dy;
+  const ratio = lengthSquared <= 1e-18
+    ? 0
+    : clamp(((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared, 0, 1);
+  return Math.hypot(start.x + dx * ratio - point.x, start.y + dy * ratio - point.y);
+}
+
+function cross(
+  origin: { x: number; y: number },
+  a: { x: number; y: number },
+  b: { x: number; y: number },
+): number {
+  return (a.x - origin.x) * (b.y - origin.y)
+    - (a.y - origin.y) * (b.x - origin.x);
+}
+
 function sweptAabbCollision(
   relativeX: number,
   relativeY: number,
@@ -2185,19 +2399,33 @@ function segmentNearPoint(
   point: { x: number; y: number },
   radius: number,
 ): boolean {
-  const dx = segment.endX - segment.startX;
-  const dy = segment.endY - segment.startY;
+  return segmentNearCoordinates(
+    { x: segment.startX, y: segment.startY },
+    { x: segment.endX, y: segment.endY },
+    point,
+    radius,
+  );
+}
+
+function segmentNearCoordinates(
+  start: { x: number; y: number },
+  end: { x: number; y: number },
+  point: { x: number; y: number },
+  radius: number,
+): boolean {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
   const lengthSquared = dx * dx + dy * dy;
   const ratio = lengthSquared <= 1e-12
     ? 0
     : clamp(
-        ((point.x - segment.startX) * dx + (point.y - segment.startY) * dy) / lengthSquared,
+        ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared,
         0,
         1,
       );
   return Math.hypot(
-    segment.startX + dx * ratio - point.x,
-    segment.startY + dy * ratio - point.y,
+    start.x + dx * ratio - point.x,
+    start.y + dy * ratio - point.y,
   ) <= radius;
 }
 
@@ -2258,6 +2486,7 @@ function emptyCounters(): PlanCounters {
     statesMerged: 0,
     statesPrunedByBeam: 0,
     activeProjectilesConsidered: 0,
+    projectilesRejectedByBroadPhase: 0,
   };
 }
 

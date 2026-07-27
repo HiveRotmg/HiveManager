@@ -1451,6 +1451,7 @@
         <div class="settings-tabs" id="settings-tabs" role="tablist" aria-label="Settings categories">
           <button type="button" class="settings-tab active" data-settings-tab="visual" id="settings-tab-visual" role="tab" aria-selected="true" aria-controls="settings-panel-visual" data-i18n="settings.tab.visual">Visual</button>
           <button type="button" class="settings-tab" data-settings-tab="viewer" id="settings-tab-viewer" role="tab" aria-selected="false" aria-controls="settings-panel-viewer" tabindex="-1" data-i18n="settings.tab.viewer">Viewer</button>
+          <button type="button" class="settings-tab" data-settings-tab="debug" id="settings-tab-debug" role="tab" aria-selected="false" aria-controls="settings-panel-debug" tabindex="-1">Debug</button>
           <button type="button" class="settings-tab hidden" data-settings-tab="developer" id="settings-tab-developer" role="tab" aria-selected="false" aria-controls="settings-panel-developer" tabindex="-1" data-i18n="settings.tab.developer">Developer</button>
           <button type="button" class="settings-tab hidden" data-settings-tab="admin" id="settings-tab-admin" role="tab" aria-selected="false" aria-controls="settings-panel-admin" tabindex="-1" data-i18n="settings.tab.admin">Admin</button>
         </div>
@@ -1635,6 +1636,32 @@
                 </div>
                 <label class="toggle-switch">
                   <input type="checkbox" id="setting-dev-mode">
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-tab-panel" data-settings-panel="debug" id="settings-panel-debug" role="tabpanel" aria-labelledby="settings-tab-debug" hidden>
+            <div class="settings-group">
+              <h3>Debug Logging</h3>
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <span class="settings-label">Dodge logging</span>
+                  <span class="settings-desc">Enable detailed dodge decisions, movement outcomes, position corrections, and AOE/projectile context in Documents\Hive\logs\dodge\dodge.txt.</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="setting-dodge-file-logging">
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <span class="settings-label">Packet logging</span>
+                  <span class="settings-desc">Enable full raw incoming and outgoing packet logging in Documents\Hive\logs\packets\packets.txt. Packet payloads may contain sensitive data.</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="setting-packet-file-logging">
                   <span class="toggle-slider"></span>
                 </label>
               </div>

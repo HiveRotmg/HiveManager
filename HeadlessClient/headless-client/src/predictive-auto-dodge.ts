@@ -741,11 +741,12 @@ export class PredictiveAutoDodgeController {
 export interface TrackedThrownAoe extends DodgePlanningAoe {
   id: number;
   effectType: number;
+  source: 'predicted_throw' | 'authoritative_aoe';
 }
 
-/** Correlates thrown SHOWEFFECT endpoints with later AOE packets. */
-export class ThrownAoeTracker {
-  private readonly throws: TrackedThrownAoe[] = [];
+/** Unified stream of predicted throws and authoritative dwelling AOE packets. */
+export class DodgeAoeThreatTracker {
+  private readonly threats: TrackedThrownAoe[] = [];
   private readonly learnedRadius = new Map<number, number>();
   private readonly learnedBlastDuration = new Map<number, number>();
   private readonly learnedDamage = new Map<number, number>();
@@ -753,7 +754,7 @@ export class ThrownAoeTracker {
   private nextId = 1;
 
   clear(): void {
-    this.throws.length = 0;
+    this.threats.length = 0;
     this.learnedRadius.clear();
     this.learnedBlastDuration.clear();
     this.learnedDamage.clear();
@@ -774,9 +775,10 @@ export class ThrownAoeTracker {
     const explicitBlastMs = blastDurationSeconds !== undefined
       ? Math.max(0, blastDurationSeconds * 1000)
       : undefined;
-    this.throws.push({
+    this.threats.push({
       id: this.nextId++,
       effectType: normalizedType,
+      source: 'predicted_throw',
       x: end.x,
       y: end.y,
       radius: this.learnedRadius.get(normalizedType) ?? 1,
@@ -794,38 +796,76 @@ export class ThrownAoeTracker {
     blastDurationSeconds?: number,
     damage?: number,
     armorPiercing?: boolean,
-  ): void {
+    effectType = 0,
+  ): boolean {
     let best: TrackedThrownAoe | undefined;
     let bestDistance = 1;
-    for (let index = 0; index < this.throws.length; index++) {
-      const thrown = this.throws[index]!;
+    for (let index = 0; index < this.threats.length; index++) {
+      const thrown = this.threats[index]!;
+      if (thrown.source !== 'predicted_throw') continue;
       if (now < thrown.landingTime - 150 || now > thrown.landingTime + 750) continue;
       const distance = Math.hypot(position.x - thrown.x, position.y - thrown.y);
       if (distance > bestDistance) continue;
       bestDistance = distance;
       best = thrown;
     }
-    if (!best) return;
-    this.learnedRadius.set(best.effectType, radius);
-    best.radius = radius;
+    const matchedPrediction = best !== undefined;
+    const blastMs = blastDurationSeconds !== undefined
+      ? Math.max(0, blastDurationSeconds * 1000)
+      : 0;
+    if (!best) {
+      best = this.threats.find((threat) => {
+        return threat.source === 'authoritative_aoe'
+          && Math.abs(threat.landingTime - now) <= 50
+          && Math.hypot(position.x - threat.x, position.y - threat.y) <= 0.05
+          && Math.abs(threat.radius - radius) <= 0.05;
+      });
+      if (!best && blastMs <= 0) return false;
+      if (!best) {
+        best = {
+          id: this.nextId++,
+          effectType: effectType >>> 0,
+          source: 'authoritative_aoe',
+          x: position.x,
+          y: position.y,
+          radius: Math.max(0, radius),
+          landingTime: now,
+          blastDurationMs: blastMs,
+          damage: damage !== undefined && Number.isFinite(damage)
+            ? Math.max(0, Math.trunc(damage))
+            : undefined,
+          armorPiercing: armorPiercing === undefined ? undefined : !!armorPiercing,
+        };
+        this.threats.push(best);
+      }
+    } else {
+      this.learnedRadius.set(best.effectType, radius);
+      best.source = 'authoritative_aoe';
+      best.landingTime = now;
+    }
+    best.x = position.x;
+    best.y = position.y;
+    best.radius = Math.max(0, radius);
     if (damage !== undefined && Number.isFinite(damage) && damage > 0) {
       const learnedDamage = Math.trunc(damage);
-      this.learnedDamage.set(best.effectType, learnedDamage);
+      if (best.effectType !== 0) this.learnedDamage.set(best.effectType, learnedDamage);
       best.damage = learnedDamage;
     }
     if (armorPiercing !== undefined) {
-      this.learnedArmorPiercing.set(best.effectType, !!armorPiercing);
+      if (best.effectType !== 0) {
+        this.learnedArmorPiercing.set(best.effectType, !!armorPiercing);
+      }
       best.armorPiercing = !!armorPiercing;
     }
     if (blastDurationSeconds !== undefined) {
-      const blastMs = Math.max(0, blastDurationSeconds * 1000);
-      this.learnedBlastDuration.set(best.effectType, blastMs);
+      if (best.effectType !== 0) this.learnedBlastDuration.set(best.effectType, blastMs);
       best.blastDurationMs = blastMs;
     }
     // Do NOT splice the matched throw here — leaving it in place lets
     // getActive() surface it to the planner during the dwell window (see
     // spec docs/superpowers/specs/2026-07-19-aoe-blast-dwell-rewrite-design.md
     // touchpoint 3). Post-dwell expiry happens in getActive() below.
+    return matchedPrediction || blastMs > 0;
   }
 
   getActive(now: number): readonly TrackedThrownAoe[] {
@@ -835,20 +875,22 @@ export class ThrownAoeTracker {
     // buffer was reset. `TrackedThrownAoe` is a flat primitive shape; shallow
     // clone plus a fresh array is cheap and avoids the retention footgun.
     const active: TrackedThrownAoe[] = [];
-    for (let index = this.throws.length - 1; index >= 0; index--) {
-      const thrown = this.throws[index]!;
+    for (let index = this.threats.length - 1; index >= 0; index--) {
+      const thrown = this.threats[index]!;
       const dwellMs = thrown.blastDurationMs ?? 0;
       const expiresAt = thrown.landingTime + Math.max(750, dwellMs);
       if (now > expiresAt) {
-        this.throws.splice(index, 1);
+        this.threats.splice(index, 1);
         continue;
       }
-      thrown.radius = this.learnedRadius.get(thrown.effectType) ?? thrown.radius;
-      const learnedBlast = this.learnedBlastDuration.get(thrown.effectType);
-      if (learnedBlast !== undefined) thrown.blastDurationMs = learnedBlast;
-      thrown.damage = this.learnedDamage.get(thrown.effectType) ?? thrown.damage;
-      thrown.armorPiercing = this.learnedArmorPiercing.get(thrown.effectType)
-        ?? thrown.armorPiercing;
+      if (thrown.effectType !== 0) {
+        thrown.radius = this.learnedRadius.get(thrown.effectType) ?? thrown.radius;
+        const learnedBlast = this.learnedBlastDuration.get(thrown.effectType);
+        if (learnedBlast !== undefined) thrown.blastDurationMs = learnedBlast;
+        thrown.damage = this.learnedDamage.get(thrown.effectType) ?? thrown.damage;
+        thrown.armorPiercing = this.learnedArmorPiercing.get(thrown.effectType)
+          ?? thrown.armorPiercing;
+      }
       // Include pre-landing throws (existing behavior) AND during-dwell throws
       // (new for P3). Post-dwell throws are cleaned up above.
       if (now < thrown.landingTime + (thrown.blastDurationMs ?? 0)) {
@@ -858,6 +900,9 @@ export class ThrownAoeTracker {
     return active;
   }
 }
+
+/** Backward-compatible name for callers that only use thrown telegraphs. */
+export class ThrownAoeTracker extends DodgeAoeThreatTracker {}
 
 function emptyState(
   enabled: boolean,

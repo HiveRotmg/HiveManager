@@ -2,7 +2,7 @@ import { Position } from '../types/world/Position';
 import { Enemy } from '../types/entities/Enemy';
 
 export type CombatAimTarget = number | { objectId: number };
-export type AutoAimMode = 'closest' | 'maxHp' | 'lowestHp' | 'random';
+export type AutoAimMode = 'closest' | 'closestToAim' | 'maxHp' | 'lowestHp' | 'random';
 
 export interface AutoAimOptions {
     mode?: AutoAimMode;
@@ -11,6 +11,16 @@ export interface AutoAimOptions {
     bossPriority?: boolean;
     leadTargets?: boolean;
     includeInvulnerable?: boolean;
+    /** Include non-Character walls and structures in automatic targeting. */
+    shootAtWalls?: boolean;
+    includeIgnored?: boolean;
+    onlyExcepted?: boolean;
+    ignoredTypes?: readonly number[];
+    exceptedTypes?: readonly number[];
+    priorityTypes?: readonly number[];
+    /** World-space cursor equivalent for `mode: 'closestToAim'`. */
+    aimPoint?: { x: number; y: number };
+    boundingDistance?: number;
     weaponSlot?: number;
 }
 

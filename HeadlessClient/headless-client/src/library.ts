@@ -2,6 +2,7 @@ export { Client } from './client';
 export type {
   ClientEventMap,
   ClientDamageTakenEvent,
+  ClientDodgeDiagnostic,
   ClientPartyMember,
   ClientShotFiredEvent,
   ContainerSlotRef,
@@ -108,7 +109,11 @@ export type {
   DodgeTrajectoryAssessment,
   TimedDodgeWaypoint,
 } from './dodge-trajectory-planner';
-export { PredictiveAutoDodgeController, ThrownAoeTracker } from './predictive-auto-dodge';
+export {
+  DodgeAoeThreatTracker,
+  PredictiveAutoDodgeController,
+  ThrownAoeTracker,
+} from './predictive-auto-dodge';
 export type {
   AutoDodgeOptions,
   AutoDodgeSnapshot,

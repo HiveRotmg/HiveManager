@@ -107,6 +107,10 @@ export interface ObjectDef {
   maxHp: number;
   defense: number;
   quest: boolean;
+  /** ProdMafia's XML-defined boss flag; custom priorities are supplied at runtime. */
+  boss: boolean;
+  /** True for Character-class objects; non-characters are walls/structures to Auto Aim. */
+  isCharacter: boolean;
   god: boolean;
   // Weapon/equipment properties
   rateOfFire: number;
@@ -542,6 +546,8 @@ export class GameDataLoader {
         maxHp: Number(obj.MaxHitPoints ?? 0),
         defense: Number(obj.Defense ?? 0),
         quest: obj.Quest !== undefined,
+        boss: obj.Quest !== undefined,
+        isCharacter: String(objectClass).trim().toLowerCase() === 'character',
         god: obj.God !== undefined,
         rateOfFire: fastestSubattackRate || finiteOr(obj.RateOfFire, 1),
         numProjectiles: primaryPattern?.numProjectiles ?? positiveIntOr(obj.NumProjectiles, 1),

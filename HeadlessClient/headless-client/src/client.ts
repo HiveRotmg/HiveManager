@@ -112,9 +112,10 @@ import {
 import { MovementController, movementSpeed, type MovementSnapshot } from './movement-controller';
 import {
   PredictiveAutoDodgeController,
-  ThrownAoeTracker,
+  DodgeAoeThreatTracker,
   type AutoDodgeOptions,
   type AutoDodgeState,
+  type TrackedThrownAoe,
 } from './predictive-auto-dodge';
 import { RealmPortal, ClientOptions, ClientServer, TrackedObject, TrackedTile } from './models';
 import { PortalTracker } from './portal-tracker';
@@ -218,6 +219,92 @@ export interface PacketTraffic {
   size: number;
   payload: Buffer;
   timestamp: number;
+  /** Client connection lifetime that produced the raw frame. */
+  connectionGeneration?: number;
+  /** Present on outgoing MOVE packets so raw traffic can be tied to dodge decisions. */
+  dodgeCorrelation?: {
+    /** Monotonic MOVE-command number for this client session. */
+    sequence: number;
+    /** The dodge evaluation that produced the command, when diagnostics are enabled. */
+    decisionSequence: number | null;
+    tickId: number;
+    recordTime: number;
+    position: { x: number; y: number };
+  };
+}
+
+export type DodgeDiagnosticKind =
+  | 'evaluation'
+  | 'movement_outcome'
+  | 'authoritative_rebase'
+  | 'initial_authoritative_position'
+  | 'goto_rebase';
+
+export interface ClientDodgeDiagnostic {
+  kind: DodgeDiagnosticKind;
+  sequence: number;
+  connectionGeneration: number;
+  timestamp: number;
+  mapName: string;
+  localPosition: { x: number; y: number };
+  serverPosition: { x: number; y: number } | null;
+  positionDrift: number | null;
+  player: {
+    objectId: number;
+    hp: number;
+    maxHp: number;
+    defense: number;
+    speed: number;
+    condition: number;
+    condition2: number;
+  } | null;
+  movement: {
+    dt: number;
+    locked: boolean;
+    snapshot: MovementSnapshot;
+    intendedVelocity: { x: number; y: number };
+    goal: { x: number; y: number; threshold?: number } | null;
+    dodgeIntent: DodgeMovementIntent | null;
+    navigationStatus: string;
+    previousDodgeDecision: string | null;
+    navigationPath: Array<{ x: number; y: number }>;
+    routeRevision: number;
+  };
+  environment: {
+    collisionRevision: number;
+    enemyRevision: number;
+  };
+  /** Null explains an unavailable controller or an intentionally disabled dodge frame. */
+  state: AutoDodgeState | null;
+  dodgeEnabled: boolean;
+  availability: {
+    controller: boolean;
+    combat: boolean;
+    collisionWorld: boolean;
+    aoeTracker: boolean;
+  };
+  projectiles: readonly CombatProjectileSnapshot[];
+  aoes: readonly TrackedThrownAoe[];
+  /** The most recent MOVE that the following authoritative status can confirm or reject. */
+  lastMove: PacketTraffic['dodgeCorrelation'] | null;
+  correction?: {
+    source: 'newtick' | 'goto';
+    from: { x: number; y: number } | null;
+    to: { x: number; y: number };
+    drift: number | null;
+    maximumExpectedDrift?: number;
+    tickId?: number;
+    tickTime?: number;
+  };
+  movementOutcome?: {
+    decisionSequence: number | null;
+    startPosition: { x: number; y: number };
+    endPosition: { x: number; y: number };
+    displacement: { x: number; y: number };
+    velocityOverride: { x: number; y: number } | null;
+    reached: { x: number; y: number } | null;
+    stalledDistance: number | null;
+  };
 }
 
 export interface ClientShotFiredEvent {
@@ -264,6 +351,7 @@ export interface ContainerSlotRef {
  */
 export interface ClientEventMap {
   [ClientEvent.PacketTraffic]: [traffic: PacketTraffic];
+  [ClientEvent.DodgeDiagnostic]: [diagnostic: ClientDodgeDiagnostic];
   [ClientEvent.Connected]: [];
   [ClientEvent.Ready]: [objectId: number];
   [ClientEvent.MapChange]: [mapName: string];
@@ -319,13 +407,20 @@ export class Client extends EventEmitter {
   private readonly pathfinder: ExplorativePathfinder;
   private readonly dodgeWorld: DodgeCollisionWorld | undefined;
   private readonly autoDodge: PredictiveAutoDodgeController | undefined;
+  private dodgeDiagnosticsEnabled = false;
+  private dodgeDiagnosticSequence = 0;
+  private dodgeMoveSequence = 0;
+  private diagnosticConnectionGeneration = 0;
+  private lastDodgeEvaluationSequence: number | null = null;
+  private lastDodgeMove: PacketTraffic['dodgeCorrelation'] | null = null;
+  private pendingDodgeMove: PacketTraffic['dodgeCorrelation'] | undefined;
   private dodgeMovementIntent: DodgeMovementIntent | null = null;
   private suspendedDodgeMovementIntent: DodgeMovementIntent | null = null;
   private navigationStatus: NavigationStatus = 'idle';
   private navigationRequestKey = '';
   private navigationMapVersion = 0;
   private navigationDodgeDecision: string | null = null;
-  private readonly thrownAoes: ThrownAoeTracker | undefined;
+  private readonly aoeThreats: DodgeAoeThreatTracker | undefined;
   private readonly portalTracker = new PortalTracker();
   private readonly autoNexus: AutoNexusMonitor;
   private readonly combat: CombatTracker | undefined;
@@ -530,7 +625,7 @@ export class Client extends EventEmitter {
       ? new DodgeCollisionWorld(opts.combatData, staticPassability)
       : undefined;
     this.autoDodge = opts.combatData ? new PredictiveAutoDodgeController() : undefined;
-    this.thrownAoes = opts.combatData ? new ThrownAoeTracker() : undefined;
+    this.aoeThreats = opts.combatData ? new DodgeAoeThreatTracker() : undefined;
     this.autoNexus = new AutoNexusMonitor((trigger) => {
       console.warn(
         `${this.tag} autonexus at ${trigger.hp}/${trigger.maxHp} HP ` +
@@ -818,6 +913,74 @@ export class Client extends EventEmitter {
     return this.autoDodge?.getState() ?? null;
   }
 
+  /** Enables the high-volume planner event used by Hive's opt-in file logger. */
+  setDodgeDiagnosticsEnabled(enabled: boolean): void {
+    this.dodgeDiagnosticsEnabled = enabled;
+  }
+
+  private dodgeDiagnosticBase(
+    kind: DodgeDiagnosticKind,
+    now: number,
+  ): Omit<ClientDodgeDiagnostic, 'sequence' | 'state' | 'projectiles' | 'aoes'> {
+    const serverPosition = this.serverPos ? { ...this.serverPos } : null;
+    const snapshot = this.movementSnapshot();
+    const movementGoal = this.movement.getTarget();
+    return {
+      kind,
+      timestamp: now,
+      connectionGeneration: this.diagnosticConnectionGeneration,
+      mapName: this.mapName,
+      localPosition: { ...this.pos },
+      serverPosition,
+      positionDrift: serverPosition
+        ? Math.hypot(this.pos.x - serverPosition.x, this.pos.y - serverPosition.y)
+        : null,
+      player: this.player ? {
+        objectId: this.objectId,
+        hp: this.player.hp,
+        maxHp: this.player.maxHP,
+        defense: this.player.def,
+        speed: this.player.spd,
+        condition: this.player.condition >>> 0,
+        condition2: this.player.condition2 >>> 0,
+      } : null,
+      movement: {
+        dt: 0,
+        locked: this.isMovementLocked(),
+        snapshot,
+        intendedVelocity: this.movement.getIntendedVelocity(snapshot, true),
+        goal: movementGoal ? { ...movementGoal } : null,
+        dodgeIntent: cloneDodgeMovementIntent(this.dodgeMovementIntent),
+        navigationStatus: this.navigationStatus,
+        previousDodgeDecision: this.navigationDodgeDecision,
+        navigationPath: this.pathfinder.getRemainingPath(),
+        routeRevision: this.pathfinder.getIntentRevisions().routeRevision,
+      },
+      environment: {
+        collisionRevision: this.dodgeWorld?.getRevision() ?? 0,
+        enemyRevision: this.dodgeWorld?.getEnemyRevision() ?? 0,
+      },
+      dodgeEnabled: this.autoDodge?.isEnabled() ?? false,
+      availability: {
+        controller: !!this.autoDodge,
+        combat: !!this.combat,
+        collisionWorld: !!this.dodgeWorld,
+        aoeTracker: !!this.aoeThreats,
+      },
+      lastMove: this.lastDodgeMove ? {
+        ...this.lastDodgeMove,
+        position: { ...this.lastDodgeMove.position },
+      } : null,
+    };
+  }
+
+  private emitDodgeDiagnostic(diagnostic: Omit<ClientDodgeDiagnostic, 'sequence'>): number | null {
+    if (!this.dodgeDiagnosticsEnabled) return null;
+    const sequence = ++this.dodgeDiagnosticSequence;
+    this.emit(ClientEvent.DodgeDiagnostic, { ...diagnostic, sequence });
+    return sequence;
+  }
+
   setDodgeMovementIntent(intent: DodgeMovementIntent | null): boolean {
     if (intent === null) {
       this.dodgeMovementIntent = null;
@@ -960,7 +1123,8 @@ export class Client extends EventEmitter {
       if (now - aoe.startTime > aoe.lifetimeMs) this.viewerAoes.splice(i, 1);
     }
     const aoes = this.viewerAoes.slice();
-    for (const thrown of this.thrownAoes?.getActive(now) ?? []) {
+    for (const thrown of this.aoeThreats?.getActive(now) ?? []) {
+      if (thrown.source !== 'predicted_throw') continue;
       aoes.push({
         id: -thrown.id,
         x: thrown.x,
@@ -2695,9 +2859,12 @@ export class Client extends EventEmitter {
     this.navigationRequestKey = '';
     this.navigationMapVersion = 0;
     this.navigationDodgeDecision = null;
+    this.lastDodgeEvaluationSequence = null;
+    this.lastDodgeMove = null;
+    this.pendingDodgeMove = undefined;
     this.dodgeWorld?.reset();
     this.autoDodge?.reset();
-    this.thrownAoes?.clear();
+    this.aoeThreats?.clear();
     this.recentObjectTypes.clear();
     this.predictedPlayerDamage.clear();
     this.nextBulletId = 1;
@@ -2860,6 +3027,7 @@ export class Client extends EventEmitter {
     }
     this.giveUp = false; // a fresh connect attempt clears the fatal-failure latch
     const generation = this.lifecycle.nextGeneration();
+    this.diagnosticConnectionGeneration = generation;
     this.lifecycle.transition(ClientLifecycleState.Connecting);
     this.stopWatchdog();
     this.timers.clear(this.localFrameTimer);
@@ -3529,14 +3697,14 @@ export class Client extends EventEmitter {
       ? this.objects.get(combatIntent.targetId)
       : undefined;
     this.dodgeWorld?.setExplorativeUnknown(this.pathfinder.hasTarget());
-    const dodgeEnabled = this.autoDodge?.isEnabled()
+    const dodgeEnabled = !!this.autoDodge?.isEnabled()
       && !!this.combat
       && !!this.dodgeWorld
-      && !!this.thrownAoes;
+      && !!this.aoeThreats;
     const activeProjectiles = dodgeEnabled && this.combat
       ? [...this.combat.getActiveProjectiles()]
       : [];
-    const activeAoes = dodgeEnabled ? this.thrownAoes!.getActive(now) : [];
+    const activeAoes = dodgeEnabled ? this.aoeThreats!.getActive(now) : [];
     const dodgeState = dodgeEnabled
       ? this.autoDodge!.evaluate({
           time: now,
@@ -3562,6 +3730,28 @@ export class Client extends EventEmitter {
           environment: this.dodgeWorld!,
         })
       : undefined;
+    if (this.dodgeDiagnosticsEnabled) {
+      const sequence = this.emitDodgeDiagnostic({
+        ...this.dodgeDiagnosticBase('evaluation', now),
+        movement: {
+          dt,
+          locked: movementLocked,
+          snapshot,
+          intendedVelocity: { ...intentVelocity },
+          goal: movementGoal ? { ...movementGoal } : null,
+          dodgeIntent: cloneDodgeMovementIntent(this.dodgeMovementIntent),
+          navigationStatus: this.navigationStatus,
+          previousDodgeDecision: this.navigationDodgeDecision,
+          navigationPath: this.pathfinder.getRemainingPath(),
+          routeRevision: this.pathfinder.getIntentRevisions().routeRevision,
+        },
+        dodgeEnabled,
+        state: dodgeState ?? null,
+        projectiles: activeProjectiles,
+        aoes: activeAoes,
+      });
+      this.lastDodgeEvaluationSequence = sequence;
+    }
     if (dodgeState && this.player) {
       const condition = this.player.condition >>> 0;
       const condition2 = this.player.condition2 >>> 0;
@@ -3616,6 +3806,26 @@ export class Client extends EventEmitter {
         || dodgeState?.decision === 'goal_path' && dodgeState.threatCount === 0,
     });
     this.pos = update.pos;
+    if (this.dodgeDiagnosticsEnabled) {
+      this.emitDodgeDiagnostic({
+        ...this.dodgeDiagnosticBase('movement_outcome', now),
+        state: dodgeState ?? null,
+        projectiles: activeProjectiles,
+        aoes: activeAoes,
+        movementOutcome: {
+          decisionSequence: this.lastDodgeEvaluationSequence,
+          startPosition: { ...snapshot.localPos },
+          endPosition: { ...update.pos },
+          displacement: {
+            x: update.pos.x - snapshot.localPos.x,
+            y: update.pos.y - snapshot.localPos.y,
+          },
+          velocityOverride: velocityOverride ? { ...velocityOverride } : null,
+          reached: update.reached ? { ...update.reached } : null,
+          stalledDistance: update.stalled?.distance ?? null,
+        },
+      });
+    }
     if (update.stalled && this.serverPos) {
       if (usingPathfinding) {
         const blocked = this.pathfinder.reportStall(this.serverPos);
@@ -3697,7 +3907,20 @@ export class Client extends EventEmitter {
     record.x = this.pos.x;
     record.y = this.pos.y;
     move.records = [record]; // must send >= 1 record or the server drops us
-    this.io.send(move);
+    const correlation = {
+      sequence: ++this.dodgeMoveSequence,
+      decisionSequence: this.lastDodgeEvaluationSequence,
+      tickId: p.tickId,
+      recordTime: record.time,
+      position: { x: record.x, y: record.y },
+    };
+    this.lastDodgeMove = correlation;
+    this.pendingDodgeMove = correlation;
+    try {
+      this.io.send(move);
+    } finally {
+      this.pendingDodgeMove = undefined;
+    }
   }
 
   /**
@@ -3740,6 +3963,26 @@ export class Client extends EventEmitter {
         this.serverPos = serverPosition;
         const maximumExpectedDrift = this.maximumExpectedPositionDrift(p.tickTime);
         if (!hadLocalPosition || drift > maximumExpectedDrift) {
+          if (this.dodgeDiagnosticsEnabled) {
+            this.emitDodgeDiagnostic({
+              ...this.dodgeDiagnosticBase(
+                hadLocalPosition ? 'authoritative_rebase' : 'initial_authoritative_position',
+                now,
+              ),
+              state: this.autoDodge?.getState() ?? null,
+              projectiles: this.combat ? [...this.combat.getActiveProjectiles()] : [],
+              aoes: this.aoeThreats?.getActive(now) ?? [],
+              correction: {
+                source: 'newtick',
+                from: hadLocalPosition ? { ...this.pos } : null,
+                to: { ...serverPosition },
+                drift: hadLocalPosition ? drift : null,
+                maximumExpectedDrift,
+                tickId: p.tickId,
+                tickTime: p.tickTime,
+              },
+            });
+          }
           this.rebaseToAuthoritativePosition(serverPosition, now);
           if (hadLocalPosition) {
             console.warn(
@@ -3837,6 +4080,7 @@ export class Client extends EventEmitter {
         size: raw.payload.length + 5,
         payload: raw.payload,
         timestamp: Date.now(),
+        connectionGeneration: this.diagnosticConnectionGeneration,
       });
     });
     this.io.on('sentRawPacket', (raw: RawOutgoingPacket) => {
@@ -3847,6 +4091,13 @@ export class Client extends EventEmitter {
         size: raw.size,
         payload: raw.payload,
         timestamp: Date.now(),
+        connectionGeneration: this.diagnosticConnectionGeneration,
+        dodgeCorrelation: raw.type === PacketType.MOVE && this.pendingDodgeMove
+          ? {
+              ...this.pendingDodgeMove,
+              position: { ...this.pendingDodgeMove.position },
+            }
+          : undefined,
       });
     });
   }
@@ -4018,7 +4269,7 @@ export class Client extends EventEmitter {
   /** Tracks announced thrown-projectile endpoints before their AOE packet arrives. */
   private handleShowEffect(p: ShowEffectPacket): void {
     if (p.effectType !== VisualEffect.THROW_PROJECTILE) return;
-    this.thrownAoes?.track(p.color, p.pos1, p.duration, this.time());
+    this.aoeThreats?.track(p.color, p.pos1, p.duration, this.time());
     this.autoDodge?.noteDangerUpdate();
   }
 
@@ -4029,14 +4280,16 @@ export class Client extends EventEmitter {
     // tracker can learn per-effectType dwell durations and surface during-
     // dwell throws to the dodge planner. Without this the P3 windowed
     // sampling never fires from real packet traffic.
-    this.thrownAoes?.recordAoe(
+    const aoeThreatsChanged = this.aoeThreats?.recordAoe(
       p.pos,
       p.radius,
       ackTime,
       p.duration,
       p.damage,
       p.armorPiercing,
+      p.origType,
     );
+    if (aoeThreatsChanged) this.autoDodge?.noteDangerUpdate();
     this.viewerAoes.push({
       id: this.nextViewerAoeId++,
       x: p.pos.x,
@@ -4178,10 +4431,26 @@ export class Client extends EventEmitter {
     if (p.objectId === this.objectId) {
       // TELEPORT is confirmed with a self-targeted GOTO. Rebase local movement
       // as well as server state so SDK reads and the viewer move immediately.
+      const previousPosition = this.posKnown ? { ...this.pos } : null;
+      const now = this.time();
+      this.serverPos = { ...position };
+      if (this.dodgeDiagnosticsEnabled) {
+        this.emitDodgeDiagnostic({
+          ...this.dodgeDiagnosticBase('goto_rebase', now),
+          state: this.autoDodge?.getState() ?? null,
+          projectiles: this.combat ? [...this.combat.getActiveProjectiles()] : [],
+          aoes: this.aoeThreats?.getActive(now) ?? [],
+          correction: {
+            source: 'goto',
+            from: previousPosition,
+            to: { ...position },
+            drift: previousPosition ? Math.hypot(previousPosition.x - position.x, previousPosition.y - position.y) : null,
+          },
+        });
+      }
       this.pos = position;
       this.serverPos = { ...position };
       this.posKnown = true;
-      const now = this.time();
       this.autoDodge?.rebase(position, now);
     } else {
       const tracked = this.objects.get(p.objectId);

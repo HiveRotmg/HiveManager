@@ -138,6 +138,10 @@ export interface CombatObjectDefinition {
   burstMinDelayMs?: number;
   maxHp?: number;
   quest?: boolean;
+  /** Mirrors ObjectProperties.boss_: XML Quest plus any caller-defined priority type. */
+  boss?: boolean;
+  /** False for wall/structure objects that source Auto Aim skips by default. */
+  isCharacter?: boolean;
   usable?: boolean;
   mpCost?: number;
   cooldownMs?: number;

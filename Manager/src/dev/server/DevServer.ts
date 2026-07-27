@@ -3389,6 +3389,34 @@ export class DevServer {
       return;
     }
 
+    if (req.url === '/api/diagnostic-logging' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(this.headlessFleet?.getLoggingSettings() ?? { dodge: false, packets: false }));
+      return;
+    }
+
+    if (req.url === '/api/diagnostic-logging' && req.method === 'POST') {
+      let body = '';
+      req.on('data', (chunk) => {
+        if (body.length <= 16_384) body += chunk;
+      });
+      req.on('end', () => {
+        try {
+          const update = JSON.parse(body || '{}') as { dodge?: unknown; packets?: unknown };
+          const settings = this.headlessFleet?.setLoggingSettings({
+            ...(typeof update.dodge === 'boolean' ? { dodge: update.dodge } : {}),
+            ...(typeof update.packets === 'boolean' ? { packets: update.packets } : {}),
+          }) ?? { dodge: false, packets: false };
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(settings));
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid JSON' }));
+        }
+      });
+      return;
+    }
+
     if (req.url === '/api/recent' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(this.inspector.getRecent()));
