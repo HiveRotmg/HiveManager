@@ -53,6 +53,10 @@ export interface DodgePlanningAoe {
   y: number;
   radius: number;
   landingTime: number;
+  /** Learned raw damage, when a matching AOE packet has supplied it. */
+  damage?: number;
+  /** Learned armor-piercing flag from the matching AOE packet. */
+  armorPiercing?: boolean;
   /**
    * Duration in ms the blast stays dangerous after `landingTime`. Falsy or
    * missing = single-frame (existing behavior). When set, both AoE-sample

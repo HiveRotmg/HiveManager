@@ -22,6 +22,7 @@ const projectile: CombatProjectileDefinition = {
   acceleration: 0,
   accelerationDelay: 0,
   speedClamp: -1,
+  laserDistance: 0,
   turnRate: 0,
   turnRateDelay: 0,
   turnAcceleration: 0,
@@ -107,6 +108,7 @@ test('target leading accounts for projectile acceleration', () => {
     lifetimeMs: 1_500,
     acceleration: 200,
     accelerationDelay: 0,
+    speedClamp: 300,
   }, 1);
 
   assert.ok(constant.y > accelerating.y);

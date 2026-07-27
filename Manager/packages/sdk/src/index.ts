@@ -135,6 +135,7 @@ export type {
   AutoAimOptions,
   CombatAimTarget,
   CombatAutomationState,
+  CombatProtectionState,
 } from './combat/Combat';
 export { Players } from './players/Players';
 export { Enemies } from './enemies/Enemies';

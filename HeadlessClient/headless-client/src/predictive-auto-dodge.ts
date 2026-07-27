@@ -835,12 +835,16 @@ export class ThrownAoeTracker {
   private readonly throws: TrackedThrownAoe[] = [];
   private readonly learnedRadius = new Map<number, number>();
   private readonly learnedBlastDuration = new Map<number, number>();
+  private readonly learnedDamage = new Map<number, number>();
+  private readonly learnedArmorPiercing = new Map<number, boolean>();
   private nextId = 1;
 
   clear(): void {
     this.throws.length = 0;
     this.learnedRadius.clear();
     this.learnedBlastDuration.clear();
+    this.learnedDamage.clear();
+    this.learnedArmorPiercing.clear();
     this.nextId = 1;
   }
 
@@ -865,6 +869,8 @@ export class ThrownAoeTracker {
       radius: this.learnedRadius.get(normalizedType) ?? 1,
       landingTime: now + durationMs,
       blastDurationMs: explicitBlastMs ?? learnedBlastMs,
+      damage: this.learnedDamage.get(normalizedType),
+      armorPiercing: this.learnedArmorPiercing.get(normalizedType),
     });
   }
 
@@ -873,6 +879,8 @@ export class ThrownAoeTracker {
     radius: number,
     now: number,
     blastDurationSeconds?: number,
+    damage?: number,
+    armorPiercing?: boolean,
   ): void {
     let best: TrackedThrownAoe | undefined;
     let bestDistance = 1;
@@ -887,6 +895,15 @@ export class ThrownAoeTracker {
     if (!best) return;
     this.learnedRadius.set(best.effectType, radius);
     best.radius = radius;
+    if (damage !== undefined && Number.isFinite(damage) && damage > 0) {
+      const learnedDamage = Math.trunc(damage);
+      this.learnedDamage.set(best.effectType, learnedDamage);
+      best.damage = learnedDamage;
+    }
+    if (armorPiercing !== undefined) {
+      this.learnedArmorPiercing.set(best.effectType, !!armorPiercing);
+      best.armorPiercing = !!armorPiercing;
+    }
     if (blastDurationSeconds !== undefined) {
       const blastMs = Math.max(0, blastDurationSeconds * 1000);
       this.learnedBlastDuration.set(best.effectType, blastMs);
@@ -916,6 +933,9 @@ export class ThrownAoeTracker {
       thrown.radius = this.learnedRadius.get(thrown.effectType) ?? thrown.radius;
       const learnedBlast = this.learnedBlastDuration.get(thrown.effectType);
       if (learnedBlast !== undefined) thrown.blastDurationMs = learnedBlast;
+      thrown.damage = this.learnedDamage.get(thrown.effectType) ?? thrown.damage;
+      thrown.armorPiercing = this.learnedArmorPiercing.get(thrown.effectType)
+        ?? thrown.armorPiercing;
       // Include pre-landing throws (existing behavior) AND during-dwell throws
       // (new for P3). Post-dwell throws are cleaned up above.
       if (now < thrown.landingTime + (thrown.blastDurationMs ?? 0)) {

@@ -26,6 +26,7 @@ function straight(): CombatProjectileDefinition {
     acceleration: 0,
     accelerationDelay: 0,
     speedClamp: -1,
+    laserDistance: 0,
     turnRate: 0,
     turnRateDelay: 0,
     turnAcceleration: 0,
@@ -139,8 +140,8 @@ test('collision half-extent scales with collisionMult', () => {
   assert.equal(projectileCollisionHalfSize({ ...straight(), collisionMult: 2 }), 1.0);
   assert.equal(
     projectileCollisionHalfSize({ ...straight(), collisionMult: 0 }),
-    0.5,
-    'a zero/absent mult must fall back to 1, never collapse the hitbox to nothing',
+    0,
+    'ProdMafia accepts an authored zero multiplier and collapses the hitbox',
   );
 });
 

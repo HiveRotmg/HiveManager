@@ -49,6 +49,21 @@ export function installHeadlessCombatBridge(deps: BridgeDeps): void {
   Combat.disableProjectileNoclip = () => active(deps).disableProjectileNoclip();
   Combat.isProjectileNoclipEnabled = () => optional(deps)?.isProjectileNoclipEnabled() ?? false;
 
+  Combat.setPartialGodMode = (enabled) => active(deps).setPartialGodModeEnabled(enabled);
+  Combat.enablePartialGodMode = () => active(deps).setPartialGodModeEnabled(true);
+  Combat.disablePartialGodMode = () => {
+    active(deps).setPartialGodModeEnabled(false);
+  };
+  Combat.isPartialGodModeEnabled = () => optional(deps)?.isPartialGodModeEnabled() ?? false;
+
+  Combat.setAoeSpoof = (enabled) => active(deps).setAoeSpoofEnabled(enabled);
+  Combat.enableAoeSpoof = () => active(deps).setAoeSpoofEnabled(true);
+  Combat.disableAoeSpoof = () => {
+    active(deps).setAoeSpoofEnabled(false);
+  };
+  Combat.isAoeSpoofEnabled = () => optional(deps)?.isAoeSpoofEnabled() ?? false;
+  Combat.getProtectionState = () => optional(deps)?.getCombatProtectionState() ?? null;
+
   Combat.accuracy = () => optional(deps)?.accuracy() ?? 0;
   Combat.recentAccuracy = (minutes) => optional(deps)?.recentAccuracy(minutes) ?? 0;
   Combat.resetAccuracy = () => active(deps).resetAccuracy();

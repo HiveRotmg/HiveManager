@@ -1,5 +1,5 @@
 // ── Crash tracer ──────────────────────────────────────────────────────────────
-import { appendFileSync as _crashAppend } from 'fs';
+import { appendFileSync as _crashAppend, existsSync } from 'fs';
 import { join as _crashJoin } from 'path';
 import { tmpdir as _crashTmpdir } from 'os';
 const _CRASH_LOG_PATH = _crashJoin(_crashTmpdir(), 'hive-proxy.log');
@@ -58,6 +58,12 @@ import { PacketInspector } from './dev/server/PacketInspector.js';
 import { DevServer } from './dev/server/DevServer.js';
 import { Logger } from './util/Logger.js';
 import { ensureRotmgMetadataXml } from './util/ensureRotmgMetadataXml.js';
+import {
+  extractLocalGameAssets,
+  findLocalGameDataDir,
+  isLocalCacheFresh,
+} from './util/rotmgLocalExtractor.js';
+import { getHiveDataDir } from './util/rotmgAssetExtractor.js';
 import { ensureSdkDeployed } from './util/ensureSdkDeployed.js';
 import { HeadlessFleet } from './headless/HeadlessFleet.js';
 import { HiveMcpServer } from './mcp/HiveMcpServer.js';
@@ -107,10 +113,35 @@ async function main() {
 
   const proxy = new Proxy(packetFactory);
   const dataDir = resolve(ROOT, 'data');
+  const localAssetDataDir = getHiveDataDir();
+  let gameDataDir = dataDir;
 
-  const objectsPath = resolve(ROOT, 'data', 'objects.xml');
-  const tilesPath = resolve(ROOT, 'data', 'tiles.xml');
-  const enchantmentsPath = resolve(ROOT, 'data', 'enchantments.xml');
+  // Keep the viewer's metadata and art from the same local game build.  XML-only
+  // refreshes are sufficient for packet parsing, but leave the viewer with no
+  // sprite atlas to draw and it falls back to its colored diagnostic shapes.
+  // This is deliberately local-only: downloading the CDN metadata must never
+  // delay startup just to obtain optional viewer art.
+  const localGameDataDir = findLocalGameDataDir();
+  if (localGameDataDir) {
+    if (!isLocalCacheFresh(localGameDataDir, localAssetDataDir)) {
+      try {
+        Logger.log('Main', `Refreshing viewer sprite assets from ${localGameDataDir}`);
+        await extractLocalGameAssets(localGameDataDir, localAssetDataDir);
+      } catch (err) {
+        // Keep the dashboard usable when the installed client is being updated or
+        // has an unsupported asset layout; the viewer will retain its safe fallback.
+        Logger.warn('Main', `Could not extract local viewer sprite assets: ${(err as Error).message}`);
+      }
+    }
+    if (isLocalCacheFresh(localGameDataDir, localAssetDataDir)) gameDataDir = localAssetDataDir;
+  }
+
+  const objectsPath = resolve(gameDataDir, 'objects.xml');
+  const tilesPath = resolve(gameDataDir, 'tiles.xml');
+  const localEnchantmentsPath = resolve(gameDataDir, 'enchantments.xml');
+  const enchantmentsPath = existsSync(localEnchantmentsPath)
+    ? localEnchantmentsPath
+    : resolve(dataDir, 'enchantments.xml');
   const gameData = new GameDataLoader();
   try {
     gameData.load(objectsPath);

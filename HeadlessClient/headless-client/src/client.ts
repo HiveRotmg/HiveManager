@@ -61,6 +61,7 @@ import {
   IncomingPartyMemberInfoPacket,
   PartyMemberAddedPacket,
   PartyActionPacket,
+  parseEnchantments,
 } from 'realmlib';
 import {
   deleteCharacter as deleteCharacterRequest,
@@ -78,6 +79,7 @@ import {
   AutoNexusMonitor,
   calculateAutoNexusDamage,
   isAutoNexusSafeMap,
+  predictAutoNexusRouteDamage,
   type AutoNexusConfig,
   type AutoNexusState,
   type AutoNexusTrigger,
@@ -165,6 +167,16 @@ export interface NavigationState {
 
 const VIEWER_AOE_LIFETIME_MS = 750;
 const MAX_VIEWER_AOES = 256;
+const AOE_SPOOF_OFFSET_TILES = 500;
+/**
+ * A NEWTICK position normally trails client-side dead reckoning by about one
+ * tick. Preserve that lead for smooth movement, but cap it so an ignored MOVE
+ * cannot keep the local simulation advancing forever.
+ */
+const MIN_AUTHORITATIVE_REBASE_DISTANCE = 3;
+const AUTHORITATIVE_REBASE_TICK_MULTIPLIER = 1.25;
+const AUTHORITATIVE_REBASE_EXTRA_MS = 120;
+const AUTHORITATIVE_REBASE_MARGIN = 0.5;
 
 enum AoeEffectId {
   Quiet = 2,
@@ -319,6 +331,11 @@ export class Client extends EventEmitter {
   private readonly portalTracker = new PortalTracker();
   private readonly autoNexus: AutoNexusMonitor;
   private readonly combat: CombatTracker | undefined;
+  private readonly weaponEnchantRateCache = new Map<string, number>();
+  /** Debug protection matching ProdMafia's Partial Godmode. Defaults off. */
+  private partialGodModeEnabled = false;
+  /** Spoofs AOEACK positions away from the local player. Defaults off. */
+  private aoeSpoofEnabled = false;
   private viewerOtherProjectilesEnabled = false;
   private readonly viewerOtherProjectiles = new Map<string, ViewerProjectileSnapshot>();
   private readonly viewerAoes: ViewerAoeSnapshot[] = [];
@@ -341,6 +358,10 @@ export class Client extends EventEmitter {
         numProjectiles: def?.numProjectiles ?? 1,
         arcGap: def?.arcGap ?? 11.25,
         subattacks: def?.subattacks,
+        burstCount: def?.burstCount ?? 0,
+        burstDelayMs: def?.burstDelayMs ?? 0,
+        burstMinDelayMs: def?.burstMinDelayMs ?? def?.burstDelayMs ?? 0,
+        rateOfFireMultiplier: this.weaponEnchantRateOfFireMultiplier(weaponType, 0),
       };
     },
     ability: (abilityType: number) => {
@@ -369,6 +390,30 @@ export class Client extends EventEmitter {
       });
     },
   }));
+
+  /**
+   * Fold the equipped weapon's rate-of-fire enchantments into every firing
+   * gate. The server enforces the enchanted cadence even though it does not
+   * expose a separate player stat for this multiplier.
+   */
+  private weaponEnchantRateOfFireMultiplier(weaponType: number, weaponSlot: number): number {
+    const raw = this.player?.enchantmentsRaw;
+    const getEnchantment = this.opts.combatData?.getEnchantment;
+    if (!raw || !getEnchantment) return 1;
+    const slot = parseEnchantments(raw).find((entry) => entry.slot === weaponSlot);
+    if (!slot || slot.enchantmentTypeIds.length === 0) return 1;
+    const key = `${weaponType}|${slot.raw}`;
+    const cached = this.weaponEnchantRateCache.get(key);
+    if (cached !== undefined) return cached;
+    let multiplier = 1;
+    for (const enchantmentType of slot.enchantmentTypeIds) {
+      const value = getEnchantment.call(this.opts.combatData, enchantmentType)?.rateOfFireMultiplier;
+      if (typeof value === 'number' && Number.isFinite(value) && value > 0) multiplier *= value;
+    }
+    if (this.weaponEnchantRateCache.size >= 512) this.weaponEnchantRateCache.clear();
+    this.weaponEnchantRateCache.set(key, multiplier);
+    return multiplier;
+  }
 
   /** Packet types any plugin has hooked; bridged onto each fresh io. */
   private readonly subscribedPacketTypes = new Set<PacketType>();
@@ -405,6 +450,7 @@ export class Client extends EventEmitter {
   private lastLocalMovementAt = 0;
   private lastGroundDamageAt = 0;
   private conditionDamageRemainder = 0;
+  private lastCombatDamageAt = -Infinity;
   private tickCount = 0;
   /** Tick id from the most recent NewTick, and the server-reported ms between the last two ticks. */
   private lastTickId = -1;
@@ -841,6 +887,38 @@ export class Client extends EventEmitter {
   /** Current autonexus configuration and predicted-health state. */
   getAutoNexusState(): AutoNexusState {
     return this.autoNexus.getState();
+  }
+
+  /** Drops enemy projectile hits before both predicted HP loss and PLAYERHIT. */
+  setPartialGodModeEnabled(enabled: boolean): boolean {
+    this.partialGodModeEnabled = enabled === true;
+    return this.partialGodModeEnabled;
+  }
+
+  isPartialGodModeEnabled(): boolean {
+    return this.partialGodModeEnabled;
+  }
+
+  /** Moves AOEACK positions 500 tiles away and skips the matching local damage. */
+  setAoeSpoofEnabled(enabled: boolean): boolean {
+    this.aoeSpoofEnabled = enabled === true;
+    return this.aoeSpoofEnabled;
+  }
+
+  isAoeSpoofEnabled(): boolean {
+    return this.aoeSpoofEnabled;
+  }
+
+  getCombatProtectionState(): {
+    partialGodModeEnabled: boolean;
+    aoeSpoofEnabled: boolean;
+    aoeSpoofOffsetTiles: number;
+  } {
+    return {
+      partialGodModeEnabled: this.partialGodModeEnabled,
+      aoeSpoofEnabled: this.aoeSpoofEnabled,
+      aoeSpoofOffsetTiles: AOE_SPOOF_OFFSET_TILES,
+    };
   }
 
   /** Current estimated (dead-reckoned) player position. */
@@ -2608,6 +2686,7 @@ export class Client extends EventEmitter {
     this.lastLocalMovementAt = 0;
     this.lastGroundDamageAt = 0;
     this.conditionDamageRemainder = 0;
+    this.lastCombatDamageAt = -Infinity;
     this.objects.clear();
     this.tiles.clear();
     this.pathfinder.resetMap();
@@ -3289,7 +3368,10 @@ export class Client extends EventEmitter {
         ? Math.min(34, Math.max(0, now - this.lastLocalMovementAt))
         : 0;
       this.lastLocalMovementAt = now;
-      if (dt > 0 && this.updateConditionDamage(dt)) return;
+      // ProdMafia expires unacknowledged projectile/environment predictions in
+      // its per-frame health check rather than carrying phantom damage forever.
+      if (this.autoNexus.tick(now)) return;
+      if (dt > 0 && this.updatePredictedHealth(dt, now)) return;
       const hasMovementIntent = this.movement.hasTarget()
         || this.pathfinder.hasTarget()
         || (this.autoDodge?.isEnabled() ?? false);
@@ -3454,8 +3536,16 @@ export class Client extends EventEmitter {
       : undefined;
     const jumpLimiterState = this.dodgeJumpLimiter.getState(now);
     this.dodgeWorld?.setExplorativeUnknown(this.pathfinder.hasTarget());
-    const dodgeState = this.autoDodge?.isEnabled() && this.combat && this.dodgeWorld && this.thrownAoes
-      ? this.autoDodge.evaluate({
+    const dodgeEnabled = this.autoDodge?.isEnabled()
+      && !!this.combat
+      && !!this.dodgeWorld
+      && !!this.thrownAoes;
+    const activeProjectiles = dodgeEnabled && this.combat
+      ? [...this.combat.getActiveProjectiles()]
+      : [];
+    const activeAoes = dodgeEnabled ? this.thrownAoes!.getActive(now) : [];
+    const dodgeState = dodgeEnabled
+      ? this.autoDodge!.evaluate({
           time: now,
           playerId: this.objectId,
           position: this.pos,
@@ -3476,11 +3566,43 @@ export class Client extends EventEmitter {
           movementLocked,
           jumpAllowance: jumpLimiterState.allowance,
           jumpStatus: jumpLimiterState.status,
-          projectiles: this.combat.getActiveProjectiles(),
-          aoes: this.thrownAoes.getActive(now),
-          environment: this.dodgeWorld,
+          projectiles: activeProjectiles,
+          aoes: activeAoes,
+          environment: this.dodgeWorld!,
         })
       : undefined;
+    if (dodgeState && this.player) {
+      const condition = this.player.condition >>> 0;
+      const condition2 = this.player.condition2 >>> 0;
+      const routeDamage = predictAutoNexusRouteDamage({
+        now,
+        playerId: this.objectId,
+        position: this.pos,
+        trajectory: dodgeState.trajectory,
+        projectiles: activeProjectiles,
+        aoes: activeAoes,
+        calculateDamage: (baseDamage, armorPiercing) => calculateAutoNexusDamage({
+          baseDamage,
+          defense: this.player!.def,
+          armorPiercing,
+          armorBroken: (condition & ConditionEffectBits.ARMOR_BROKEN) !== 0,
+          armored: (condition & ConditionEffectBits.ARMORED) !== 0,
+          invincible: (condition & ConditionEffectBits.INVINCIBLE) !== 0,
+          invulnerable: (condition & ConditionEffectBits.INVULNERABLE) !== 0,
+          exposed: (condition2 & ConditionEffectBits2.EXPOSED) !== 0,
+          petrified: (condition2 & ConditionEffectBits2.PETRIFIED) !== 0,
+          cursed: (condition2 & ConditionEffectBits2.CURSE) !== 0,
+        }),
+      });
+      if (this.autoNexus.checkPredictive({
+        ...routeDamage,
+        candidate: dodgeState.selectedCandidate,
+        threats: dodgeState.threatCount,
+        decision: dodgeState.decision,
+      }, now)) {
+        return;
+      }
+    }
     this.navigationDodgeDecision = dodgeState?.decision ?? null;
     if (this.pathfinder.hasTarget() && this.navigationStatus !== 'no_path') {
       this.navigationStatus = dodgeState?.decision.endsWith('_blocked')
@@ -3598,22 +3720,62 @@ export class Client extends EventEmitter {
     this.dodgeJumpLimiter.markSent(now, { x: record.x, y: record.y });
   }
 
+  /**
+   * The server's NEWTICK position is intentionally a little behind the most
+   * recent local frame. Allow that normal prediction window, but use the
+   * actual movement speed and tick cadence rather than an unbounded local
+   * position when the server stops accepting our records.
+   */
+  private maximumExpectedPositionDrift(tickTime: number): number {
+    const tickMs = Math.max(100, Math.min(500, tickTime || 200));
+    const predictionMs = tickMs * AUTHORITATIVE_REBASE_TICK_MULTIPLIER
+      + AUTHORITATIVE_REBASE_EXTRA_MS;
+    return Math.max(
+      MIN_AUTHORITATIVE_REBASE_DISTANCE,
+      movementSpeed(this.movementSnapshot()) * predictionMs + AUTHORITATIVE_REBASE_MARGIN,
+    );
+  }
+
+  /** Resets all local movement consumers to a server-confirmed player position. */
+  private rebaseToAuthoritativePosition(position: { x: number; y: number }, now: number): void {
+    this.pos = { ...position };
+    this.posKnown = true;
+    // The next local frame must integrate from this correction, not from a
+    // timestamp belonging to the rejected local trajectory.
+    this.lastLocalMovementAt = now;
+    this.autoDodge?.rebase(position, now);
+  }
+
   /** Applies per-object status deltas from the tick to player and portal state. */
   private updateStatuses(p: NewTickPacket): boolean {
     let selfUpdated = false;
     for (const status of p.statuses) {
       if (status.objectId === this.objectId) {
-        this.serverPos = { x: status.pos.x, y: status.pos.y };
-        this.dodgeJumpLimiter.observeAuthoritative(this.time(), this.serverPos);
-        if (this.dodgeJumpLimiter.consumeCorrectionRebase()) {
-          this.pos = { ...this.serverPos };
-          this.autoDodge?.rebase(this.serverPos, this.time());
+        const now = this.time();
+        const serverPosition = { x: status.pos.x, y: status.pos.y };
+        const hadLocalPosition = this.posKnown;
+        const drift = hadLocalPosition
+          ? Math.hypot(this.pos.x - serverPosition.x, this.pos.y - serverPosition.y)
+          : Infinity;
+        this.serverPos = serverPosition;
+        this.dodgeJumpLimiter.observeAuthoritative(now, serverPosition);
+        const jumpCorrected = this.dodgeJumpLimiter.consumeCorrectionRebase();
+        const maximumExpectedDrift = this.maximumExpectedPositionDrift(p.tickTime);
+        if (!hadLocalPosition || jumpCorrected || drift > maximumExpectedDrift) {
+          this.rebaseToAuthoritativePosition(serverPosition, now);
+          if (jumpCorrected) {
           const jumpState = this.dodgeJumpLimiter.getState(this.time());
           console.warn(
             `${this.tag} dodge jump corrected by server; learned limit is now `
               + `${jumpState.learnedMaxDistance.toFixed(2)} tiles with `
               + `${Math.ceil(jumpState.backoffRemainingMs)}ms backoff`,
           );
+          } else if (hadLocalPosition) {
+            console.warn(
+              `${this.tag} movement desynced by ${drift.toFixed(2)} tiles; `
+                + `rebasing to server position before the next MOVE`,
+            );
+          }
         }
         this.player = processObjectStatus(status, this.player);
         selfUpdated = true;
@@ -3645,29 +3807,53 @@ export class Client extends EventEmitter {
   private reconcilePlayerHealth(player: PlayerData, full = false): boolean {
     if (!full) {
       const state = this.autoNexus.getState();
-      if (state.syncedHp !== null && state.predictedHp !== null) {
+      if (state.syncedHp !== null) {
+        const capacityLoss = state.maxHp === null
+          ? 0
+          : Math.max(0, state.maxHp - player.maxHP);
         const serverDrop = Math.max(0, state.syncedHp - player.hp);
-        const predictedDamage = Math.max(0, state.syncedHp - state.predictedHp);
-        const unreportedDamage = Math.max(0, serverDrop - predictedDamage);
-        if (unreportedDamage > 0 && this.recordDamageTaken(unreportedDamage, 'server')) return true;
+        const combatDamage = Math.max(0, serverDrop - capacityLoss);
+        const unreportedDamage = Math.max(0, combatDamage - state.pendingDamage);
+        if (unreportedDamage > 0 && state.maxHp === player.maxHP) {
+          this.emit(ClientEvent.DamageTaken, {
+            amount: unreportedDamage,
+            source: 'server',
+            hp: player.hp,
+            maxHp: player.maxHP,
+          });
+        }
       }
     }
     return this.autoNexus.reconcileServerHp(player.hp, player.maxHP, full);
   }
 
-  /** Mirrors ProdMafia's local 20 HP/s bleeding prediction between server ticks. */
-  private updateConditionDamage(dt: number): boolean {
-    const bleeding = ((this.player?.condition ?? 0) & ConditionEffectBits.BLEEDING) !== 0;
-    if (!bleeding) {
-      this.conditionDamageRemainder = 0;
-      return false;
+  /** Mirrors ProdMafia's per-frame VIT/healing/bleeding client-HP integration. */
+  private updatePredictedHealth(dt: number, now: number): boolean {
+    const player = this.player;
+    if (!player) return false;
+    const condition = player.condition >>> 0;
+    const sick = (condition & ConditionEffectBits.SICK) !== 0;
+    const bleeding = (condition & ConditionEffectBits.BLEEDING) !== 0;
+    const healing = (condition & ConditionEffectBits.HEALING) !== 0;
+    const inCombat = now - this.lastCombatDamageAt
+      < Math.max(7_000 - Math.max(0, player.vit) * 40, 1_000);
+    const seconds = dt / 1_000;
+
+    if (!sick && !bleeding) {
+      this.conditionDamageRemainder += (
+        1 + 0.12 * Math.max(0, player.vit) * (inCombat ? 1 : 2)
+      ) * seconds;
+      if (healing) this.conditionDamageRemainder += 20 * seconds;
+    } else if (bleeding) {
+      this.conditionDamageRemainder -= 20 * seconds;
     }
 
-    this.conditionDamageRemainder += 20 * dt / 1000;
-    const damage = Math.floor(this.conditionDamageRemainder);
-    if (damage <= 0) return false;
-    this.conditionDamageRemainder -= damage;
-    return this.recordDamageTaken(damage, 'condition');
+    // ActionScript's int conversion truncates toward zero.
+    const wholeHp = Math.trunc(this.conditionDamageRemainder);
+    this.conditionDamageRemainder -= wholeHp;
+    if (wholeHp < 0) return this.recordDamageTaken(-wholeHp, 'condition');
+    if (wholeHp > 0) this.autoNexus.applyRecovery(wholeHp, now);
+    return false;
   }
 
   /** Re-emits raw traffic from each fresh PacketIO for fleet diagnostics. */
@@ -3872,7 +4058,14 @@ export class Client extends EventEmitter {
     // tracker can learn per-effectType dwell durations and surface during-
     // dwell throws to the dodge planner. Without this the P3 windowed
     // sampling never fires from real packet traffic.
-    this.thrownAoes?.recordAoe(p.pos, p.radius, ackTime, p.duration);
+    this.thrownAoes?.recordAoe(
+      p.pos,
+      p.radius,
+      ackTime,
+      p.duration,
+      p.damage,
+      p.armorPiercing,
+    );
     this.viewerAoes.push({
       id: this.nextViewerAoeId++,
       x: p.pos.x,
@@ -3900,6 +4093,14 @@ export class Client extends EventEmitter {
 
     ack.position.x = this.pos.x;
     ack.position.y = this.pos.y;
+    if (this.aoeSpoofEnabled) {
+      // Keep local prediction symmetric with the server claim: if the ack says
+      // we were outside the blast, do not charge HP or apply its condition here.
+      ack.position.x += AOE_SPOOF_OFFSET_TILES;
+      ack.position.y += AOE_SPOOF_OFFSET_TILES;
+      this.io.send(ack);
+      return;
+    }
     if ((this.player.condition & ConditionEffectBits.INVINCIBLE) !== 0) {
       this.io.send(ack);
       return;
@@ -3950,6 +4151,10 @@ export class Client extends EventEmitter {
   ): boolean {
     const player = this.player;
     if (!player) return false;
+    // ProdMafia's Partial Godmode fix makes one decision at the collision
+    // boundary. Returning true here tells CombatTracker to consume the shot
+    // without sending PLAYERHIT, before any predicted HP is charged.
+    if (source === 'projectile' && this.partialGodModeEnabled) return true;
     const condition = player.condition >>> 0;
     const condition2 = player.condition2 >>> 0;
     const damage = calculateAutoNexusDamage({
@@ -3974,6 +4179,9 @@ export class Client extends EventEmitter {
   ): boolean {
     const damage = Math.max(0, Math.trunc(Number(amount) || 0));
     if (damage <= 0) return false;
+    if (damage >= autoNexusCombatTrigger(this.player?.def ?? 0)) {
+      this.lastCombatDamageAt = this.time();
+    }
     if (source === 'projectile' && projectile) {
       this.predictedPlayerDamage.set(`${projectile.ownerId}:${projectile.bulletId}`, Date.now());
     }
@@ -3988,7 +4196,9 @@ export class Client extends EventEmitter {
       maxHp,
       ...projectile,
     });
-    return this.autoNexus.applyDamage(damage, source);
+    return source === 'server'
+      ? this.autoNexus.applyServerDamage(damage)
+      : this.autoNexus.applyDamage(damage, source);
   }
 
   /** Applies and acknowledges an authoritative server position correction. */
@@ -4338,6 +4548,20 @@ export function backoffDelay(attempt: number, baseMs: number, maxMs: number): nu
   // Full jitter: a random point in [base, exponential] keeps a sane floor while
   // de-synchronizing many clients reconnecting at once.
   return baseMs + Math.random() * Math.max(0, exponential - baseMs);
+}
+
+/** ProdMafia's defense-weighted threshold for entering the reduced-VIT combat state. */
+function autoNexusCombatTrigger(defense: number): number {
+  const normalizedDefense = Math.max(0, Math.trunc(Number(defense) || 0));
+  const blockWeights = [1, 0.75, 0.5, 0.25] as const;
+  const fullBlocks = Math.floor(normalizedDefense / 15);
+  let threshold = 0;
+  for (let block = 0; block < fullBlocks; block++) {
+    threshold += 15 * blockWeights[Math.min(block, 3)]!;
+  }
+  threshold += (normalizedDefense % 15)
+    * blockWeights[Math.min(Math.max(0, fullBlocks - 1), 3)]!;
+  return Math.trunc(threshold);
 }
 
 function boundedMovementGoal(

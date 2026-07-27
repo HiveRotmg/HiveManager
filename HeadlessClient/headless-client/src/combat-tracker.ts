@@ -34,6 +34,8 @@ export interface CombatProjectileDefinition {
   acceleration: number;
   accelerationDelay: number;
   speedClamp: number;
+  /** Fixed world-space beam length from `<Laser>`; absent/zero for ordinary shots. */
+  laserDistance?: number;
   armorPiercing?: boolean;
   /**
    * Turning model. Mirrors the client's ProjectileProperties turn fields.
@@ -99,6 +101,12 @@ export interface CombatWeaponPatternDefinition {
 
 export interface CombatWeaponSubattackDefinition {
   rateOfFire: number;
+  /** Projectile budget multiplier for one server-enforced burst. */
+  burstCount?: number;
+  /** Full burst cooldown at zero dexterity, in milliseconds. */
+  burstDelayMs?: number;
+  /** Burst cooldown at 75+ dexterity, in milliseconds. */
+  burstMinDelayMs?: number;
   isDummy: boolean;
   defaultAngleIncrease: number;
   minIncrAngleCounter: number;
@@ -124,6 +132,10 @@ export interface CombatObjectDefinition {
   arcGap?: number;
   /** Modern weapon fire definitions parsed from `<Subattack>`. */
   subattacks?: readonly CombatWeaponSubattackDefinition[];
+  /** Legacy root-level burst metadata for weapons without parsed subattacks. */
+  burstCount?: number;
+  burstDelayMs?: number;
+  burstMinDelayMs?: number;
   maxHp?: number;
   quest?: boolean;
   usable?: boolean;
@@ -135,6 +147,7 @@ export interface CombatObjectDefinition {
 /** Minimal game-data surface needed by combat simulation. */
 export interface CombatDataProvider {
   getObject(type: number): CombatObjectDefinition | undefined;
+  getEnchantment?(type: number): { rateOfFireMultiplier?: number } | undefined;
   getProjectile(objectType: number, projectileId: number): CombatProjectileDefinition | undefined;
   getTileDamage?(tileType: number): number | undefined;
   getTileSpeed?(tileType: number): number;

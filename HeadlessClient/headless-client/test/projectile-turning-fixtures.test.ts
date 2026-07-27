@@ -10,6 +10,7 @@ function base(): CombatProjectileDefinition {
     speed: 243, lifetimeMs: 250, multiHit: false, passesCover: false,
     amplitude: 0, frequency: 1, magnitude: 3, wavy: false, parametric: false,
     boomerang: false, acceleration: 0, accelerationDelay: 0, speedClamp: -1,
+    laserDistance: 0,
     turnRate: 0, turnRateDelay: 0, turnAcceleration: 0, turnAccelerationDelay: 0,
     turnClamp: 0, turnStopTime: 0, circleTurnAngle: 0, circleTurnDelay: 0,
     collisionMult: 1,
@@ -106,10 +107,11 @@ test('circle-turn resolves the sweep to turnRate when both are set', () => {
   // untested: with TurnRate set, the XML CircleTurnAngle is discarded.
   const both: CombatProjectileDefinition = { ...jailer, turnRate: 45 * DEG };
   const p = turningPositionAt(both, 0, 0, 0, 300);
-  // stopMs falls back to circleTurnDelay (200), so 100ms past the delay sweeps
-  // half of turnRate: 22.5 degrees, not the 45 that CircleTurnAngle would give.
+  // The combined TurnRate+CircleTurn branch uses absolute elapsed time (unlike
+  // CircleTurn-only, which subtracts the delay). At 300/200 of the 45-degree
+  // sweep this is 67.5 degrees, not the XML CircleTurnAngle.
   assert.ok(
-    Math.abs(Math.atan2(p.y, p.x) - 22.5 * DEG) < 1e-9,
+    Math.abs(Math.atan2(p.y, p.x) - 67.5 * DEG) < 1e-9,
     `expected the turnRate sweep, got ${Math.atan2(p.y, p.x) / DEG} degrees`,
   );
   assert.ok(

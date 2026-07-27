@@ -176,6 +176,101 @@ test('CommandSender previews the center fan projectile without consuming its bul
   assert.equal(sent[1]?.angle, 0);
 });
 
+test('CommandSender matches ProdMafia burst budget, cooldown, and per-projectile indices', () => {
+  const sent: PlayerShootPacket[] = [];
+  let time = 0;
+  let bullet = 0;
+  const bowPlayer = player([0x3d8d]);
+  bowPlayer.dex = 12;
+  const commands = new CommandSender(() => ({
+    io: { send: (packet: Packet) => {
+      if (packet instanceof PlayerShootPacket) sent.push(packet);
+    } },
+    time,
+    pos: { x: 1, y: 1 },
+    objectId: 77,
+    player: bowPlayer,
+    peekBulletId: () => bullet,
+    nextBulletId: () => bullet++,
+    weapon: () => ({
+      rateOfFire: 1.2,
+      numProjectiles: 5,
+      arcGap: 4,
+      subattacks: [{
+        rateOfFire: 1.2,
+        burstCount: 3,
+        burstDelayMs: 1_000,
+        burstMinDelayMs: 600,
+        isDummy: false,
+        defaultAngleIncrease: 0,
+        minIncrAngleCounter: 0,
+        maxIncrAngleCounter: 0,
+        patterns: [{
+          projectileId: 0,
+          patternIndex: -1,
+          numProjectiles: 5,
+          arcGap: 4,
+          defaultAngle: 0,
+          posOffsetX: 0,
+          posOffsetY: 0,
+        }],
+      }],
+    }),
+    ability: () => ({ usable: true, mpCost: 0, cooldownMs: 550, activateEffects: [] }),
+    trackShot: () => undefined,
+  }));
+
+  for (const shotTime of [0, 334, 668]) {
+    time = shotTime;
+    assert.equal(commands.shootAt({ x: 2, y: 1 }), true);
+  }
+  time = 900;
+  assert.equal(commands.shootAt({ x: 2, y: 1 }), false);
+  time = 1_002;
+  assert.equal(commands.shootAt({ x: 2, y: 1 }), true);
+
+  assert.equal(sent.length, 20);
+  assert.deepEqual(
+    sent.map((shot) => shot.burstIndex),
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0, 1, 2, 3, 4],
+  );
+  assert.deepEqual(
+    [...new Set(sent.map((shot) => shot.time))],
+    [0, 334, 668, 1_002],
+  );
+});
+
+test('CommandSender applies the weapon enchant multiplier to every fire gate', () => {
+  const sent: PlayerShootPacket[] = [];
+  let time = 0;
+  const commands = new CommandSender(() => ({
+    io: { send: (packet: Packet) => {
+      if (packet instanceof PlayerShootPacket) sent.push(packet);
+    } },
+    time,
+    pos: { x: 1, y: 1 },
+    objectId: 77,
+    player: player([100]),
+    peekBulletId: () => sent.length,
+    nextBulletId: () => sent.length,
+    weapon: () => ({
+      rateOfFire: 1,
+      rateOfFireMultiplier: 0.8,
+      numProjectiles: 1,
+      arcGap: 11.25,
+    }),
+    ability: () => ({ usable: true, mpCost: 0, cooldownMs: 550, activateEffects: [] }),
+    trackShot: () => undefined,
+  }));
+
+  assert.equal(commands.shootAt({ x: 2, y: 1 }), true);
+  time = 700;
+  assert.equal(commands.shootAt({ x: 2, y: 1 }), false);
+  time = 839;
+  assert.equal(commands.shootAt({ x: 2, y: 1 }), true);
+  assert.deepEqual(sent.map((shot) => shot.time), [0, 839]);
+});
+
 test('CommandSender does not shoot while petrified', () => {
   const sent: Packet[] = [];
   const petrified = player([100]);

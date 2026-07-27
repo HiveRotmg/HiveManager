@@ -43,13 +43,21 @@ export {
   testProxy,
 } from './proxy';
 export type { ProxyConfig, ProxyProtocol, ProxyTestResult } from './proxy';
-export { AutoNexusMonitor, calculateAutoNexusDamage, isAutoNexusSafeMap } from './auto-nexus';
+export {
+  AutoNexusMonitor,
+  calculateAutoNexusDamage,
+  isAutoNexusSafeMap,
+  predictAutoNexusRouteDamage,
+} from './auto-nexus';
 export type {
   AutoNexusConfig,
   AutoNexusDamageOptions,
+  AutoNexusRoutePrediction,
+  AutoNexusRoutePredictionOptions,
   AutoNexusState,
   AutoNexusTrigger,
   AutoNexusTriggerSource,
+  PredictiveAutoNexusOptions,
 } from './auto-nexus';
 export { CombatTracker, isNonlinearProjectile } from './combat-tracker';
 export type {

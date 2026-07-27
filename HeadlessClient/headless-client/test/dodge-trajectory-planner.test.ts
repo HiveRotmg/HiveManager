@@ -34,6 +34,7 @@ const PROJECTILE_DEFINITION: CombatProjectileDefinition = {
   acceleration: 0,
   accelerationDelay: 0,
   speedClamp: -1,
+  laserDistance: 0,
   turnRate: 0,
   turnRateDelay: 0,
   turnAcceleration: 0,

@@ -37,6 +37,13 @@ export interface CombatAutomationState {
     autoAbility: Required<AutoAbilityOptions>;
 }
 
+export interface CombatProtectionState {
+    partialGodModeEnabled: boolean;
+    aoeSpoofEnabled: boolean;
+    /** Distance added to both AOEACK coordinates while AoE spoof is enabled. */
+    aoeSpoofOffsetTiles: number;
+}
+
 export class Combat {
     static shootAt(x: number, y: number, weaponSlot = 0): boolean {
         throw new Error('Must be run inside Hive client');
@@ -119,6 +126,50 @@ export class Combat {
     }
 
     static isProjectileNoclipEnabled(): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /**
+     * Toggle Partial Godmode. When enabled, enemy projectile collisions are
+     * consumed before both local HP prediction and the PLAYERHIT acknowledgement.
+     */
+    static setPartialGodMode(enabled: boolean): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static enablePartialGodMode(): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static disablePartialGodMode(): void {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static isPartialGodModeEnabled(): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /**
+     * Toggle AoE spoof. When enabled, AOEACK is sent 500 tiles away on both
+     * axes and the corresponding local AoE damage/condition is not applied.
+     */
+    static setAoeSpoof(enabled: boolean): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static enableAoeSpoof(): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static disableAoeSpoof(): void {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static isAoeSpoofEnabled(): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static getProtectionState(): CombatProtectionState | null {
         throw new Error('Must be run inside Hive client');
     }
 

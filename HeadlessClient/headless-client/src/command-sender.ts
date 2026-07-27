@@ -17,10 +17,15 @@ export type { SlotRef } from './inventory';
 /** Weapon firing data used to pace and shape PLAYERSHOOT volleys. */
 export interface WeaponFireInfo {
   rateOfFire: number;
+  /** Folded equipped-weapon enchant multiplier. */
+  rateOfFireMultiplier?: number;
   numProjectiles: number;
   /** Arc gap between projectiles, in degrees. */
   arcGap: number;
   subattacks?: readonly WeaponSubattackInfo[];
+  burstCount?: number;
+  burstDelayMs?: number;
+  burstMinDelayMs?: number;
 }
 
 export interface WeaponFirePatternInfo {
@@ -35,6 +40,9 @@ export interface WeaponFirePatternInfo {
 
 export interface WeaponSubattackInfo {
   rateOfFire: number;
+  burstCount?: number;
+  burstDelayMs?: number;
+  burstMinDelayMs?: number;
   isDummy: boolean;
   defaultAngleIncrease: number;
   minIncrAngleCounter: number;
@@ -91,6 +99,7 @@ export class CommandSender {
   resetMap(): void {
     this.attackStart = -Infinity;
     this.subattackStates.clear();
+    this.activeBurstWeaponType = -1;
     this.nextAbilityAt = -Infinity;
   }
 
@@ -195,6 +204,7 @@ export class CommandSender {
     if (weaponType === -1) return null;
     const info = state.weapon(weaponType);
     const subattacks = normalizeSubattacks(info);
+    const enchantRate = validRate(info.rateOfFireMultiplier ?? 1);
     const fastestRate = subattacks.reduce(
       (fastest, subattack) => Math.max(fastest, validRate(subattack.rateOfFire)),
       validRate(info.rateOfFire),
@@ -202,11 +212,12 @@ export class CommandSender {
     if (state.time < this.attackStart) {
       this.attackStart = -Infinity;
       this.subattackStates.clear();
+      this.activeBurstWeaponType = -1;
     }
 
     const nextVolleyAt = Math.max(
       state.time,
-      this.attackStart + this.attackPeriod(state.player, fastestRate),
+      this.attackStart + this.attackPeriod(state.player, fastestRate, enchantRate),
     );
     const fireStates = this.fireStates(weaponType, subattacks.length);
     let bulletId = normalizeBulletId(state.peekBulletId());
@@ -217,8 +228,14 @@ export class CommandSender {
       const subattack = subattacks[attackIndex]!;
       const fireState = fireStates[attackIndex]!;
       const lastFire = state.time < fireState.lastFire ? -Infinity : fireState.lastFire;
-      const subattackPeriod = Math.max(0, this.attackPeriod(state.player, subattack.rateOfFire) - 2);
+      const subattackPeriod = this.attackPeriod(state.player, subattack.rateOfFire, enchantRate) + 5;
       if (nextVolleyAt < lastFire + subattackPeriod) continue;
+      if (positiveIntegerOrZero(subattack.burstCount) > 0
+        && this.activeBurstWeaponType === weaponType
+        && fireState.burstLeft <= 0
+        && nextVolleyAt <= fireState.burstTimestamp + this.burstDelay(state.player, subattack)) {
+        continue;
+      }
 
       const pattern = subattack.patterns[fireState.patternIndex % subattack.patterns.length]!;
       const count = positiveInteger(pattern.numProjectiles, 1);
@@ -264,6 +281,7 @@ export class CommandSender {
     }
     const info = state.weapon(weaponType);
     const subattacks = normalizeSubattacks(info);
+    const enchantRate = validRate(info.rateOfFireMultiplier ?? 1);
     const fastestRate = subattacks.reduce(
       (fastest, subattack) => Math.max(fastest, validRate(subattack.rateOfFire)),
       validRate(info.rateOfFire),
@@ -272,8 +290,9 @@ export class CommandSender {
       // The client clock restarted (reconnect); drop the stale cooldown.
       this.attackStart = -Infinity;
       this.subattackStates.clear();
+      this.activeBurstWeaponType = -1;
     }
-    if (state.time < this.attackStart + this.attackPeriod(state.player, fastestRate)) {
+    if (state.time < this.attackStart + this.attackPeriod(state.player, fastestRate, enchantRate)) {
       return false;
     }
     this.attackStart = state.time;
@@ -288,58 +307,124 @@ export class CommandSender {
       const fireState = fireStates[attackIndex]!;
       if (state.time < fireState.lastFire) {
         fireState.lastFire = -Infinity;
+        fireState.burstLeft = 0;
+        fireState.burstIndex = 0;
+        fireState.burstTimestamp = -Infinity;
+        fireState.burstEnd = -Infinity;
       }
-      const subattackPeriod = Math.max(0, this.attackPeriod(state.player, subattack.rateOfFire) - 2);
-      if (state.time < fireState.lastFire + subattackPeriod) {
+
+      const burstCount = positiveIntegerOrZero(subattack.burstCount);
+      if (burstCount > 0) {
+        const burstDelay = this.burstDelay(state.player, subattack);
+        if (state.time <= fireState.burstEnd && this.activeBurstWeaponType === weaponType) {
+          if (fireState.burstLeft > 0 && fireState.burstIndex > 0) {
+            sent = this.sendSubattackVolley(
+              state, weaponType, attackIndex, subattack, fireState, aimAngle, enchantRate, true,
+            ) || sent;
+          }
+          continue;
+        }
+
+        this.activeBurstWeaponType = weaponType;
+        if (state.time <= fireState.burstTimestamp + burstDelay) {
+          fireState.burstEnd = fireState.burstTimestamp + burstDelay;
+          continue;
+        }
+
+        const pattern = subattack.patterns[fireState.patternIndex % subattack.patterns.length]!;
+        fireState.burstIndex = 0;
+        fireState.burstLeft = burstCount * positiveInteger(pattern.numProjectiles, 1);
+        const fired = this.sendSubattackVolley(
+          state, weaponType, attackIndex, subattack, fireState, aimAngle, enchantRate, true,
+        );
+        if (fired) {
+          fireState.burstTimestamp = state.time;
+          fireState.burstEnd = state.time + burstDelay;
+          sent = true;
+        }
         continue;
       }
-      fireState.lastFire = state.time;
-
-      const pattern = subattack.patterns[fireState.patternIndex % subattack.patterns.length]!;
-      fireState.patternIndex = (fireState.patternIndex + 1) % subattack.patterns.length;
-      const count = positiveInteger(pattern.numProjectiles, 1);
-      const arcGap = finiteNumber(pattern.arcGap, 11.25) * Math.PI / 180;
-      const defaultAngle = finiteNumber(pattern.defaultAngle, 0) * Math.PI / 180;
-      const offsetX = finiteNumber(pattern.posOffsetX, 0);
-      const spawnDistance = SHOT_SPAWN_OFFSET + finiteNumber(pattern.posOffsetY, 0);
-      const cos = Math.cos(aimAngle);
-      const sin = Math.sin(aimAngle);
-      const spawnX = state.pos.x + spawnDistance * cos - offsetX * sin;
-      const spawnY = state.pos.y + spawnDistance * sin + offsetX * cos;
-      let angleIncrease = 0;
-      const angleIncrement = finiteNumber(subattack.defaultAngleIncrease, 0);
-      if (angleIncrement !== 0) {
-        angleIncrease = angleIncrement * Math.PI / 180 * fireState.incrCounter;
-        fireState.incrCounter += fireState.incrDirection;
-        const minCounter = Math.trunc(finiteNumber(subattack.minIncrAngleCounter, 0));
-        const maxCounter = Math.trunc(finiteNumber(subattack.maxIncrAngleCounter, 0));
-        if (fireState.incrCounter > maxCounter || fireState.incrCounter < minCounter) {
-          fireState.incrDirection *= -1;
-        }
-      }
-      let angle = aimAngle - arcGap * (count - 1) / 2 + defaultAngle + angleIncrease;
-
-      for (let projectileIndex = 0; projectileIndex < count; projectileIndex++) {
-        const shot = new PlayerShootPacket();
-        shot.time = state.time;
-        shot.bulletId = state.nextBulletId();
-        shot.containerType = weaponType;
-        shot.attackIndex = subattack.isDummy ? -1 : attackIndex;
-        shot.startingPos.x = spawnX;
-        shot.startingPos.y = spawnY;
-        shot.angle = angle;
-        shot.attackType = 0;
-        shot.patternIndex = pattern.patternIndex;
-        shot.burstIndex = 0;
-        shot.playerPos.x = state.pos.x;
-        shot.playerPos.y = state.pos.y;
-        state.io.send(shot);
-        state.trackShot(shot, pattern.projectileId);
-        angle += arcGap;
-        sent = true;
-      }
+      sent = this.sendSubattackVolley(
+        state, weaponType, attackIndex, subattack, fireState, aimAngle, enchantRate, false,
+      ) || sent;
     }
     return sent;
+  }
+
+  private sendSubattackVolley(
+    state: CommandState,
+    weaponType: number,
+    attackIndex: number,
+    subattack: WeaponSubattackInfo,
+    fireState: SubattackFireState,
+    aimAngle: number,
+    enchantRate: number,
+    allowBurst: boolean,
+  ): boolean {
+    const cooldown = this.attackPeriod(state.player!, subattack.rateOfFire, enchantRate) + 5;
+    if (state.time < fireState.lastFire + cooldown) return false;
+    fireState.lastFire = state.time;
+
+    const pattern = subattack.patterns[fireState.patternIndex % subattack.patterns.length]!;
+    fireState.patternIndex = (fireState.patternIndex + 1) % subattack.patterns.length;
+    const count = positiveInteger(pattern.numProjectiles, 1);
+    const arcGap = finiteNumber(pattern.arcGap, 11.25) * Math.PI / 180;
+    const defaultAngle = finiteNumber(pattern.defaultAngle, 0) * Math.PI / 180;
+    const offsetX = finiteNumber(pattern.posOffsetX, 0);
+    const spawnDistance = SHOT_SPAWN_OFFSET + finiteNumber(pattern.posOffsetY, 0);
+    const cos = Math.cos(aimAngle);
+    const sin = Math.sin(aimAngle);
+    const spawnX = state.pos.x + spawnDistance * cos - offsetX * sin;
+    const spawnY = state.pos.y + spawnDistance * sin + offsetX * cos;
+    let angleIncrease = 0;
+    const angleIncrement = finiteNumber(subattack.defaultAngleIncrease, 0);
+    if (angleIncrement !== 0) {
+      angleIncrease = angleIncrement * Math.PI / 180 * fireState.incrCounter;
+      fireState.incrCounter += fireState.incrDirection;
+      const minCounter = Math.trunc(finiteNumber(subattack.minIncrAngleCounter, 0));
+      const maxCounter = Math.trunc(finiteNumber(subattack.maxIncrAngleCounter, 0));
+      if (fireState.incrCounter > maxCounter || fireState.incrCounter < minCounter) {
+        fireState.incrDirection *= -1;
+      }
+    }
+    let angle = aimAngle - arcGap * (count - 1) / 2 + defaultAngle + angleIncrease;
+
+    for (let projectileIndex = 0; projectileIndex < count; projectileIndex++) {
+      const shot = new PlayerShootPacket();
+      shot.time = state.time;
+      shot.bulletId = state.nextBulletId();
+      shot.containerType = weaponType;
+      shot.attackIndex = subattack.isDummy ? -1 : attackIndex;
+      shot.startingPos.x = spawnX;
+      shot.startingPos.y = spawnY;
+      shot.angle = angle;
+      shot.burstIndex = allowBurst ? fireState.burstIndex : 0;
+      shot.patternIndex = pattern.patternIndex;
+      shot.attackType = 0;
+      shot.playerPos.x = state.pos.x;
+      shot.playerPos.y = state.pos.y;
+      state.io!.send(shot);
+      state.trackShot(shot, pattern.projectileId);
+      if (allowBurst) {
+        fireState.burstIndex++;
+        fireState.burstLeft--;
+      }
+      angle += arcGap;
+    }
+    return true;
+  }
+
+  private burstDelay(player: PlayerData, subattack: WeaponSubattackInfo): number {
+    const fullDelay = Math.max(0, finiteNumber(subattack.burstDelayMs ?? 0, 0));
+    if (fullDelay <= 0) return 0;
+    let minimumDelay = Math.max(
+      0,
+      finiteNumber(subattack.burstMinDelayMs ?? fullDelay, fullDelay),
+    );
+    if ((player.condition & ConditionEffectBits.BERSERK) !== 0) minimumDelay *= 0.75;
+    const dex = Math.max(0, finiteNumber(player.dex ?? 0, 0));
+    const dexRatio = Math.min(1, dex / 75);
+    return fullDelay - dexRatio * (fullDelay - minimumDelay);
   }
 
   /** Sends USEITEM for the equipped ability slot after client-side safety checks. */
@@ -375,6 +460,7 @@ export class CommandSender {
   /** Client time of the last accepted shot; paces PLAYERSHOOT volleys. */
   private attackStart = -Infinity;
   private readonly subattackStates = new Map<number, SubattackFireState[]>();
+  private activeBurstWeaponType = -1;
   private nextAbilityAt = -Infinity;
 
   private fireStates(weaponType: number, count: number): SubattackFireState[] {
@@ -385,6 +471,10 @@ export class CommandSender {
         patternIndex: 0,
         incrCounter: 0,
         incrDirection: 1,
+        burstLeft: 0,
+        burstIndex: 0,
+        burstTimestamp: -Infinity,
+        burstEnd: -Infinity,
       }));
       this.subattackStates.set(weaponType, states);
     }
@@ -396,7 +486,7 @@ export class CommandSender {
    * `1 / attackFrequency(dex) / RateOfFire`. Firing faster than this is a
    * shot-flood protocol violation the server kicks for (FAILURE errorId=0).
    */
-  private attackPeriod(player: PlayerData, rateOfFire: number): number {
+  private attackPeriod(player: PlayerData, rateOfFire: number, enchantRate = 1): number {
     const dazed = (player.condition & ConditionEffectBits.DAZED) !== 0;
     const rawDex = player.dex ?? 0;
     const dex = dazed || !Number.isFinite(rawDex) ? 0 : Math.max(0, rawDex);
@@ -404,7 +494,7 @@ export class CommandSender {
     if (!dazed && (player.condition & ConditionEffectBits.BERSERK) !== 0) {
       frequency *= 1.25;
     }
-    return 1 / frequency / validRate(rateOfFire);
+    return 1 / frequency / (validRate(rateOfFire) * validRate(enchantRate));
   }
 }
 
@@ -413,6 +503,10 @@ interface SubattackFireState {
   patternIndex: number;
   incrCounter: number;
   incrDirection: number;
+  burstLeft: number;
+  burstIndex: number;
+  burstTimestamp: number;
+  burstEnd: number;
 }
 
 function normalizeSubattacks(info: WeaponFireInfo): readonly WeaponSubattackInfo[] {
@@ -422,6 +516,9 @@ function normalizeSubattacks(info: WeaponFireInfo): readonly WeaponSubattackInfo
   }
   return [{
     rateOfFire: validRate(info.rateOfFire),
+    burstCount: info.burstCount,
+    burstDelayMs: info.burstDelayMs,
+    burstMinDelayMs: info.burstMinDelayMs,
     isDummy: true,
     defaultAngleIncrease: 0,
     minIncrAngleCounter: 0,
@@ -444,6 +541,12 @@ function finiteNumber(value: number, fallback: number): number {
 
 function positiveInteger(value: number, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.max(1, Math.trunc(value)) : fallback;
+}
+
+function positiveIntegerOrZero(value: number | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.max(1, Math.trunc(value))
+    : 0;
 }
 
 function validRate(value: number): number {

@@ -46,6 +46,7 @@ const projectile: CombatProjectileDefinition = {
   circleTurnAngle: 0,
   circleTurnDelay: 0,
   collisionMult: 1,
+  laserDistance: 0,
 };
 
 test('isNonlinearProjectile flags each of the five nonlinear-motion attributes', () => {
@@ -342,14 +343,14 @@ test('multi-hit projectiles keep accuracy within a 0-1 fraction', () => {
   assert.equal(tracker.accuracy(), 1);
 });
 
-test('predictProjectilePosition advances unclamped-accelerated projectiles across mid-flight samples', () => {
+test('predictProjectilePosition advances accelerated projectiles up to their authored clamp', () => {
   const accelDef: CombatProjectileDefinition = {
     ...projectile,
     speed: 100,
     lifetimeMs: 2000,
     acceleration: 200,
     accelerationDelay: 0,
-    speedClamp: -1,
+    speedClamp: 300,
   };
   const shot: CombatProjectileSnapshot = {
     side: 'enemy', bulletId: 42, bulletType: 0, ownerId: 20, containerType: 100,
@@ -384,14 +385,14 @@ test('predictProjectilePosition respects speedClamp for clamped-accelerated proj
     `expected x approx 17.5 at t=1000 (500 ms accel to clamp + 500 ms cruise at clamped speed), got ${p1000.x}`);
 });
 
-test('predictProjectilePosition treats pre-delay time as pure linear motion, then accelerates', () => {
+test('predictProjectilePosition treats pre-delay time as pure linear motion, then accelerates toward its clamp', () => {
   const delayedDef: CombatProjectileDefinition = {
     ...projectile,
     speed: 100,
     lifetimeMs: 2000,
     acceleration: 200,
     accelerationDelay: 400,
-    speedClamp: -1,
+    speedClamp: 300,
   };
   const shot: CombatProjectileSnapshot = {
     side: 'enemy', bulletId: 44, bulletType: 0, ownerId: 20, containerType: 100,

@@ -404,6 +404,22 @@ describe('current-build packets reconciled from captured bytes', () => {
     expect(out.burstIndex).to.equal(0);
   });
 
+  it('PlayerShootPacket writes burst, pattern, attack trailing-byte order', () => {
+    const p = new PlayerShootPacket();
+    p.burstIndex = 14;
+    p.patternIndex = -2;
+    p.attackType = 1;
+    const writer = new Writer();
+    p.write(writer);
+    expect(writer.buffer.subarray(21, 24).toString('hex')).to.equal('0efe01');
+
+    const out = roundTrip(p, new PlayerShootPacket());
+    expect(out.burstIndex).to.equal(14);
+    expect(out.patternIndex).to.equal(-2);
+    expect(out.attackType).to.equal(1);
+    expect(out.unknownShort).to.equal(0x0efe);
+  });
+
   it('FavourPetPacket reads the leading byte then a signed pet id', () => {
     const reader = hexReader('00ffffffff');
     const p = new FavourPetPacket();

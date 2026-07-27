@@ -100,25 +100,21 @@ export function projectileDistanceAt(
   const scaledSpeed = definition.speed * validMultiplier(speedMultiplier);
   const baseSpeed = scaledSpeed / 10_000;
 
-  let distance: number;
-  if (definition.acceleration === 0 || elapsed < definition.accelerationDelay) {
-    distance = elapsed * baseSpeed;
-  } else {
-    const accelerationElapsed = elapsed - definition.accelerationDelay;
-    let accelerationTime = accelerationElapsed;
-    let clampedTime = 0;
-    let clampedSpeed = 0;
-    if (definition.speedClamp !== -1) {
-      clampedSpeed = definition.speedClamp / 10_000;
-      const speedNeeded = Math.abs(definition.speedClamp - scaledSpeed);
-      const timeToClamp = speedNeeded / Math.abs(definition.acceleration) * 1000;
-      accelerationTime = Math.min(accelerationElapsed, timeToClamp);
-      clampedTime = Math.max(0, accelerationElapsed - accelerationTime);
+  let distance = elapsed * baseSpeed;
+  if (definition.acceleration !== 0 && elapsed > definition.accelerationDelay) {
+    const accelerationTime = elapsed - definition.accelerationDelay;
+    const accelerationPerMs = definition.acceleration / 10_000_000;
+    const clampSpeed = Math.max(0, definition.speedClamp) / 10_000;
+    const speedDifference = definition.acceleration > 0
+      ? Math.max(clampSpeed, baseSpeed) - baseSpeed
+      : Math.min(clampSpeed, baseSpeed) - baseSpeed;
+    const timeToClamp = speedDifference / accelerationPerMs;
+    if (accelerationTime <= timeToClamp) {
+      distance += 0.5 * accelerationPerMs * accelerationTime * accelerationTime;
+    } else {
+      distance += 0.5 * accelerationPerMs * timeToClamp * timeToClamp
+        + speedDifference * (accelerationTime - timeToClamp);
     }
-    distance = definition.accelerationDelay * baseSpeed
-      + accelerationTime * baseSpeed
-      + (accelerationTime * accelerationTime / 1000) * 0.5 * (definition.acceleration / 10_000)
-      + clampedTime * clampedSpeed;
   }
 
   if (applyBoomerang && definition.boomerang) {
@@ -200,7 +196,8 @@ export const BASE_COLLISION_HALF_SIZE = 0.5;
 
 /**
  * Collision half-extent for a projectile. The client scales its square
- * half-extent by CollisionMult; a missing or zero multiplier means 1.
+ * half-extent by CollisionMult; a missing/invalid multiplier is normalized by
+ * the data loader, while an explicitly authored zero remains zero.
  *
  * The planner and CombatTracker must both use this — if they disagree the
  * planner dodges a differently-sized bullet than the one that actually hits.
@@ -222,7 +219,9 @@ export const BASE_COLLISION_HALF_SIZE = 0.5;
 export function projectileCollisionHalfSize(
   definition: CombatProjectileDefinition,
 ): number {
-  const mult = definition.collisionMult > 0 ? definition.collisionMult : 1;
+  const mult = Number.isFinite(definition.collisionMult) && definition.collisionMult >= 0
+    ? definition.collisionMult
+    : 1;
   return BASE_COLLISION_HALF_SIZE * mult;
 }
 
@@ -250,22 +249,18 @@ export function turningPositionAt(
 ): { x: number; y: number } {
   const distance = projectileDistanceAt(definition, elapsedMs, options);
 
-  // Circle-turn: after the delay, travelled distance FREEZES and the projectile
-  // orbits on a fixed-length arm. It stops advancing outward entirely, which is
-  // why treating it as straight-line travel is maximally wrong.
-  if (definition.circleTurnDelay !== 0) {
+  // CircleTurn without TurnRate uses (elapsed - delay). When both are present,
+  // ProdMafia enters the TurnRate branch instead and uses absolute elapsed.
+  if (definition.turnRate === 0 && definition.circleTurnDelay !== 0) {
     if (elapsedMs < definition.circleTurnDelay) {
       out.x = startX + Math.cos(launchAngle) * distance;
       out.y = startY + Math.sin(launchAngle) * distance;
       return out;
     }
     const frozen = projectileDistanceAt(definition, definition.circleTurnDelay, options);
-    // When TurnRate is also set, the client resolves the circle sweep to
-    // turnRate and discards the XML CircleTurnAngle.
-    const sweep = definition.turnRate !== 0 ? definition.turnRate : definition.circleTurnAngle;
     const stopMs = effectiveTurnStopTime(definition);
     const offset = stopMs > 0
-      ? (sweep / stopMs) * (elapsedMs - definition.circleTurnDelay)
+      ? (definition.circleTurnAngle / stopMs) * (elapsedMs - definition.circleTurnDelay)
       : 0;
     out.x = startX + Math.cos(launchAngle + offset) * frozen;
     out.y = startY + Math.sin(launchAngle + offset) * frozen;
@@ -279,7 +274,17 @@ export function turningPositionAt(
   }
 
   const stopMs = effectiveTurnStopTime(definition);
-  if (elapsedMs >= stopMs && stopMs > 0) {
+  if (definition.circleTurnDelay !== 0 && elapsedMs >= definition.circleTurnDelay) {
+    const frozen = projectileDistanceAt(definition, definition.circleTurnDelay, options);
+    const offset = stopMs > 0 ? (definition.turnRate / stopMs) * elapsedMs : 0;
+    out.x = startX + Math.cos(launchAngle + offset) * frozen;
+    out.y = startY + Math.sin(launchAngle + offset) * frozen;
+    return out;
+  }
+  const phaseLifetime = definition.circleTurnDelay !== 0
+    ? definition.circleTurnDelay
+    : (definition.trajectoryLifetimeMs ?? definition.lifetimeMs);
+  if (elapsedMs >= stopMs && stopMs > 0 && stopMs !== phaseLifetime) {
     const stopDistance = projectileDistanceAt(definition, stopMs, options);
     const stopAngle = launchAngle + turnAngleAt(definition, stopMs, true);
     const stopX = startX + Math.cos(stopAngle) * stopDistance;

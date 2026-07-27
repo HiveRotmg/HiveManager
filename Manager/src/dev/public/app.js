@@ -10619,35 +10619,80 @@
     return viewerGameClock ? viewerGameClock.gameTime + Math.max(0, now - viewerGameClock.receivedAt) : 0;
   }
 
-  function viewerProjectilePosition(projectile, gameTime) {
-    var elapsed = gameTime - Number(projectile.startTime);
+  function viewerProjectileDistance(projectile, elapsed) {
     var lifetime = Math.max(1, Number(projectile.lifetimeMs) || 1);
-    var trajectoryLifetime = Math.max(1, Number(projectile.trajectoryLifetimeMs) || lifetime);
     var speed = Number(projectile.speed) || 0;
     var baseSpeed = speed / 10000;
     var acceleration = Number(projectile.acceleration) || 0;
     var accelerationDelay = Number(projectile.accelerationDelay) || 0;
-    var speedClamp = Number.isFinite(Number(projectile.speedClamp)) ? Number(projectile.speedClamp) : -1;
-    var distance;
-    if (acceleration === 0 || elapsed < accelerationDelay) {
-      distance = elapsed * baseSpeed;
-    } else {
+    var speedClamp = Math.max(0, Number(projectile.speedClamp) || 0);
+    var distance = elapsed * baseSpeed;
+    if (acceleration !== 0 && elapsed > accelerationDelay) {
       var accelerationElapsed = elapsed - accelerationDelay;
-      var accelerationTime = lifetime - accelerationDelay;
-      var clampedTime = 0;
-      var clampedSpeed = 0;
-      if (speedClamp !== -1) {
-        clampedSpeed = speedClamp / 10000;
-        var speedNeeded = Math.abs(speedClamp - speed);
-        var timeToClamp = speedNeeded / Math.abs(acceleration) * 1000;
-        accelerationTime = Math.min(accelerationElapsed, timeToClamp);
-        clampedTime = Math.max(0, accelerationElapsed - accelerationTime);
+      var accelerationPerMs = acceleration / 10000000;
+      var clampSpeed = speedClamp / 10000;
+      var speedDifference = acceleration > 0
+        ? Math.max(clampSpeed, baseSpeed) - baseSpeed
+        : Math.min(clampSpeed, baseSpeed) - baseSpeed;
+      var timeToClamp = speedDifference / accelerationPerMs;
+      if (accelerationElapsed <= timeToClamp) {
+        distance += 0.5 * accelerationPerMs * accelerationElapsed * accelerationElapsed;
+      } else {
+        distance += 0.5 * accelerationPerMs * timeToClamp * timeToClamp
+          + speedDifference * (accelerationElapsed - timeToClamp);
       }
-      distance = accelerationDelay * baseSpeed
-        + accelerationTime * baseSpeed
-        + (accelerationTime * accelerationTime / 1000) * 0.5 * (acceleration / 10000)
-        + clampedTime * clampedSpeed;
     }
+    return distance;
+  }
+
+  function viewerProjectileTurnStopTime(projectile) {
+    var authored = Number(projectile.turnStopTime) || 0;
+    if (authored !== 0) return authored;
+    var circleDelay = Number(projectile.circleTurnDelay) || 0;
+    return circleDelay !== 0
+      ? circleDelay
+      : Math.max(1, Number(projectile.trajectoryLifetimeMs) || Number(projectile.lifetimeMs) || 1);
+  }
+
+  function viewerProjectileTurnAcceleration(projectile, angle, elapsedSeconds) {
+    var acceleration = Number(projectile.turnAcceleration) || 0;
+    var delay = Number(projectile.turnAccelerationDelay) || 0;
+    if (acceleration === 0 || elapsedSeconds < delay) return angle;
+    var timeDifference = elapsedSeconds - delay;
+    var turnRate = Number(projectile.turnRate) || 0;
+    var turnClamp = Number(projectile.turnClamp) || 0;
+    var clampSpan = acceleration > 0
+      ? Math.max(turnClamp, turnRate) - turnRate
+      : Math.min(turnClamp, turnRate) - turnRate;
+    if (clampSpan === 0) return angle;
+    var timeToClamp = clampSpan / acceleration;
+    if (timeDifference <= timeToClamp) {
+      return angle + acceleration * timeDifference * timeDifference * 0.5;
+    }
+    return angle
+      + acceleration * timeToClamp * timeToClamp * 0.5
+      + (timeDifference - timeToClamp) * clampSpan;
+  }
+
+  function viewerProjectileTurnAngle(projectile, elapsed, ignoreStop) {
+    var turnRate = Number(projectile.turnRate) || 0;
+    if (turnRate === 0) return 0;
+    var stopTime = viewerProjectileTurnStopTime(projectile);
+    if (stopTime <= 0 || (!ignoreStop && elapsed > stopTime)) return 0;
+    var elapsedSeconds = elapsed / 1000;
+    var delaySeconds = Number(projectile.turnRateDelay) || 0;
+    if (delaySeconds !== 0 && elapsedSeconds < delaySeconds) return 0;
+    var angle = delaySeconds !== 0
+      ? (elapsed - delaySeconds * 1000) * (turnRate / stopTime)
+      : elapsed * (turnRate / stopTime);
+    return viewerProjectileTurnAcceleration(projectile, angle, elapsedSeconds);
+  }
+
+  function viewerProjectilePosition(projectile, gameTime) {
+    var elapsed = gameTime - Number(projectile.startTime);
+    var lifetime = Math.max(1, Number(projectile.lifetimeMs) || 1);
+    var trajectoryLifetime = Math.max(1, Number(projectile.trajectoryLifetimeMs) || lifetime);
+    var distance = viewerProjectileDistance(projectile, elapsed);
     var angle = Number(projectile.angle) || 0;
     var phase = Number(projectile.bulletId) % 2 === 0 ? 0 : Math.PI;
     var x = Number(projectile.startX) || 0;
@@ -10663,9 +10708,50 @@
       var magnitude = Number(projectile.magnitude) || 0;
       x += (localX * Math.cos(angle) - localY * Math.sin(angle)) * magnitude;
       y += (localX * Math.sin(angle) + localY * Math.cos(angle)) * magnitude;
+    } else if (Number(projectile.turnRate)) {
+      var stopTime = viewerProjectileTurnStopTime(projectile);
+      var circleDelay = Number(projectile.circleTurnDelay) || 0;
+      if (circleDelay !== 0 && elapsed >= circleDelay) {
+        var circleDistance = viewerProjectileDistance(projectile, circleDelay);
+        var circleOffset = stopTime > 0 ? Number(projectile.turnRate) / stopTime * elapsed : 0;
+        x += Math.cos(angle + circleOffset) * circleDistance;
+        y += Math.sin(angle + circleOffset) * circleDistance;
+      } else if (elapsed >= stopTime && stopTime > 0 && stopTime !== (circleDelay || trajectoryLifetime)) {
+        var stopDistance = viewerProjectileDistance(projectile, stopTime);
+        var stopAngle = angle + viewerProjectileTurnAngle(projectile, stopTime, true);
+        var stopX = x + Math.cos(stopAngle) * stopDistance;
+        var stopY = y + Math.sin(stopAngle) * stopDistance;
+        var aheadDistance = viewerProjectileDistance(projectile, stopTime + 16);
+        var aheadAngle = angle + viewerProjectileTurnAngle(projectile, stopTime + 16, true);
+        var heading = Math.atan2(
+          y + Math.sin(aheadAngle) * aheadDistance - stopY,
+          x + Math.cos(aheadAngle) * aheadDistance - stopX
+        );
+        var remaining = distance - stopDistance;
+        x = stopX + Math.cos(heading) * remaining;
+        y = stopY + Math.sin(heading) * remaining;
+      } else {
+        var turnAngle = viewerProjectileTurnAngle(projectile, elapsed, false);
+        x += Math.cos(angle + turnAngle) * distance;
+        y += Math.sin(angle + turnAngle) * distance;
+      }
+    } else if (Number(projectile.circleTurnDelay)) {
+      var onlyCircleDelay = Number(projectile.circleTurnDelay);
+      if (elapsed >= onlyCircleDelay) {
+        var frozenDistance = viewerProjectileDistance(projectile, onlyCircleDelay);
+        var onlyCircleStop = viewerProjectileTurnStopTime(projectile);
+        var onlyCircleOffset = onlyCircleStop > 0
+          ? Number(projectile.circleTurnAngle || 0) / onlyCircleStop * (elapsed - onlyCircleDelay)
+          : 0;
+        x += Math.cos(angle + onlyCircleOffset) * frozenDistance;
+        y += Math.sin(angle + onlyCircleOffset) * frozenDistance;
+      } else {
+        x += distance * Math.cos(angle);
+        y += distance * Math.sin(angle);
+      }
     } else {
       if (projectile.boomerang) {
-        var halfway = trajectoryLifetime * baseSpeed * 0.5;
+        var halfway = trajectoryLifetime * (Number(projectile.speed) || 0) / 10000 * 0.5;
         if (distance > halfway) distance = halfway - (distance - halfway);
       }
       x += distance * Math.cos(angle);
@@ -10849,6 +10935,33 @@
   function drawViewerProjectile(ctx, projectile, gameTime, centerX, centerY, screenCenterX, screenCenterY, tileSize, width, height) {
     var elapsed = gameTime - Number(projectile.startTime);
     if (elapsed < 0 || elapsed > Number(projectile.lifetimeMs)) return false;
+    var laserDistance = Number(projectile.laserDistance) || 0;
+    if (laserDistance > 0) {
+      var laserStartX = screenCenterX + (Number(projectile.startX) - centerX) * tileSize;
+      var laserStartY = screenCenterY + (Number(projectile.startY) - centerY) * tileSize;
+      var laserAngle = Number(projectile.angle) || 0;
+      var laserEndX = laserStartX + Math.cos(laserAngle) * laserDistance * tileSize;
+      var laserEndY = laserStartY + Math.sin(laserAngle) * laserDistance * tileSize;
+      var packedGlow = Number(projectile.glowColor);
+      packedGlow = Number.isFinite(packedGlow) ? packedGlow >>> 0 & 0xffffff : 0xffffff;
+      var laserColor = 'rgb(' + (packedGlow >>> 16 & 0xff) + ',' +
+        (packedGlow >>> 8 & 0xff) + ',' + (packedGlow & 0xff) + ')';
+      var laserSize = Number(projectile.size);
+      if (!Number.isFinite(laserSize) || laserSize <= 0) laserSize = 100;
+      ctx.save();
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = laserColor;
+      ctx.shadowColor = laserColor;
+      ctx.shadowBlur = Math.max(4, tileSize * 0.35);
+      ctx.globalAlpha = 0.86;
+      ctx.lineWidth = Math.max(2, tileSize * 0.07 * laserSize / 100);
+      ctx.beginPath();
+      ctx.moveTo(laserStartX, laserStartY);
+      ctx.lineTo(laserEndX, laserEndY);
+      ctx.stroke();
+      ctx.restore();
+      return true;
+    }
     var position = viewerProjectilePosition(projectile, gameTime);
     var x = screenCenterX + (position.x - centerX) * tileSize;
     var y = screenCenterY + (position.y - centerY) * tileSize;

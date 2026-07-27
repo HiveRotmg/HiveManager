@@ -34,12 +34,12 @@ export class PlayerShootPacket implements Packet {
      * The angle at which the projectile was fired.
      */
     angle: number;
-    /** Attack kind used by the current weapon metadata. */
-    attackType: number;
-    /** Projectile-pattern index, or -1 for a basic weapon shot. */
-    patternIndex: number;
     /** Index within a burst sequence. */
     burstIndex: number;
+    /** Projectile-pattern index, or -1 for a basic weapon shot. */
+    patternIndex: number;
+    /** Attack kind used by the current weapon metadata. */
+    attackType: number;
     /**
      * The Player Position 
      */
@@ -67,9 +67,12 @@ export class PlayerShootPacket implements Packet {
         writer.writeByte(this.attackIndex);
         this.startingPos.write(writer);
         writer.writeFloat(this.angle);
-        writer.writeByte(this.attackType);
-        writer.writeByte(this.patternIndex);
+        // Confirmed by the 2026-07-27 Exalt capture: burst, pattern, attack.
+        // The previous attack, pattern, burst order turns burst indices 1..N
+        // into invalid attack types and the server disconnects the client.
         writer.writeByte(this.burstIndex);
+        writer.writeByte(this.patternIndex);
+        writer.writeByte(this.attackType);
         this.playerPos.write(writer);
     }
 
@@ -80,9 +83,9 @@ export class PlayerShootPacket implements Packet {
         this.attackIndex = reader.readByte();
         this.startingPos.read(reader);
         this.angle = reader.readFloat();
-        this.attackType = reader.readByte();
-        this.patternIndex = reader.readByte();
         this.burstIndex = reader.readByte();
+        this.patternIndex = reader.readByte();
+        this.attackType = reader.readByte();
         this.playerPos.read(reader);
     }
 
@@ -94,12 +97,12 @@ export class PlayerShootPacket implements Packet {
     get isBurst(): boolean { return this.attackType !== 0; }
     set isBurst(value: boolean) { this.attackType = value ? 1 : 0; }
 
-    /** @deprecated Use {@link patternIndex} and {@link burstIndex}. */
+    /** @deprecated Use {@link burstIndex} and {@link patternIndex}. */
     get unknownShort(): number {
-        return ((this.patternIndex & 0xff) << 8) | (this.burstIndex & 0xff);
+        return ((this.burstIndex & 0xff) << 8) | (this.patternIndex & 0xff);
     }
     set unknownShort(value: number) {
-        this.patternIndex = (value << 16) >> 24;
-        this.burstIndex = value & 0xff;
+        this.burstIndex = (value >>> 8) & 0xff;
+        this.patternIndex = (value << 24) >> 24;
     }
 }

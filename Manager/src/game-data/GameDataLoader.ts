@@ -11,6 +11,8 @@ export interface ProjectileDef {
   visualSize: number;
   faceDir: boolean;
   noRotation: boolean;
+  minDamage: number;
+  maxDamage: number;
   damage: number;
   speed: number;
   lifetimeMs: number;
@@ -19,8 +21,17 @@ export interface ProjectileDef {
   armorPiercing: boolean;
   multiHit: boolean;
   passesCover: boolean;
+  protectFromSink: boolean;
   maxHealthDamage: number;
-  conditionEffects: { effect: string; durationSec: number }[];
+  conditionEffects: { effect: string; durationSec: number; targetPet: boolean }[];
+  damageMultiplier: number;
+  damageMultiplierDurationMs: number;
+  particleTrail: boolean;
+  particleTrailColor: number;
+  particleTrailIntensity: number;
+  particleTrailLifetimeMs: number;
+  laserDistance: number;
+  glowColor: number;
   // Movement pattern properties (from game client Projectile.as)
   amplitude: number;
   frequency: number;
@@ -54,6 +65,12 @@ export interface WeaponPatternDef {
 
 export interface WeaponSubattackDef {
   rateOfFire: number;
+  /** Projectile budget multiplier for one burst; zero means ordinary cadence. */
+  burstCount: number;
+  /** Full burst cooldown at zero dexterity, in milliseconds. */
+  burstDelayMs: number;
+  /** Burst cooldown at 75+ dexterity, in milliseconds. */
+  burstMinDelayMs: number;
   /** Basic projectile weapons without `<Subattack>` use the protocol's -1 attack index. */
   isDummy: boolean;
   /** Per-volley oscillating angle increment, in degrees. */
@@ -210,6 +227,18 @@ function readFirstTextureIndex(
   return Number.isFinite(index) ? index : -1;
 }
 
+function readLastText(value: unknown): string {
+  const values = Array.isArray(value) ? value : [value];
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    const entry = values[index];
+    const text = typeof entry === 'object' && entry !== null
+      ? String((entry as Record<string, unknown>)['#text'] ?? '').trim()
+      : String(entry ?? '').trim();
+    if (text) return text;
+  }
+  return '';
+}
+
 /** RotMG `SlotType` → SDK `Item.slotType` (same buckets as plugins/auto-loot). */
 const WEAPON_SLOT_TYPES = new Set<number>([1, 2, 3, 8, 17, 24]);
 const ABILITY_SLOT_TYPES = new Set<number>([4, 5, 11, 12, 13, 15, 16, 18, 19, 20, 21, 22, 23, 25, 27, 28, 29, 30]);
@@ -237,6 +266,8 @@ export interface EnchantmentDef {
   description: string;
   labels: string[];
   compatibleLabels: string[];
+  /** Product of all `<MultiplyRateOfFire>` mutators. */
+  rateOfFireMultiplier: number;
 }
 
 function readActivateEffects(node: unknown): string[] {
@@ -283,6 +314,14 @@ function positiveIntOr(value: unknown, fallback: number): number {
   return parsed > 0 ? Math.max(1, Math.trunc(parsed)) : fallback;
 }
 
+function multiplierProduct(value: unknown): number {
+  const values = Array.isArray(value) ? value : value == null ? [] : [value];
+  return values.reduce((product, entry) => {
+    const multiplier = xmlNumber(entry, 1);
+    return multiplier > 0 ? product * multiplier : product;
+  }, 1);
+}
+
 function readPosOffset(value: unknown, fallback: [number, number]): [number, number] {
   if (typeof value !== 'string' && typeof value !== 'number') return fallback;
   const [rawX, rawY] = String(value).split(',', 2);
@@ -304,6 +343,9 @@ function readWeaponSubattacks(
     if (asObjectArray(root.Projectile).length === 0) return [];
     return [{
       rateOfFire: rootRate,
+      burstCount: Math.max(0, Math.trunc(finiteOr(root.BurstCount, 0))),
+      burstDelayMs: Math.max(0, finiteOr(root.BurstDelay, 0) * 1000),
+      burstMinDelayMs: Math.max(0, finiteOr(root.BurstMinDelay, finiteOr(root.BurstDelay, 0)) * 1000),
       isDummy: true,
       defaultAngleIncrease: 0,
       minIncrAngleCounter: 0,
@@ -356,6 +398,15 @@ function readWeaponSubattacks(
       : undefined;
     return {
       rateOfFire,
+      burstCount: Math.max(0, Math.trunc(finiteOr(subattack.BurstCount, finiteOr(root.BurstCount, 0)))),
+      burstDelayMs: Math.max(0, finiteOr(subattack.BurstDelay, finiteOr(root.BurstDelay, 0)) * 1000),
+      burstMinDelayMs: Math.max(
+        0,
+        finiteOr(
+          subattack.BurstMinDelay,
+          finiteOr(subattack.BurstDelay, finiteOr(root.BurstMinDelay, finiteOr(root.BurstDelay, 0))),
+        ) * 1000,
+      ),
       isDummy: false,
       defaultAngleIncrease,
       minIncrAngleCounter: increment > 0
@@ -433,7 +484,12 @@ export interface GameWikiTileRow {
  */
 export class GameDataLoader {
   private objects = new Map<number, ObjectDef>();
-  private objectTypesById = new Map<string, number>();
+  // Keep the definition itself, not just its numeric type. Game data can contain
+  // duplicate type values across unrelated object catalogs (for example,
+  // Yellow Missile and pdiscovery_icon_39 are both type 0x28). Resolving an
+  // ObjectId through the type map would therefore return whichever definition
+  // happened to overwrite that type last, producing the wrong projectile art.
+  private objectsById = new Map<string, ObjectDef>();
   private enchantments = new Map<number, EnchantmentDef>();
   private tileSpeedMap = new Map<number, number>();
   private tileNameMap = new Map<number, string>();
@@ -496,7 +552,10 @@ export class GameDataLoader {
         mpCost: Number(obj.MpCost ?? 0),
         cooldownMs: Math.max(0, Number(obj.Cooldown ?? 0) * 1000),
         activateEffects: readActivateEffects(obj.Activate),
-        burstCount: Number(obj.BurstCount ?? 0),
+        burstCount: subattacks.reduce(
+          (largest, subattack) => Math.max(largest, subattack.burstCount),
+          Math.max(0, Math.trunc(Number(obj.BurstCount ?? 0))),
+        ),
         occupySquare: obj.OccupySquare !== undefined,
         fullOccupy: obj.FullOccupy !== undefined,
         enemyOccupySquare: obj.EnemyOccupySquare !== undefined,
@@ -533,7 +592,7 @@ export class GameDataLoader {
           const size = Number.isFinite(rawSize) && rawSize > 0 ? rawSize : 100;
           const hitRadius = 0.15 * (size / 100);
 
-          const conditionEffects: { effect: string; durationSec: number }[] = [];
+          const conditionEffects: { effect: string; durationSec: number; targetPet: boolean }[] = [];
           if (proj.ConditionEffect) {
             const effects = Array.isArray(proj.ConditionEffect)
               ? proj.ConditionEffect
@@ -544,26 +603,65 @@ export class GameDataLoader {
               const duration =
                 typeof ce === 'object' ? Number(ce['@_duration'] ?? 0) : 0;
               if (effectName) {
-                conditionEffects.push({ effect: effectName, durationSec: duration });
+                conditionEffects.push({
+                  effect: effectName,
+                  durationSec: duration,
+                  targetPet: typeof ce === 'object' && String(ce['@_target'] ?? '') === '1',
+                });
               }
             }
           }
 
+          const hasFixedDamage = proj.Damage !== undefined;
+          const minDamage = Number(hasFixedDamage ? proj.Damage : proj.MinDamage ?? 0);
+          const maxDamage = Number(hasFixedDamage ? proj.Damage : proj.MaxDamage ?? 0);
+          const rawDamageMultiplier = Number(proj.DamageMultiplier?.['@_mult'] ?? 1);
+          const rawDamageMultiplierDuration = Number(proj.DamageMultiplier?.['@_duration'] ?? 0) * 1000;
+          const rawParticleTrailColor = Number(proj.ParticleTrail ?? 0xff00ff);
+          const rawLaserDistance = Number(proj.Laser ?? 0);
+          const rawGlowColor = Number(proj.GlowColor ?? 0xffffff);
+          const rawCollisionMult = Number(proj.CollisionMult ?? 1);
           def.projectiles.set(projId, {
             id: projId,
-            objectId: String(proj.ObjectId ?? '').trim(),
+            // Three live definitions contain two ObjectId tags: an obsolete
+            // Invisible placeholder followed by the real projectile visual.
+            // String(array) comma-joined them and guaranteed a missing sprite.
+            objectId: readLastText(proj.ObjectId),
             visualSize: proj.Size === undefined ? -1 : Number(proj.Size),
             faceDir: proj.FaceDir !== undefined,
             noRotation: proj.NoRotation !== undefined,
-            damage: Number(proj.Damage ?? 0),
+            minDamage,
+            maxDamage,
+            damage: hasFixedDamage ? minDamage : 0,
             speed: Number(proj.Speed ?? 0),
             lifetimeMs: Number(proj.LifetimeMS ?? 0),
             hitRadius,
             armorPiercing: proj.ArmorPiercing !== undefined,
             multiHit: proj.MultiHit !== undefined,
             passesCover: proj.PassesCover !== undefined,
+            protectFromSink: proj.ProtectFromSink !== undefined,
             maxHealthDamage: Number(proj.MaxHealthDamage ?? 0),
             conditionEffects,
+            damageMultiplier: Number.isFinite(rawDamageMultiplier) && rawDamageMultiplier > 0
+              ? rawDamageMultiplier
+              : 1,
+            damageMultiplierDurationMs: Number.isFinite(rawDamageMultiplierDuration)
+              && rawDamageMultiplierDuration >= 0
+              ? rawDamageMultiplierDuration
+              : 0,
+            particleTrail: proj.ParticleTrail !== undefined,
+            particleTrailColor: Number.isFinite(rawParticleTrailColor) && rawParticleTrailColor !== 0
+              ? rawParticleTrailColor
+              : 0xff00ff,
+            // ProdMafia exposes these fields but leaves them at their defaults.
+            particleTrailIntensity: -1,
+            particleTrailLifetimeMs: -1,
+            laserDistance: Number.isFinite(rawLaserDistance) && rawLaserDistance > 0
+              ? rawLaserDistance
+              : 0,
+            glowColor: Number.isFinite(rawGlowColor) && rawGlowColor >= 0
+              ? rawGlowColor >>> 0
+              : 0xffffff,
             amplitude: Number(proj.Amplitude ?? 0),
             frequency: Number(proj.Frequency ?? 1),
             magnitude: Number(proj.Magnitude ?? 3),
@@ -572,18 +670,21 @@ export class GameDataLoader {
             boomerang: proj.Boomerang !== undefined,
             acceleration: Number(proj.Acceleration ?? 0),
             accelerationDelay: Number(proj.AccelerationDelay ?? 0),
-            speedClamp: Number(proj.SpeedClamp ?? -1),
-            // Turn fields. XML angles are degrees; store radians. XML omits
-            // most of these on most projectiles, hence the zero defaults.
+            // ProdMafia treats an omitted/non-positive clamp as zero, not an
+            // "unbounded acceleration" sentinel.
+            speedClamp: Math.max(0, Math.trunc(Number(proj.SpeedClamp ?? 0))),
+            // Match ProjectileProperties units exactly.
             turnRate: Number(proj.TurnRate ?? 0) * Math.PI / 180,
-            turnRateDelay: Number(proj.TurnRateDelay ?? 0),
-            turnAcceleration: Number(proj.TurnAcceleration ?? 0) * Math.PI / 180,
-            turnAccelerationDelay: Number(proj.TurnAccelerationDelay ?? 0),
+            turnRateDelay: Number(proj.TurnRateDelay ?? 0) / 1000,
+            turnAcceleration: Number(proj.TurnAcceleration ?? 0),
+            turnAccelerationDelay: Number(proj.TurnAccelerationDelay ?? 0) / 1000,
             turnClamp: Number(proj.TurnClamp ?? 0) * Math.PI / 180,
             turnStopTime: Number(proj.TurnStopTime ?? 0),
             circleTurnAngle: Number(proj.CircleTurnAngle ?? 0) * Math.PI / 180,
             circleTurnDelay: Number(proj.CircleTurnDelay ?? 0),
-            collisionMult: Number(proj.CollisionMult ?? 1),
+            collisionMult: Number.isFinite(rawCollisionMult) && rawCollisionMult >= 0
+              ? rawCollisionMult
+              : 1,
           });
         }
       }
@@ -596,7 +697,7 @@ export class GameDataLoader {
       }
 
       this.objects.set(type, def);
-      if (id) this.objectTypesById.set(id.trim().toLowerCase(), type);
+      if (id) this.objectsById.set(id.trim().toLowerCase(), def);
     }
 
     const projCount = [...this.objects.values()].reduce(
@@ -629,8 +730,7 @@ export class GameDataLoader {
   }
 
   getObjectById(id: string): ObjectDef | undefined {
-    const type = this.objectTypesById.get(String(id || '').trim().toLowerCase());
-    return type === undefined ? undefined : this.objects.get(type);
+    return this.objectsById.get(String(id || '').trim().toLowerCase());
   }
 
   loadEnchantments(xmlPath: string): void {
@@ -649,6 +749,7 @@ export class GameDataLoader {
       const type = Number(typeRaw);
       if (!Number.isFinite(type)) continue;
       const id = String(enchantment['@_id'] ?? '').trim();
+      const mutators = asObjectArray(enchantment.Mutators)[0];
       this.enchantments.set(type, {
         type,
         id,
@@ -656,6 +757,7 @@ export class GameDataLoader {
         description: String(enchantment.Description ?? '').trim(),
         labels: csvValues(enchantment.EnchantmentLabels),
         compatibleLabels: csvValues(enchantment.CompatibleWithItemLabels),
+        rateOfFireMultiplier: multiplierProduct(mutators?.MultiplyRateOfFire),
       });
     }
   }

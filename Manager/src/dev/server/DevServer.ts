@@ -2814,7 +2814,6 @@ export class DevServer {
           : options.includeOtherProjectiles)
         .map((projectile) => {
           const projectileDef = this.gameData?.getProjectile(projectile.containerType, projectile.bulletType);
-          const containerDef = this.gameData?.getObject(projectile.containerType);
           const visualDef = projectileDef?.objectId
             ? this.gameData?.getObjectById(projectileDef.objectId)
             : undefined;
@@ -2842,11 +2841,27 @@ export class DevServer {
             acceleration: projectile.definition.acceleration,
             accelerationDelay: projectile.definition.accelerationDelay,
             speedClamp: projectile.definition.speedClamp,
+            turnRate: projectile.definition.turnRate,
+            turnRateDelay: projectile.definition.turnRateDelay,
+            turnAcceleration: projectile.definition.turnAcceleration,
+            turnAccelerationDelay: projectile.definition.turnAccelerationDelay,
+            turnClamp: projectile.definition.turnClamp,
+            turnStopTime: projectile.definition.turnStopTime,
+            circleTurnAngle: projectile.definition.circleTurnAngle,
+            circleTurnDelay: projectile.definition.circleTurnDelay,
+            collisionMult: projectile.definition.collisionMult,
+            laserDistance: projectileDef?.laserDistance ?? projectile.definition.laserDistance ?? 0,
+            glowColor: projectileDef?.glowColor ?? 0xffffff,
+            particleTrail: projectileDef?.particleTrail ?? false,
+            particleTrailColor: projectileDef?.particleTrailColor ?? 0xff00ff,
+            protectFromSink: projectileDef?.protectFromSink ?? false,
+            damageMultiplier: projectileDef?.damageMultiplier ?? 1,
+            damageMultiplierDurationMs: projectileDef?.damageMultiplierDurationMs ?? 0,
             textureFile: visualDef?.textureFile ?? '',
             textureIndex: visualDef?.textureIndex ?? -1,
             size: Number.isFinite(explicitSize) && explicitSize >= 0
               ? explicitSize
-              : containerDef?.size ?? 100,
+              : visualDef?.size ?? 100,
             angleCorrection: visualDef?.angleCorrection ?? 0,
             rotation: visualDef?.rotation ?? 0,
             faceDir: projectileDef?.faceDir ?? false,

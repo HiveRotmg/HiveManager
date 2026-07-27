@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ConditionEffectBits, GotoAckPacket, GotoPacket, MovePacket, NewTickPacket, Packet, PlayerData } from 'realmlib';
+import { ConditionEffectBits, GotoAckPacket, GotoPacket, MovePacket, NewTickPacket, ObjectStatusData, Packet, PlayerData } from 'realmlib';
 import { Client } from '../src/client';
 import { DodgeJumpLimiter } from '../src/dodge-jump-limiter';
 
@@ -72,6 +72,41 @@ test('NEWTICK reports the latest local frame without re-integrating from stale s
   );
 });
 
+test('NEWTICK rebases a local trajectory the server has stopped accepting', () => {
+  const client = movementClient();
+  const state = client as unknown as MovementClientState;
+  const sent: Packet[] = [];
+  Object.assign(state, {
+    objectId: 42,
+    pos: { x: 10, y: 0 },
+    serverPos: { x: 0, y: 0 },
+    lastLocalMovementAt: 1192,
+    io: { send: (packet: Packet) => sent.push(packet) },
+    time: () => 1200,
+  });
+
+  const self = new ObjectStatusData();
+  self.objectId = 42;
+  self.pos.x = 0;
+  self.pos.y = 0;
+  const tick = new NewTickPacket();
+  tick.tickId = 8;
+  tick.tickTime = 200;
+  tick.serverRealTimeMS = 5200;
+  tick.statuses = [self];
+
+  state.handleNewTick(tick);
+
+  assert.deepEqual(state.pos, { x: 0, y: 0 });
+  assert.deepEqual(state.serverPos, { x: 0, y: 0 });
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0] instanceof MovePacket);
+  assert.deepEqual(
+    { x: sent[0].records[0].x, y: sent[0].records[0].y },
+    { x: 0, y: 0 },
+  );
+});
+
 test('NEWTICK sends no movement after authoritative HP triggers autonexus', () => {
   const client = movementClient();
   const state = client as unknown as MovementClientState;
@@ -82,7 +117,7 @@ test('NEWTICK sends no movement after authoritative HP triggers autonexus', () =
     setSafeMap(safe: boolean): void;
     applyDamage(amount: number, source: 'server'): boolean;
   } }).autoNexus;
-  monitor.reset(250, 1000);
+  monitor.reset(200, 1000);
   monitor.setSafeMap(false);
   Object.assign(state, {
     io: { send: (packet: Packet) => sent.push(packet) },
@@ -148,7 +183,7 @@ test('bleeding is predicted between server ticks and can trigger autonexus', () 
     reset(hp: number, maxHp: number): void;
     setSafeMap(safe: boolean): void;
   } }).autoNexus;
-  monitor.reset(201, 1000);
+  monitor.reset(151, 1000);
   monitor.setSafeMap(false);
   state.player!.condition = ConditionEffectBits.BLEEDING;
   state.lastLocalMovementAt = 1000;

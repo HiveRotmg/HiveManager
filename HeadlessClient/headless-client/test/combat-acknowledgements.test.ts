@@ -10,6 +10,7 @@ import {
   CreateSuccessPacket,
   EnemyShootPacket,
   Packet,
+  PlayerHitPacket,
   PlayerData,
   ServerPlayerShootPacket,
   ShowEffectPacket,
@@ -17,7 +18,10 @@ import {
   VisualEffect,
 } from 'realmlib';
 import { Client } from '../src/client';
-import type { CombatProjectileDefinition } from '../src/combat-tracker';
+import {
+  CombatTracker,
+  type CombatProjectileDefinition,
+} from '../src/combat-tracker';
 import { ClientEvent } from '../src/events';
 import { ThrownAoeTracker } from '../src/predictive-auto-dodge';
 
@@ -50,30 +54,7 @@ test('another player SERVERPLAYERSHOOT is not acknowledged', () => {
 });
 
 test('other-player viewer projectiles are render-only and clear when disabled', () => {
-  const definition: CombatProjectileDefinition = {
-    speed: 10000,
-    lifetimeMs: 1000,
-    multiHit: false,
-    passesCover: false,
-    amplitude: 0,
-    frequency: 1,
-    magnitude: 3,
-    wavy: false,
-    parametric: false,
-    boomerang: false,
-    acceleration: 0,
-    accelerationDelay: 0,
-    speedClamp: -1,
-    turnRate: 0,
-    turnRateDelay: 0,
-    turnAcceleration: 0,
-    turnAccelerationDelay: 0,
-    turnClamp: 0,
-    turnStopTime: 0,
-    circleTurnAngle: 0,
-    circleTurnDelay: 0,
-    collisionMult: 1,
-  };
+  const definition = ordinaryProjectileDefinition();
   const client = new Client({
     alias: 'viewer-test',
     accessToken: '',
@@ -154,6 +135,86 @@ test('AOE is acknowledged with the current client time and local player position
   assert.ok(sent[0] instanceof AoeAckPacket);
   assert.equal(sent[0].time, 456);
   assert.deepEqual({ x: sent[0].position.x, y: sent[0].position.y }, { x: 4, y: 6 });
+});
+
+test('AOE spoof moves AOEACK 500 tiles away and skips local damage and conditions', () => {
+  const { client, sent, player } = harness();
+  const damage: number[] = [];
+  client.on(ClientEvent.DamageTaken, (event) => damage.push(event.amount));
+  assert.equal(client.setAoeSpoofEnabled(true), true);
+  const aoe = aoeAtPlayer(38); // Curse
+
+  invoke(client, 'handleAoe', aoe);
+
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0] instanceof AoeAckPacket);
+  assert.deepEqual({ x: sent[0].position.x, y: sent[0].position.y }, { x: 504, y: 506 });
+  assert.deepEqual(damage, []);
+  assert.equal(player.condition2 & ConditionEffectBits2.CURSE, 0);
+  assert.deepEqual(client.getCombatProtectionState(), {
+    partialGodModeEnabled: false,
+    aoeSpoofEnabled: true,
+    aoeSpoofOffsetTiles: 500,
+  });
+});
+
+test('Partial Godmode consumes an enemy projectile before local HP loss and PLAYERHIT', () => {
+  const client = new Client({
+    alias: 'partial-godmode-test',
+    accessToken: '',
+    clientToken: '',
+    charId: 1,
+    needsNewChar: false,
+    host: '127.0.0.1',
+    combatData: {
+      getObject: (type) => type === 100
+        ? { isEnemy: true, occupySquare: false }
+        : undefined,
+      getProjectile: (type, bulletType) => type === 100 && bulletType === 0
+        ? ordinaryProjectileDefinition()
+        : undefined,
+    },
+  });
+  const sent: Packet[] = [];
+  Object.assign(client as unknown as Record<string, unknown>, {
+    io: { send: (packet: Packet) => sent.push(packet) },
+    objectId: 10,
+    player: {
+      hp: 100,
+      maxHP: 100,
+      def: 0,
+      condition: 0,
+      condition2: 0,
+    } as PlayerData,
+  });
+  const damage: number[] = [];
+  client.on(ClientEvent.DamageTaken, (event) => damage.push(event.amount));
+  assert.equal(client.setPartialGodModeEnabled(true), true);
+  const shot = new EnemyShootPacket();
+  shot.ownerId = 20;
+  shot.bulletId = 7;
+  shot.bulletType = 0;
+  shot.startingPos.x = 0;
+  shot.startingPos.y = 1;
+  shot.angle = 0;
+  shot.damage = 75;
+  const tracker = (
+    client as unknown as { combat: CombatTracker }
+  ).combat;
+  tracker.trackEnemyShoot(shot, 100, 0);
+  tracker.update(600, {
+    playerId: 10,
+    playerPos: { x: 5, y: 1 },
+    mapWidth: 100,
+    mapHeight: 100,
+    entities: [],
+    tiles: [],
+  });
+
+  assert.equal(sent.some((packet) => packet instanceof PlayerHitPacket), false);
+  assert.deepEqual(damage, []);
+  assert.equal(client.getAutoNexusState().predictedHp, null);
+  assert.equal(client.isPartialGodModeEnabled(), true);
 });
 
 test('AOE is retained briefly for the viewer with its server radius and color', () => {
@@ -355,6 +416,34 @@ function aoeAtPlayer(effect: number): AoePacket {
   aoe.damage = 25;
   aoe.effect = effect;
   return aoe;
+}
+
+function ordinaryProjectileDefinition(): CombatProjectileDefinition {
+  return {
+    speed: 100,
+    lifetimeMs: 1000,
+    multiHit: false,
+    passesCover: false,
+    amplitude: 0,
+    frequency: 1,
+    magnitude: 3,
+    wavy: false,
+    parametric: false,
+    boomerang: false,
+    acceleration: 0,
+    accelerationDelay: 0,
+    speedClamp: -1,
+    laserDistance: 0,
+    turnRate: 0,
+    turnRateDelay: 0,
+    turnAcceleration: 0,
+    turnAccelerationDelay: 0,
+    turnClamp: 0,
+    turnStopTime: 0,
+    circleTurnAngle: 0,
+    circleTurnDelay: 0,
+    collisionMult: 1,
+  };
 }
 
 function invoke(client: Client, method: string, packet: Packet): void {
