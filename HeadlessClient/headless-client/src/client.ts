@@ -109,7 +109,12 @@ import {
   type DodgeMovementIntent,
   type DodgeMovementIntentId,
 } from './dodge-movement-intent';
-import { MovementController, movementSpeed, type MovementSnapshot } from './movement-controller';
+import {
+  MovementController,
+  movementSpeed,
+  resolveMovementCollision,
+  type MovementSnapshot,
+} from './movement-controller';
 import {
   PredictiveAutoDodgeController,
   DodgeAoeThreatTracker,
@@ -304,6 +309,10 @@ export interface ClientDodgeDiagnostic {
     velocityOverride: { x: number; y: number } | null;
     reached: { x: number; y: number } | null;
     stalledDistance: number | null;
+    collision: {
+      requestedDistance: number;
+      appliedDistance: number;
+    } | null;
   };
 }
 
@@ -413,6 +422,7 @@ export class Client extends EventEmitter {
   private diagnosticConnectionGeneration = 0;
   private lastDodgeEvaluationSequence: number | null = null;
   private lastDodgeMove: PacketTraffic['dodgeCorrelation'] | null = null;
+  private collisionBlockedFrames = 0;
   private pendingDodgeMove: PacketTraffic['dodgeCorrelation'] | undefined;
   private dodgeMovementIntent: DodgeMovementIntent | null = null;
   private suspendedDodgeMovementIntent: DodgeMovementIntent | null = null;
@@ -3799,6 +3809,13 @@ export class Client extends EventEmitter {
     const update = this.movement.update(snapshot, dt, {
       integrateFromLocal,
       velocityOverride,
+      resolvePosition: this.dodgeWorld
+        ? (from, intended) => resolveMovementCollision(
+          from,
+          intended,
+          (x, y) => this.dodgeWorld!.canOccupyMovement(x, y),
+        )
+        : undefined,
       // A goal_blocked dodge decision intentionally commands a controlled stop.
       // Treating that stop as failed server movement poisons both pathfinding and
       // dodge collision with learned blocked cells, making the condition persist.
@@ -3823,10 +3840,30 @@ export class Client extends EventEmitter {
           velocityOverride: velocityOverride ? { ...velocityOverride } : null,
           reached: update.reached ? { ...update.reached } : null,
           stalledDistance: update.stalled?.distance ?? null,
+          collision: update.collision ? { ...update.collision } : null,
         },
       });
     }
-    if (update.stalled && this.serverPos) {
+    const collisionStopped = !!update.collision
+      && update.collision.requestedDistance > 0.02
+      && update.collision.appliedDistance < update.collision.requestedDistance * 0.2;
+    this.collisionBlockedFrames = collisionStopped
+      ? this.collisionBlockedFrames + 1
+      : 0;
+    let collisionTriggeredReplan = false;
+    if (this.collisionBlockedFrames >= 3 && this.serverPos && usingPathfinding) {
+      const blocked = this.pathfinder.reportStall(this.serverPos);
+      if (blocked) this.dodgeWorld?.markBlocked(blocked.x, blocked.y);
+      this.collisionBlockedFrames = 0;
+      this.movement.clear();
+      this.navigationStatus = 'planning';
+      collisionTriggeredReplan = true;
+      console.warn(
+        `${this.tag} movement repeatedly blocked by local collision at ` +
+          `(${this.serverPos.x.toFixed(2)},${this.serverPos.y.toFixed(2)}); replanning`,
+      );
+    }
+    if (update.stalled && this.serverPos && !collisionTriggeredReplan) {
       if (usingPathfinding) {
         const blocked = this.pathfinder.reportStall(this.serverPos);
         if (blocked) this.dodgeWorld?.markBlocked(blocked.x, blocked.y);

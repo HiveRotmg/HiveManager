@@ -1276,11 +1276,13 @@ test('dodge collision world treats unknown cells as open only for exploratory pa
   assert.equal(world.canOccupy(5.5, 5.5, true), false);
   world.setExplorativeUnknown(true);
   assert.equal(world.canOccupy(5.5, 5.5, true), true);
+  assert.equal(world.canOccupyMovement(5.5, 5.5), false);
   assert.equal(world.canOccupy(-0.5, 5.5, true), false);
 
   world.observeTile(5, 5, 0xffff);
   assert.equal(world.canOccupy(5.5, 5.5, true), false);
   world.observeTile(5, 5, 0);
+  assert.equal(world.canOccupyMovement(5.5, 5.5), true);
   world.markBlocked(6, 5);
   assert.equal(world.canOccupy(5.75, 5.5, true), false);
 
@@ -1324,12 +1326,12 @@ test('dodge collision world keeps candidates one tile from projectile-capable en
 
   world.removeObject(32);
   world.upsertObject(33, 6, 5.5, 5.5);
-  // Damageable enemy occupySquare walls do not block movement.
-  assert.equal(world.canOccupy(5.5, 5.5, true), true);
+  // Damageability does not change authoritative occupySquare collision.
+  assert.equal(world.canOccupy(5.5, 5.5, true), false);
   assert.equal(world.canOccupy(6.25, 5.5, true), true);
 });
 
-test('damageable enemy walls still block projectiles but not movement', () => {
+test('damageable enemy walls block both projectiles and movement', () => {
   const data: CombatDataProvider = {
     getObject: (type) => type === 6
       ? { isEnemy: true, occupySquare: true }
@@ -1343,7 +1345,7 @@ test('damageable enemy walls still block projectiles but not movement', () => {
   for (let x = 0; x < 10; x++) world.observeTile(x, 5, 0);
 
   world.upsertObject(33, 6, 4.5, 5.5);
-  assert.equal(world.canOccupy(4.5, 5.5, true), true);
+  assert.equal(world.canOccupy(4.5, 5.5, true), false);
   const projectile = hostileProjectile();
   assert.equal(world.isProjectileSegmentOpen(3.5, 5.5, 5.5, 5.5, projectile), false);
 

@@ -75,18 +75,14 @@ export function isEnemyProximityThreat(
   return false;
 }
 
-/**
- * Killable enemy-tagged objects (destructible walls, crates, etc.) should not
- * block movement — path through them and shoot to clear. Invincible enemies
- * still occupy as static geometry.
- */
+/** Whether an enemy-tagged object can be damaged. */
 export function isDamageableEnemyObject(
   definition: { isEnemy?: boolean; invincible?: boolean } | undefined,
 ): boolean {
   return !!definition?.isEnemy && !definition.invincible;
 }
 
-/** Static movement flags after stripping damageable enemy occupy/fullOccupy. */
+/** Static movement flags used by pathfinding and fractional movement. */
 export function staticMovementProfile(definition: {
   occupySquare?: boolean;
   fullOccupy?: boolean;
@@ -94,9 +90,6 @@ export function staticMovementProfile(definition: {
   invincible?: boolean;
 } | undefined): { occupySquare: boolean; fullOccupy: boolean } {
   if (!definition) return { occupySquare: false, fullOccupy: false };
-  if (isDamageableEnemyObject(definition)) {
-    return { occupySquare: false, fullOccupy: false };
-  }
   return {
     occupySquare: !!definition.occupySquare,
     fullOccupy: !!definition.fullOccupy,
@@ -243,6 +236,19 @@ export class DodgeCollisionWorld {
   canOccupy(x: number, y: number, safeWalk: boolean, avoidEnemies = true): boolean {
     if (!this.canOccupyStatic(x, y, safeWalk)) return false;
     return !avoidEnemies || this.enemyOverlay.satisfiesHardClearance(x, y);
+  }
+
+  /**
+   * Physical movement cannot rely on exploratory unknown cells. It ignores
+   * enemy avoidance and damaging-floor policy because this is collision only.
+   */
+  canOccupyMovement(x: number, y: number): boolean {
+    return this.staticPassability.canOccupyAt(x, y, {
+      consumer: 'dodge',
+      safeWalk: false,
+      checkFullOccupyNeighbors: true,
+      allowUnknown: false,
+    });
   }
 
   /** Monotonic revision for local-snapshot invalidation. */

@@ -325,7 +325,7 @@ export class ExplorativePathfinder {
   upsertObject(objectId: number, objectType: number, x: number, y: number): void {
     const definition = this.data?.getObject(objectType);
     const revisionBefore = this.staticPassability.getRevision();
-    // Damageable enemy walls/crates are pathable; auto-aim shoots them clear.
+    // Preserve server collision for every occupy/fullOccupy object.
     this.staticPassability.upsertObject(
       objectId,
       objectType,

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { MovementController } from '../src/movement-controller';
+import { MovementController, resolveMovementCollision } from '../src/movement-controller';
 
 test('MovementController steps from authoritative server position when available', () => {
   const movement = new MovementController();
@@ -120,4 +120,52 @@ test('MovementController can dodge from standstill without creating a walk targe
 
   assert.deepEqual(update.pos, { x: 1.5, y: 2 });
   assert.equal(movement.hasTarget(), false);
+});
+
+test('resolveMovementCollision prevents movement from tunneling through a wall', () => {
+  const resolved = resolveMovementCollision(
+    { x: 0.5, y: 0.5 },
+    { x: 2.5, y: 0.5 },
+    (x) => x < 1 || x >= 2,
+  );
+
+  assert.ok(resolved.x > 0.99 && resolved.x < 1);
+  assert.equal(resolved.y, 0.5);
+});
+
+test('resolveMovementCollision slides diagonal movement along a blocked axis', () => {
+  const resolved = resolveMovementCollision(
+    { x: 0.5, y: 0.5 },
+    { x: 1.5, y: 1.5 },
+    (x) => x < 1,
+  );
+
+  assert.ok(resolved.x > 0.99 && resolved.x < 1);
+  assert.ok(resolved.y > 1.49 && resolved.y <= 1.5);
+});
+
+test('MovementController reports collision-adjusted dodge movement', () => {
+  const movement = new MovementController();
+  const update = movement.update(
+    {
+      localPos: { x: 0.5, y: 0.5 },
+      playerSpeed: 75,
+      playerSpeedBoost: 0,
+    },
+    200,
+    {
+      integrateFromLocal: true,
+      velocityOverride: { x: 0.005, y: 0 },
+      resolvePosition: (from, intended) => resolveMovementCollision(
+        from,
+        intended,
+        (x) => x < 1,
+      ),
+    },
+  );
+
+  assert.ok(update.pos.x > 0.99 && update.pos.x < 1);
+  assert.ok(update.collision);
+  assert.equal(update.collision.requestedDistance, 1);
+  assert.ok(update.collision.appliedDistance < 0.5);
 });

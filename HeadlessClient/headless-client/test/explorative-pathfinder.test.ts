@@ -605,14 +605,14 @@ test('Client exposes no-path state, suspends goal dodge, and recovers after map 
   });
 });
 
-test('damageable enemy walls are pathable and stalls against them are not learned', () => {
+test('damageable occupySquare enemies remain blocked geometry', () => {
   const pathfinder = createPathfinder(12, 3);
   for (let x = 0; x < 12; x++) {
     pathfinder.observeTile(x, 0, 1);
     pathfinder.observeTile(x, 1, 1);
     pathfinder.observeTile(x, 2, 1);
   }
-  // Solid inert wall on the north lane; only the south lane has a shootable wall.
+  // The route must use the open lane instead of assuming a shootable wall is passable.
   pathfinder.upsertObject(1, BLOCKING_OBJECT, 5.5, 0.5);
   pathfinder.upsertObject(2, DESTRUCTIBLE_WALL, 5.5, 1.5);
 
@@ -620,10 +620,7 @@ test('damageable enemy walls are pathable and stalls against them are not learne
   const step = pathfinder.next({ x: 0.5, y: 1.5 });
   assert.equal(step.noPath, undefined);
   assert.ok(step.waypoint);
-  assert.equal(hasTile(pathfinder, 5, 1), true, 'route should cross the shootable wall tile');
-
-  const stalled = pathfinder.reportStall({ x: 4.5, y: 1.5 });
-  assert.equal(stalled, undefined, 'must not permanently learn shootable wall tiles');
+  assert.equal(hasTile(pathfinder, 5, 1), false, 'route must not cross occupySquare geometry');
 
   pathfinder.removeObject(2);
   pathfinder.upsertObject(3, INVINCIBLE_WALL, 5.5, 1.5);

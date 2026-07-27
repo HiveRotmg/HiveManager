@@ -76,6 +76,8 @@ export interface StaticOccupancyQuery extends StaticTileQuery {
    * a fullOccupy object. Pathfinding uses integer tiles and does not need this.
    */
   checkFullOccupyNeighbors?: boolean;
+  /** Overrides the global exploratory-unknown policy for physical movement. */
+  allowUnknown?: boolean;
 }
 
 /**

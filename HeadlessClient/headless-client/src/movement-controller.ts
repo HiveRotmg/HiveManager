@@ -20,6 +20,10 @@ export interface MovementUpdate {
   pos: { x: number; y: number };
   reached?: { x: number; y: number };
   stalled?: { distance: number };
+  collision?: {
+    requestedDistance: number;
+    appliedDistance: number;
+  };
 }
 
 export interface MovementVelocity {
@@ -34,10 +38,19 @@ export interface MovementUpdateOptions {
   velocityOverride?: MovementVelocity;
   /** Continue target-progress stall detection while applying the override. */
   trackTargetProgress?: boolean;
+  /** Resolves the intended step against authoritative map collision. */
+  resolvePosition?: MovementPositionResolver;
 }
+
+export type MovementPositionResolver = (
+  from: Readonly<{ x: number; y: number }>,
+  intended: Readonly<{ x: number; y: number }>,
+) => { x: number; y: number };
 
 const SPEED_MIN = 0.004;
 const SPEED_MAX = 0.0096;
+const MAX_COLLISION_STEP = 0.4;
+const COLLISION_EPSILON = 1e-6;
 
 /** Owns movement target state and local dead-reckoning between server ticks. */
 export class MovementController {
@@ -73,10 +86,21 @@ export class MovementController {
     if (!this.target && !options.velocityOverride) {
       return { pos: snapshot.localPos };
     }
-    const pos = options.velocityOverride
+    const base = options.integrateFromLocal
+      ? snapshot.localPos
+      : snapshot.serverPos ?? snapshot.localPos;
+    const intended = options.velocityOverride
       ? this.stepWithVelocity(snapshot, dt, options.velocityOverride, !!options.integrateFromLocal)
       : this.stepToward(snapshot, dt, !!options.integrateFromLocal);
-    if (!this.target) return { pos };
+    const pos = options.resolvePosition
+      ? options.resolvePosition(base, intended)
+      : intended;
+    const requestedDistance = Math.hypot(intended.x - base.x, intended.y - base.y);
+    const appliedDistance = Math.hypot(pos.x - base.x, pos.y - base.y);
+    const collision = Math.hypot(intended.x - pos.x, intended.y - pos.y) > COLLISION_EPSILON
+      ? { requestedDistance, appliedDistance }
+      : undefined;
+    if (!this.target) return { pos, collision };
     const stalled = options.velocityOverride && !options.trackTargetProgress
       ? undefined
       : this.detectStall(snapshot.serverPos, dt);
@@ -84,9 +108,9 @@ export class MovementController {
     if (Math.hypot(this.target.x - confirmedPos.x, this.target.y - confirmedPos.y) < this.target.threshold) {
       const reached = { x: this.target.x, y: this.target.y };
       this.clear();
-      return { pos, reached, stalled };
+      return { pos, reached, stalled, collision };
     }
-    return { pos, stalled };
+    return { pos, stalled, collision };
   }
 
   getIntendedVelocity(snapshot: MovementSnapshot, integrateFromLocal = false): MovementVelocity {
@@ -145,6 +169,76 @@ export class MovementController {
     }
     return undefined;
   }
+}
+
+/**
+ * Sweeps a movement step through fractional collision geometry and slides along
+ * a blocked axis instead of allowing a valid route to cut through an obstacle.
+ */
+export function resolveMovementCollision(
+  from: Readonly<{ x: number; y: number }>,
+  intended: Readonly<{ x: number; y: number }>,
+  canOccupy: (x: number, y: number) => boolean,
+): { x: number; y: number } {
+  const dx = intended.x - from.x;
+  const dy = intended.y - from.y;
+  const distance = Math.hypot(dx, dy);
+  if (distance <= COLLISION_EPSILON) return { x: intended.x, y: intended.y };
+
+  const steps = Math.max(1, Math.ceil(distance / MAX_COLLISION_STEP));
+  const stepX = dx / steps;
+  const stepY = dy / steps;
+  let current = { x: from.x, y: from.y };
+  for (let remaining = steps; remaining > 0; remaining--) {
+    const next = {
+      x: current.x + stepX,
+      y: current.y + stepY,
+    };
+    if (canOccupy(next.x, next.y)) {
+      current = next;
+      continue;
+    }
+
+    const candidates = [
+      furthestReachable(current, next, canOccupy),
+      furthestReachable(current, { x: next.x, y: current.y }, canOccupy),
+      furthestReachable(current, { x: current.x, y: next.y }, canOccupy),
+    ];
+    let best = current;
+    let bestProgress = 0;
+    for (const candidate of candidates) {
+      const progress = (candidate.x - current.x) * dx + (candidate.y - current.y) * dy;
+      if (progress > bestProgress + COLLISION_EPSILON) {
+        best = candidate;
+        bestProgress = progress;
+      }
+    }
+    current = best;
+  }
+  return current;
+}
+
+function furthestReachable(
+  from: Readonly<{ x: number; y: number }>,
+  to: Readonly<{ x: number; y: number }>,
+  canOccupy: (x: number, y: number) => boolean,
+): { x: number; y: number } {
+  if (canOccupy(to.x, to.y)) return { x: to.x, y: to.y };
+  if (!canOccupy(from.x, from.y)) return { x: from.x, y: from.y };
+
+  let low = 0;
+  let high = 1;
+  for (let iteration = 0; iteration < 12; iteration++) {
+    const ratio = (low + high) * 0.5;
+    const x = from.x + (to.x - from.x) * ratio;
+    const y = from.y + (to.y - from.y) * ratio;
+    if (canOccupy(x, y)) low = ratio;
+    else high = ratio;
+  }
+  return {
+    x: from.x + (to.x - from.x) * low,
+    y: from.y + (to.y - from.y) * low,
+  };
 }
 
 export function movementSpeed(snapshot: MovementSnapshot): number {

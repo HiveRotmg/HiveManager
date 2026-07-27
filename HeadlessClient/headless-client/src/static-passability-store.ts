@@ -125,7 +125,10 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
 
     const type = this.tileTypes.get(key);
     if (type === INVALID_TILE_TYPE) return true;
-    if (type === undefined && !this.explorativeUnknown) return true;
+    const allowUnknown = query.consumer === 'dodge'
+      ? (query as StaticOccupancyQuery).allowUnknown ?? this.explorativeUnknown
+      : true;
+    if (type === undefined && !allowUnknown) return true;
     if (this.learnedBlocked.has(key)) return true;
     if (type !== undefined && !!this.data?.tileIsBlockingWalk?.(type)) return true;
     if (type !== undefined && query.safeWalk && (this.data?.getTileDamage?.(type) ?? 0) > 0) {
@@ -275,6 +278,7 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
 
     const fracX = x - tileX;
     const fracY = y - tileY;
+    const allowUnknown = query.allowUnknown ?? this.explorativeUnknown;
     const minX = fracX < 0.5 ? tileX - 1 : tileX;
     const maxX = fracX > 0.5 ? tileX + 1 : tileX;
     const minY = fracY < 0.5 ? tileY - 1 : tileY;
@@ -286,7 +290,7 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
         const neighborType = this.tileTypes.get(key);
         if (!this.inBounds(neighborX, neighborY)
           || neighborType === INVALID_TILE_TYPE
-          || neighborType === undefined && !this.explorativeUnknown
+          || neighborType === undefined && !allowUnknown
           || this.learnedBlocked.has(key)
           || (this.fullOccupyCounts.get(key) ?? 0) > 0) {
           return false;
