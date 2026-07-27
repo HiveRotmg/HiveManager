@@ -70,7 +70,7 @@ test('NEWTICK reports the latest local frame without re-integrating from stale s
   );
 });
 
-test('NEWTICK rebases a local trajectory the server has stopped accepting', () => {
+test('NEWTICK sends the current legal endpoint before applying a hard rebase', () => {
   const client = movementClient();
   const state = client as unknown as MovementClientState;
   const sent: Packet[] = [];
@@ -101,8 +101,66 @@ test('NEWTICK rebases a local trajectory the server has stopped accepting', () =
   assert.ok(sent[0] instanceof MovePacket);
   assert.deepEqual(
     { x: sent[0].records[0].x, y: sent[0].records[0].y },
-    { x: 0, y: 0 },
+    { x: 10, y: 0 },
   );
+});
+
+test('NEWTICK does not rebase ordinary prediction drift below ProdMafia hard threshold', () => {
+  const client = movementClient();
+  const state = client as unknown as MovementClientState;
+  const sent: Packet[] = [];
+  Object.assign(state, {
+    objectId: 42,
+    pos: { x: 7.9, y: 0 },
+    serverPos: { x: 0, y: 0 },
+    lastLocalMovementAt: 1192,
+    io: { send: (packet: Packet) => sent.push(packet) },
+    time: () => 1200,
+  });
+
+  const self = new ObjectStatusData();
+  self.objectId = 42;
+  self.pos.x = 0;
+  self.pos.y = 0;
+  const tick = new NewTickPacket();
+  tick.tickId = 8;
+  tick.tickTime = 200;
+  tick.serverRealTimeMS = 5200;
+  tick.statuses = [self];
+
+  state.handleNewTick(tick);
+
+  assert.deepEqual(state.pos, { x: 7.9, y: 0 });
+  assert.deepEqual(state.serverPos, { x: 0, y: 0 });
+  assert.equal(sent.length, 1);
+  assert.equal((sent[0] as MovePacket).records[0].x, 7.9);
+});
+
+test('MOVE clamps consecutive endpoints to legal stat speed', () => {
+  const client = movementClient();
+  const state = client as unknown as MovementClientState;
+  const sent: MovePacket[] = [];
+  Object.assign(state, {
+    pos: { x: 0, y: 0 },
+    lastLocalMovementAt: 1000,
+    io: { send: (packet: Packet) => sent.push(packet as MovePacket) },
+  });
+  const first = new NewTickPacket();
+  first.tickId = 1;
+  first.serverRealTimeMS = 5000;
+  state.sendMove(first, 1000);
+
+  state.pos = { x: 10, y: 0 };
+  state.lastLocalMovementAt = 1200;
+  const second = new NewTickPacket();
+  second.tickId = 2;
+  second.serverRealTimeMS = 5200;
+  state.sendMove(second, 1200);
+
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0].records[0].x, 0);
+  assert.ok(Math.abs(sent[1].records[0].x - 2.016) < 1e-6);
+  assert.equal(sent[1].records[0].y, 0);
 });
 
 test('NEWTICK sends no movement after authoritative HP triggers autonexus', () => {

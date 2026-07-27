@@ -178,10 +178,11 @@ const AOE_SPOOF_OFFSET_TILES = 500;
  * tick. Preserve that lead for smooth movement, but cap it so an ignored MOVE
  * cannot keep the local simulation advancing forever.
  */
-const MIN_AUTHORITATIVE_REBASE_DISTANCE = 3;
+const MIN_AUTHORITATIVE_REBASE_DISTANCE = 8;
 const AUTHORITATIVE_REBASE_TICK_MULTIPLIER = 1.25;
 const AUTHORITATIVE_REBASE_EXTRA_MS = 120;
 const AUTHORITATIVE_REBASE_MARGIN = 0.5;
+const MOVE_CLAMP_TOLERANCE = 1.05;
 
 enum AoeEffectId {
   Quiet = 2,
@@ -235,6 +236,9 @@ export interface PacketTraffic {
     tickId: number;
     recordTime: number;
     position: { x: number; y: number };
+    desiredPosition: { x: number; y: number };
+    clamped: boolean;
+    legalDistance: number | null;
   };
 }
 
@@ -422,6 +426,14 @@ export class Client extends EventEmitter {
   private diagnosticConnectionGeneration = 0;
   private lastDodgeEvaluationSequence: number | null = null;
   private lastDodgeMove: PacketTraffic['dodgeCorrelation'] | null = null;
+  private lastSentMovePosition: { x: number; y: number } | undefined;
+  private lastSentMoveAt = 0;
+  private lastSentMoveSpeed = 0;
+  private pendingAuthoritativeRebase: {
+    position: { x: number; y: number };
+    now: number;
+    drift: number;
+  } | undefined;
   private collisionBlockedFrames = 0;
   private pendingDodgeMove: PacketTraffic['dodgeCorrelation'] | undefined;
   private dodgeMovementIntent: DodgeMovementIntent | null = null;
@@ -2871,6 +2883,10 @@ export class Client extends EventEmitter {
     this.navigationDodgeDecision = null;
     this.lastDodgeEvaluationSequence = null;
     this.lastDodgeMove = null;
+    this.lastSentMovePosition = undefined;
+    this.lastSentMoveAt = 0;
+    this.lastSentMoveSpeed = 0;
+    this.pendingAuthoritativeRebase = undefined;
     this.pendingDodgeMove = undefined;
     this.dodgeWorld?.reset();
     this.autoDodge?.reset();
@@ -3501,14 +3517,21 @@ export class Client extends EventEmitter {
     this.findPendingPortal();
   }
 
-  /** Applies authoritative state before reporting movement so autonexus can suppress the tick. */
+  /**
+   * Applies authoritative stats before movement so autonexus can suppress the
+   * tick, but defers a self-position snap until after the current legal MOVE.
+   */
   private handleNewTick(p: NewTickPacket): void {
     const now = this.time();
     this.lastFrameTime = now;
     this.lastTickId = p.tickId;
     this.lastTickTime = p.tickTime;
     this.tickCount++;
-    if (this.updateStatuses(p)) return;
+    this.pendingAuthoritativeRebase = undefined;
+    if (this.updateStatuses(p)) {
+      this.pendingAuthoritativeRebase = undefined;
+      return;
+    }
     this.autoCombat?.observeWorldTick(
       now,
       p.tickTime,
@@ -3526,6 +3549,7 @@ export class Client extends EventEmitter {
         })),
     );
     this.sendMove(p, now);
+    this.applyPendingAuthoritativeRebase();
     this.updateCombat(now);
     this.tryUseVaultPortal();
     this.tryUsePendingPortal();
@@ -3941,8 +3965,32 @@ export class Client extends EventEmitter {
     // ProdMafia stamps the record with the frame that integrated this position,
     // not the slightly later time at which NEWTICK happened to arrive.
     record.time = this.lastLocalMovementAt > 0 ? Math.min(now, this.lastLocalMovementAt) : now;
-    record.x = this.pos.x;
-    record.y = this.pos.y;
+    const currentSpeed = movementSpeed(this.movementSnapshot());
+    const desiredMovePosition = { ...this.pos };
+    let movePosition = { ...desiredMovePosition };
+    let legalDistance: number | null = null;
+    let clamped = false;
+    if (this.lastSentMovePosition) {
+      const elapsed = Math.max(0, now - this.lastSentMoveAt);
+      const legalSpeed = Math.max(currentSpeed, this.lastSentMoveSpeed);
+      legalDistance = legalSpeed * elapsed * MOVE_CLAMP_TOLERANCE;
+      const dx = movePosition.x - this.lastSentMovePosition.x;
+      const dy = movePosition.y - this.lastSentMovePosition.y;
+      const desiredDistance = Math.hypot(dx, dy);
+      if (desiredDistance > legalDistance && desiredDistance > 0) {
+        clamped = true;
+        const scale = legalDistance / desiredDistance;
+        movePosition = {
+          x: this.lastSentMovePosition.x + dx * scale,
+          y: this.lastSentMovePosition.y + dy * scale,
+        };
+      }
+    }
+    record.x = movePosition.x;
+    record.y = movePosition.y;
+    this.lastSentMovePosition = { ...movePosition };
+    this.lastSentMoveAt = now;
+    this.lastSentMoveSpeed = currentSpeed;
     move.records = [record]; // must send >= 1 record or the server drops us
     const correlation = {
       sequence: ++this.dodgeMoveSequence,
@@ -3950,6 +3998,9 @@ export class Client extends EventEmitter {
       tickId: p.tickId,
       recordTime: record.time,
       position: { x: record.x, y: record.y },
+      desiredPosition: desiredMovePosition,
+      clamped,
+      legalDistance,
     };
     this.lastDodgeMove = correlation;
     this.pendingDodgeMove = correlation;
@@ -3986,6 +4037,18 @@ export class Client extends EventEmitter {
     this.autoDodge?.rebase(position, now);
   }
 
+  /** Applies the correction only after this tick reports its pre-snap endpoint. */
+  private applyPendingAuthoritativeRebase(): void {
+    const pending = this.pendingAuthoritativeRebase;
+    if (!pending) return;
+    this.pendingAuthoritativeRebase = undefined;
+    this.rebaseToAuthoritativePosition(pending.position, pending.now);
+    console.warn(
+      `${this.tag} movement desynced by ${pending.drift.toFixed(2)} tiles; ` +
+        `rebasing after sending the current legal MOVE`,
+    );
+  }
+
   /** Applies per-object status deltas from the tick to player and portal state. */
   private updateStatuses(p: NewTickPacket): boolean {
     let selfUpdated = false;
@@ -4020,12 +4083,14 @@ export class Client extends EventEmitter {
               },
             });
           }
-          this.rebaseToAuthoritativePosition(serverPosition, now);
           if (hadLocalPosition) {
-            console.warn(
-              `${this.tag} movement desynced by ${drift.toFixed(2)} tiles; `
-                + `rebasing to server position before the next MOVE`,
-            );
+            this.pendingAuthoritativeRebase = {
+              position: serverPosition,
+              now,
+              drift,
+            };
+          } else {
+            this.rebaseToAuthoritativePosition(serverPosition, now);
           }
         }
         this.player = processObjectStatus(status, this.player);
@@ -4470,6 +4535,10 @@ export class Client extends EventEmitter {
       // as well as server state so SDK reads and the viewer move immediately.
       const previousPosition = this.posKnown ? { ...this.pos } : null;
       const now = this.time();
+      this.pendingAuthoritativeRebase = undefined;
+      this.lastSentMovePosition = { ...position };
+      this.lastSentMoveAt = now;
+      this.lastSentMoveSpeed = movementSpeed(this.movementSnapshot());
       this.serverPos = { ...position };
       if (this.dodgeDiagnosticsEnabled) {
         this.emitDodgeDiagnostic({
