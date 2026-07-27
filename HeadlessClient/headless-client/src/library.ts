@@ -128,6 +128,14 @@ export {
   SYNC_PATH_SEARCH_BUDGET,
 } from './explorative-pathfinder';
 export { ProdMafiaAutoDodgeController } from './prodmafia-auto-dodge';
+export { ProdMafiaAutoPlayController } from './prodmafia-autoplay';
+export type {
+  ProdMafiaAutoPlayDecision,
+  ProdMafiaAutoPlayNavigationMode,
+  ProdMafiaAutoPlayObject,
+  ProdMafiaAutoPlayOptions,
+  ProdMafiaAutoPlaySnapshot,
+} from './prodmafia-autoplay';
 export {
   ProdMafiaPathfinder,
   PROD_MAFIA_MAX_LOCAL_GOAL_DISTANCE,
@@ -152,7 +160,11 @@ export type {
   PathSearchStepBudget,
   PathTarget,
 } from './explorative-pathfinder';
-export { AutoCombatController } from './auto-combat';
+export {
+  AutoCombatController,
+  PRODMAFIA_AUTO_ABILITY_DEFAULTS,
+  TOMB_BOSS_CYCLE,
+} from './auto-combat';
 export type {
   AutoAbilityOptions,
   AutoAimMode,
@@ -160,7 +172,114 @@ export type {
   AutoCombatActions,
   AutoCombatSnapshot,
   AutoCombatState,
+  TombBossPhase,
 } from './auto-combat';
+export {
+  AutoConsumablesController,
+  DEFAULT_AUTO_CONSUMABLES,
+  HP_POTION_TYPES,
+  LIFE_MANA_POTION_TYPES,
+  MP_DRINK_TYPES,
+  MP_POTION_TYPES,
+  RAINBOW_POTION_TYPES,
+  potionStatType,
+  shouldDrinkStatPotion,
+} from './auto-consumables';
+export type {
+  AutoConsumablesActions,
+  AutoConsumablesBag,
+  AutoConsumablesOptions,
+  AutoConsumablesQuickSlot,
+  AutoConsumablesSnapshot,
+  AutoConsumablesState,
+  PotionStat,
+  PotionStatSnapshot,
+} from './auto-consumables';
+export {
+  ABILITY_SLOT_TYPES,
+  ARMOR_SLOT_TYPES,
+  AutoLootController,
+  DEFAULT_AUTO_LOOT,
+  DEFAULT_AUTO_LOOT_INCLUDES,
+  PET_STONE_TYPES,
+  RING_SLOT_TYPE,
+  TIER_OPTION_OFF,
+  WEAPON_SLOT_TYPES,
+  autoLootBagTier,
+  isDesiredLoot,
+  isDesiredPotion,
+  itemCatalogLootData,
+} from './auto-loot';
+export type {
+  AutoLootAction,
+  AutoLootActions,
+  AutoLootBag,
+  AutoLootBlockReason,
+  AutoLootDataProvider,
+  AutoLootItemInfo,
+  AutoLootOptions,
+  AutoLootQuickSlot,
+  AutoLootSnapshot,
+  AutoLootState,
+} from './auto-loot';
+export {
+  BossPhaseTracker,
+  CLOTH_BAZAAR_MAP,
+  CLOTH_BAZAAR_PHASE,
+  PERSISTENT_PHASE_NAMES,
+  SERVER_MESSAGE_STARS,
+  TIMER_PHASES,
+  autoResponderReply,
+  bossPhaseForText,
+  getSplinterReply,
+  isServerDialogue,
+} from './boss-dialogue';
+export type { BossPhase, BossPhaseSnapshot, DialogueMessage } from './boss-dialogue';
+export {
+  DEFAULT_PORTAL_AUTO_ENTER,
+  PORTAL_OBJECT_TYPES,
+  PortalAutoEnterController,
+  isAutoEnterCandidate,
+  isDungeonWhitelisted,
+  isHubPortal,
+  looksLikePortal,
+  normalizeDungeonName,
+  parseDungeonWhitelist,
+} from './portal-automation';
+export type {
+  PortalAutoEnterDecision,
+  PortalAutoEnterOptions,
+  PortalAutoEnterSnapshot,
+  PortalCandidate,
+} from './portal-automation';
+export {
+  portalCandidates,
+  portalNameCatalog,
+  resolveObjectName,
+  setPortalNameCatalog,
+} from './portal-lookup';
+export {
+  DEFAULT_FOLLOW_OPTIONS,
+  FollowController,
+  anchorTeleportCommand,
+  selectClosestPlayerTeleport,
+  selectQuestTeleportTarget,
+} from './follow-controller';
+export type {
+  FollowDecision,
+  FollowOptions,
+  FollowPlayer,
+  FollowSnapshot,
+  PlayerTeleportSelection,
+  QuestTeleportSelection,
+} from './follow-controller';
+export {
+  VAULT_SWEEP_STAGGER_MS,
+  planVaultDepositAll,
+} from './inventory';
+export type { VaultSweepStep } from './inventory';
+export { ItemCatalog, loadItemCatalog } from './item-metadata';
+export type { ItemInfo, ItemRef, PlayerStatMaximums } from './item-metadata';
 export {
   AcceptTradePacket,
   CancelTradePacket,

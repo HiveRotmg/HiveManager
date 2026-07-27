@@ -41,6 +41,37 @@ export interface AutoDodgeOptions {
     safeWalk?: boolean;
 }
 
+/** ProdMafia Auto Play switches exposed by GameSprite's Auto Play panel. */
+export interface ProdMafiaAutoPlayOptions {
+    dungeons?: boolean;
+    stopAtVisibleQuest?: boolean;
+    collectSoulbound?: boolean;
+    smartSpacing?: boolean;
+    nexusRecovery?: boolean;
+    autoAim?: boolean;
+    autoAbility?: boolean;
+}
+
+export type ProdMafiaAutoPlayNavigationMode = 'stop' | 'direct' | 'path';
+
+export interface ProdMafiaAutoPlayState {
+    enabled: boolean;
+    state: string;
+    navigationMode: ProdMafiaAutoPlayNavigationMode;
+    target: { x: number; y: number } | null;
+    targetObjectId: number | null;
+    arriveThreshold: number;
+    allowWallEscape: boolean;
+    usePortalObjectId: number | null;
+    teleportObjectId: number | null;
+    nexus: boolean;
+    autoAim: boolean;
+    autoAbility: boolean;
+    combatTargetObjectId: number | null;
+    reconnectServerHost: string | null;
+    movementSpeedScale: number;
+}
+
 export interface AutoDodgeState {
     enabled: boolean;
     overrideActive: boolean;
@@ -128,6 +159,36 @@ export interface CombatPathfindingOptions {
 }
 
 export interface CombatNavigationOptions extends CombatPathfindingOptions, AutoDodgeOptions {}
+
+/** Options for `Walking.followPlayer`. */
+export interface PlayerFollowOptions {
+    /** Distance in tiles at which the follower stops closing in. Defaults to 1.5. */
+    arriveThreshold?: number;
+    /**
+     * Teleport to the followed player once they are this many tiles away.
+     * Requires a map that permits teleporting. Defaults to 10.
+     */
+    teleportDistance?: number;
+    /** Minimum gap between follow teleports, in milliseconds. Defaults to 6000. */
+    teleportCooldownMs?: number;
+    /**
+     * When the followed player disappears while standing on a portal, take the
+     * same portal and keep following them on the other side. Defaults to false.
+     */
+    followIntoPortals?: boolean;
+}
+
+/**
+ * Outcome of `Walking.teleportToQuestPlayer`. `self_closest` means you are
+ * already the player nearest your quest, so nothing was sent.
+ */
+export type QuestTeleportOutcome =
+    | 'teleported'
+    | 'self_closest'
+    | 'no_quest'
+    | 'quest_not_visible'
+    | 'no_players'
+    | 'not_allowed';
 
 /**
  * A Realm teleport-beacon destination. Canonical region names and common
@@ -268,7 +329,36 @@ export class Walking {
         throw new Error('Must be run inside Hive client');
     }
 
-    static followPlayer(name: string): boolean {
+    /**
+     * Continuously follow a visible player by exact or partial name. With
+     * `followIntoPortals` the follower also takes the portal the target vanishes
+     * on, and with `teleportDistance` it teleports instead of walking when it
+     * falls too far behind.
+     */
+    static followPlayer(name: string, options?: PlayerFollowOptions): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Name of the anchored player used by `anchorTeleport`, or `''` when unset. */
+    static getAnchor(): string {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Anchors a player by name so `anchorTeleport` can teleport to them later. */
+    static setAnchor(name: string): string {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /**
+     * Teleport to the anchored player. Sends the `/teleport <name>` chat command,
+     * so it works even when the anchor is off-screen.
+     */
+    static anchorTeleport(): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Teleport to the visible player closest to your current quest. */
+    static teleportToQuestPlayer(): QuestTeleportOutcome {
         throw new Error('Must be run inside Hive client');
     }
 
@@ -307,6 +397,23 @@ export class Walking {
     }
 
     static getAutoDodgeState(): AutoDodgeState | null {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    /** Enable the engine-side exact ProdMafia Auto Play controller. */
+    static enableProdMafiaAutoPlay(options?: ProdMafiaAutoPlayOptions): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static disableProdMafiaAutoPlay(): void {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static isProdMafiaAutoPlayEnabled(): boolean {
+        throw new Error('Must be run inside Hive client');
+    }
+
+    static getProdMafiaAutoPlayState(): ProdMafiaAutoPlayState {
         throw new Error('Must be run inside Hive client');
     }
 

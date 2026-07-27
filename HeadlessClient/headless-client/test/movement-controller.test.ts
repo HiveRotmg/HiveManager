@@ -65,6 +65,86 @@ test('MovementController waits for authoritative position before confirming a wa
   assert.equal(movement.hasTarget(), false);
 });
 
+test('MovementController confirms arrival from local prediction while integrating locally', () => {
+  const movement = new MovementController();
+  movement.setTarget({ x: 1, y: 0 }, 0.1);
+
+  const update = movement.update(
+    {
+      localPos: { x: 0, y: 0 },
+      serverPos: { x: 0, y: 0 },
+      playerSpeed: 75,
+      playerSpeedBoost: 0,
+    },
+    1000,
+    { integrateFromLocal: true },
+  );
+  assert.deepEqual(update.pos, { x: 1, y: 0 });
+  assert.deepEqual(update.reached, { x: 1, y: 0 });
+  assert.equal(movement.hasTarget(), false);
+});
+
+test('MovementController keeps steering from local prediction when server lags behind the waypoint', () => {
+  const movement = new MovementController();
+  movement.setTarget({ x: 2, y: 0 }, 0.35);
+
+  const velocity = movement.getIntendedVelocity(
+    {
+      localPos: { x: 1.1, y: 0 },
+      serverPos: { x: 0.5, y: 0 },
+      playerSpeed: 75,
+      playerSpeedBoost: 0,
+    },
+    true,
+  );
+  assert.ok(velocity.x > 0);
+  assert.equal(velocity.y, 0);
+});
+
+test('MovementController follows successive path waypoints without zero-velocity gaps', () => {
+  const movement = new MovementController();
+  let pos = { x: 0.5, y: 0.5 };
+  const waypoints = [
+    { x: 1.5, y: 0.5 },
+    { x: 2.5, y: 0.5 },
+    { x: 3.5, y: 0.5 },
+  ];
+  let waypointIndex = 0;
+  movement.setTarget(waypoints[0]!, 0);
+
+  const displacements: number[] = [];
+  for (let frame = 0; frame < 120; frame++) {
+    while (
+      waypointIndex < waypoints.length
+      && Math.hypot(pos.x - waypoints[waypointIndex]!.x, pos.y - waypoints[waypointIndex]!.y) <= Math.sqrt(0.20)
+    ) {
+      waypointIndex++;
+      if (waypointIndex < waypoints.length) {
+        movement.setTarget(waypoints[waypointIndex]!, 0);
+      } else {
+        movement.clear();
+      }
+    }
+    if (!movement.hasTarget()) break;
+    const before = { ...pos };
+    const update = movement.update(
+      {
+        localPos: pos,
+        serverPos: { x: pos.x - 0.4, y: pos.y },
+        playerSpeed: 75,
+        playerSpeedBoost: 0,
+      },
+      16,
+      { integrateFromLocal: true },
+    );
+    pos = update.pos;
+    displacements.push(Math.hypot(pos.x - before.x, pos.y - before.y));
+  }
+
+  assert.ok(pos.x > 3.0, `expected to progress past x=3, got ${pos.x}`);
+  assert.equal(displacements.some((distance) => distance < 1e-6), false);
+});
+
 test('MovementController applies a local dodge velocity without clearing navigation intent', () => {
   const movement = new MovementController();
   movement.setTarget({ x: 10, y: 0 }, 0.1);

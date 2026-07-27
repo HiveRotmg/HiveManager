@@ -126,6 +126,11 @@ export type {
   NavigationOptions,
   NavigationState,
   NavigationStatus,
+  PlayerFollowOptions,
+  ProdMafiaAutoPlayNavigationMode,
+  ProdMafiaAutoPlayOptions,
+  ProdMafiaAutoPlayState,
+  QuestTeleportOutcome,
   TeleportBeaconDestination,
 } from './walking/Walking';
 export { Combat } from './combat/Combat';

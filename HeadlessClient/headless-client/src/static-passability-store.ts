@@ -16,6 +16,34 @@ import type {
 
 const INVALID_TILE_TYPE = 0xffff;
 
+/**
+ * Cost of hazardous-but-walkable ground under the `cost` hazard-traversal policy,
+ * expressed in extra tile-steps so it adds directly to a route length.
+ *
+ * ProdMafia has no equivalent — `apBuildPath` is an unweighted BFS — so these are
+ * our numbers. tiles.xml damage runs 20 (Puke Water) to 115 (LH Void Pure Evil
+ * Depths) across 185 walkable damaging types, and the ratio between the extremes
+ * is under 6x, so a fixed part plus a damage-proportional part orders them more
+ * usefully than pure proportionality: the fixed part says "taking a damage tick
+ * at all is bad", the proportional part says "taking 115 is much worse than 20".
+ *
+ * Absolute calibration is deliberately low-stakes. Both pathfinders search with
+ * hazards blocked first and only fall back to `cost`, so these weights order
+ * hazardous routes against each other and never against a dry route.
+ */
+const HAZARD_BASE_PENALTY = 8;
+/** Damage that adds one more {@link HAZARD_BASE_PENALTY} (the commonest value). */
+const HAZARD_DAMAGE_REFERENCE = 25;
+/** `<Sink />` water with no damage: mildly undesirable, far cheaper than lava. */
+const SINK_PENALTY = 2;
+/**
+ * `<Sinking />` tiles decay to 0.1x speed over 18 moves, and the level depends on
+ * how long the body has already been on them. Nine is the midpoint estimate.
+ */
+const SINKING_ESTIMATE_LEVEL = 9;
+/** Slow ground costs the extra time it takes to cross, capped at the 0.1x floor. */
+const MAX_SLOW_GROUND_PENALTY = 9;
+
 interface StoredObjectRecord {
   key: string;
   occupySquare: boolean;
@@ -48,8 +76,14 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
   private revision = 0;
   private explorativeUnknown = false;
   private readonly useInflatedPassability: boolean;
-  /** Pathfinding: observed blocking terrain (unknown cells are absent). */
+  /** Pathfinding: observed impassable geometry — invalid tiles and `<NoWalk />`. */
   private readonly blockedTerrain = new Set<string>();
+  /**
+   * Pathfinding: observed damaging floors. Kept separate from
+   * {@link blockedTerrain} so a `cost` hazard query can traverse them while the
+   * default `block` query still treats them as walls.
+   */
+  private readonly damagingTerrain = new Set<string>();
   /** Dodge: observed tile types for unresolved-tile handling. */
   private readonly tileTypes = new Map<string, number>();
   private readonly learnedBlocked = new Set<string>();
@@ -117,8 +151,10 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
     if (!this.inBounds(tileX, tileY)) return true;
 
     const key = tileKey(tileX, tileY);
+    const traverseHazards = query.hazardTraversal === 'cost';
     if (query.consumer === 'pathfinding') {
       return this.blockedTerrain.has(key)
+        || !traverseHazards && this.damagingTerrain.has(key)
         || this.learnedBlocked.has(key)
         || (this.occupyCounts.get(key) ?? 0) > 0;
     }
@@ -131,10 +167,57 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
     if (type === undefined && !allowUnknown) return true;
     if (this.learnedBlocked.has(key)) return true;
     if (type !== undefined && !!this.data?.tileIsBlockingWalk?.(type)) return true;
-    if (type !== undefined && query.safeWalk && (this.data?.getTileDamage?.(type) ?? 0) > 0) {
+    // safeWalk avoids hazardous ground; hazardTraversal 'cost' overrides that so
+    // navigation can price a crossing instead of failing outright. Dodge never
+    // sets hazardTraversal, so its safeWalk semantics are unchanged.
+    const avoidHazards = !!query.safeWalk && !traverseHazards;
+    if (type !== undefined && avoidHazards && (this.data?.getTileDamage?.(type) ?? 0) > 0) {
+      return true;
+    }
+    // `<Sink />` is walkable in ProdMafia (Square.as:154-156 tests noWalk_ only);
+    // it is a preference, not geometry, so it belongs on the safeWalk policy next
+    // to damaging ground rather than in tileIsBlockingWalk.
+    if (type !== undefined && avoidHazards && !!this.data?.tileIsSink?.(type)) {
       return true;
     }
     return (this.occupyCounts.get(key) ?? 0) > 0;
+  }
+
+  /** Extra tile-steps for entering this tile; 0 for ordinary dry ground. */
+  getTileTraversalPenalty(tileX: number, tileY: number): number {
+    const type = this.tileTypes.get(tileKey(Math.trunc(tileX), Math.trunc(tileY)));
+    if (type === undefined || type === INVALID_TILE_TYPE) return 0;
+    return this.tileTypeTraversalPenalty(type);
+  }
+
+  private tileTypeTraversalPenalty(type: number): number {
+    const data = this.data;
+    if (!data) return 0;
+    let penalty = 0;
+    const damage = data.getTileDamage?.(type) ?? 0;
+    if (damage > 0) {
+      penalty += HAZARD_BASE_PENALTY * (1 + damage / HAZARD_DAMAGE_REFERENCE);
+    } else if (data.tileIsSink?.(type)) {
+      penalty += SINK_PENALTY;
+    }
+    const speed = this.estimatedTileSpeed(type);
+    if (speed > 0 && speed < 1) {
+      penalty += Math.min(MAX_SLOW_GROUND_PENALTY, 1 / speed - 1);
+    }
+    return penalty;
+  }
+
+  /**
+   * Speed multiplier a route planner should assume for the tile. `<Sinking />`
+   * ground is sampled mid-decay because its real multiplier depends on how many
+   * moves the body has already spent on it, which a static plan cannot know.
+   */
+  private estimatedTileSpeed(type: number): number {
+    const data = this.data;
+    if (data?.tileIsSinking?.(type) && data.getSinkingSpeedMultiplier) {
+      return data.getSinkingSpeedMultiplier(type, SINKING_ESTIMATE_LEVEL);
+    }
+    return data?.getTileSpeed?.(type) ?? 1;
   }
 
   private isInflatedBlockedAt(px: number, py: number): boolean {
@@ -212,6 +295,10 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
   private collectObstacleTiles(): Set<string> {
     const obstacles = new Set<string>();
     for (const key of this.blockedTerrain) obstacles.add(key);
+    // Damaging ground stays an inflation source. Inflation is a clearance margin
+    // for the default `block` policy; letting a `cost` query walk *up to* a lava
+    // edge is handled by the penalty, not by shrinking the margin.
+    for (const key of this.damagingTerrain) obstacles.add(key);
     for (const key of this.learnedBlocked) obstacles.add(key);
     for (const [key, count] of this.occupyCounts) {
       if (count > 0) obstacles.add(key);
@@ -276,13 +363,18 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
 
     if (query.checkFullOccupyNeighbors === false) return true;
 
+    // ProdMafia Player.isValidPosition / Map.canOccupyForDodge default hitbox is
+    // 92% of a tile (half-extent 0.46). Using 0.5 made every approach to a tile
+    // midline check an extra neighbor and park movement on half-tile boundaries.
     const fracX = x - tileX;
     const fracY = y - tileY;
     const allowUnknown = query.allowUnknown ?? this.explorativeUnknown;
-    const minX = fracX < 0.5 ? tileX - 1 : tileX;
-    const maxX = fracX > 0.5 ? tileX + 1 : tileX;
-    const minY = fracY < 0.5 ? tileY - 1 : tileY;
-    const maxY = fracY > 0.5 ? tileY + 1 : tileY;
+    const collisionHalfSize = 0.46;
+    const collisionUpperBound = 1 - collisionHalfSize;
+    const minX = fracX < collisionHalfSize ? tileX - 1 : tileX;
+    const maxX = fracX > collisionUpperBound ? tileX + 1 : tileX;
+    const minY = fracY < collisionHalfSize ? tileY - 1 : tileY;
+    const maxY = fracY > collisionUpperBound ? tileY + 1 : tileY;
     for (let neighborX = minX; neighborX <= maxX; neighborX++) {
       for (let neighborY = minY; neighborY <= maxY; neighborY++) {
         if (neighborX === tileX && neighborY === tileY) continue;
@@ -305,6 +397,7 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
     this.height = 0;
     this.explorativeUnknown = false;
     this.blockedTerrain.clear();
+    this.damagingTerrain.clear();
     this.tileTypes.clear();
     this.learnedBlocked.clear();
     this.objectTiles.clear();
@@ -332,9 +425,11 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
     const nextType = Math.trunc(tileType);
 
     const blocked = nextType === INVALID_TILE_TYPE
-      || !!this.data?.tileIsBlockingWalk?.(nextType)
-      || (this.data?.getTileDamage?.(nextType) ?? 0) > 0;
+      || !!this.data?.tileIsBlockingWalk?.(nextType);
+    const damaging = !blocked && (this.data?.getTileDamage?.(nextType) ?? 0) > 0;
     let changed = blocked ? addToSet(this.blockedTerrain, key) : this.blockedTerrain.delete(key);
+    changed = (damaging ? addToSet(this.damagingTerrain, key) : this.damagingTerrain.delete(key))
+      || changed;
 
     if (this.tileTypes.get(key) !== nextType) {
       this.tileTypes.set(key, nextType);

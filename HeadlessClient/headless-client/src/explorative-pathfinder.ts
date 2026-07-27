@@ -8,6 +8,7 @@ import { isEnemyProximityThreat, staticMovementProfile } from './dodge-collision
 import type { DodgeMovementIntentId } from './dodge-movement-intent';
 import {
   PASSABILITY_SCHEMA_VERSION,
+  type HazardTraversalPolicy,
   type StaticPassabilityStore,
 } from './static-passability-model';
 import { createStaticPassabilityStore } from './static-passability-store';
@@ -27,6 +28,12 @@ export interface PathfindingDataProvider {
   getProjectile?(objectType: number, projectileId: number): unknown;
   tileIsBlockingWalk?(tileType: number): boolean;
   getTileDamage?(tileType: number): number | undefined;
+  /** `<Sink />` water/lava. Walkable; only the safeWalk policy avoids it. */
+  tileIsSink?(tileType: number): boolean;
+  /** `<Sinking />` quicksand/honey. Walkable, but decays movement speed. */
+  tileIsSinking?(tileType: number): boolean;
+  getTileSpeed?(tileType: number): number;
+  getSinkingSpeedMultiplier?(tileType: number, sinkLevel: number): number;
 }
 
 export interface PathPoint {
@@ -71,6 +78,8 @@ interface PlannedPath {
   targetBlocked: boolean;
   combat: boolean;
   revision: number;
+  /** `cost` when this route was only reachable by crossing hazardous ground. */
+  hazardTraversal: HazardTraversalPolicy;
 }
 
 interface NoPathCacheEntry {
@@ -125,6 +134,14 @@ const DIRECTIONS: ReadonlyArray<readonly [number, number, number]> = [
 /**
  * Optimistic A* navigation over the map knowledge streamed by UPDATE packets.
  * Unknown cells have exactly the same traversal cost as observed walkable cells.
+ *
+ * Hazardous ground (damaging floors, `<Sink />` water/lava) is searched in two
+ * tiers. The first tier treats it as impassable, which is the historical behavior
+ * and therefore returns the historical route whenever a dry one exists. Only when
+ * that tier proves no dry route exists does the search re-run with hazards
+ * traversable at the cost reported by
+ * {@link StaticPassabilityStore.getTileTraversalPenalty}, so a lava crossing is a
+ * last resort and the cheapest such crossing wins.
  */
 export class ExplorativePathfinder {
   private readonly staticPassability: StaticPassabilityStore;
@@ -151,6 +168,12 @@ export class ExplorativePathfinder {
   private goalSearchAttempts: GridPoint[][] | undefined;
   private goalSearchAttemptIndex = 0;
   private goalSearchSessionKey: string | undefined;
+  /** Hazard policy of the planning operation in flight; see the class comment. */
+  private hazardTraversal: HazardTraversalPolicy = 'block';
+  /** Tier the current goal-search session has escalated to. */
+  private goalSearchHazardTraversal: HazardTraversalPolicy = 'block';
+  private pendingHazardTraversal: HazardTraversalPolicy = 'block';
+  private hazardEscalationEnabled = true;
 
   constructor(
     private readonly data?: PathfindingDataProvider,
@@ -297,7 +320,7 @@ export class ExplorativePathfinder {
     if (!active || active.search.getStatus() !== 'searching') return false;
     return active.start.x === start.x
       && active.start.y === start.y
-      && active.goalKey === goalsKey(goals)
+      && active.goalKey.endsWith(`|${goalsKey(goals)}`)
       && active.mapVersion === this.revision;
   }
 
@@ -541,22 +564,26 @@ export class ExplorativePathfinder {
     const sessionKey = this.planSearchSessionKey(start, target);
     if (this.goalSearchSessionKey !== sessionKey) {
       this.goalSearchSessionKey = sessionKey;
+      this.goalSearchHazardTraversal = 'block';
+      this.hazardTraversal = 'block';
       this.goalSearchAttempts = this.resolveGoalSearchAttempts(start, target);
       this.goalSearchAttemptIndex = 0;
       this.pendingRawTiles = undefined;
       this.cancelPathSearch();
     }
+    this.hazardTraversal = this.goalSearchHazardTraversal;
 
-    const attempts = this.goalSearchAttempts;
-    if (!attempts || attempts.length === 0) {
+    if (!this.goalSearchAttempts || this.goalSearchAttempts.length === 0) {
+      if (this.escalateGoalSearchHazards(start, target)) return 'searching';
       this.lastSearchOpenSetExhausted = true;
       return 'no_path';
     }
 
-    while (this.goalSearchAttemptIndex < attempts.length) {
-      const goals = attempts[this.goalSearchAttemptIndex]!;
+    while (this.goalSearchAttemptIndex < this.goalSearchAttempts.length) {
+      const goals = this.goalSearchAttempts[this.goalSearchAttemptIndex]!;
       if (goals.length === 0) {
         this.pendingRawTiles = [];
+        this.pendingHazardTraversal = this.goalSearchHazardTraversal;
         return 'found';
       }
 
@@ -567,23 +594,52 @@ export class ExplorativePathfinder {
       }
       if (status === 'found') {
         this.pendingRawTiles = handle.getPath() ? [...handle.getPath()!] : [];
+        this.pendingHazardTraversal = this.goalSearchHazardTraversal;
         return 'found';
       }
 
       this.lastSearchOpenSetExhausted = handle.wasOpenSetExhausted();
       this.goalSearchAttemptIndex++;
-      if (this.goalSearchAttemptIndex >= attempts.length) {
+      if (this.goalSearchAttemptIndex >= this.goalSearchAttempts.length) {
+        // Yield instead of running the hazard tier in the same tick: a tick that
+        // already burned its search budget on every dry attempt must not then pay
+        // for a second full round and stall the 16 ms frame timer.
+        if (this.escalateGoalSearchHazards(start, target)) return 'searching';
         this.clearGoalSearchSession();
         return 'no_path';
       }
     }
 
+    if (this.escalateGoalSearchHazards(start, target)) return 'searching';
     this.clearGoalSearchSession();
     return 'no_path';
   }
 
+  /**
+   * Re-opens the goal search with hazardous ground priced instead of walled.
+   * Returns false when the session has already escalated, escalation is disabled,
+   * or no goal is reachable even with hazards allowed.
+   */
+  private escalateGoalSearchHazards(start: GridPoint, target: PathTarget): boolean {
+    if (!this.hazardEscalationEnabled || this.goalSearchHazardTraversal === 'cost') {
+      return false;
+    }
+    this.goalSearchHazardTraversal = 'cost';
+    this.hazardTraversal = 'cost';
+    this.goalSearchAttempts = this.resolveGoalSearchAttempts(start, target);
+    this.goalSearchAttemptIndex = 0;
+    this.pendingRawTiles = undefined;
+    this.cancelPathSearch();
+    if (this.goalSearchAttempts.length === 0) return false;
+    this.lastSearchOpenSetExhausted = false;
+    return true;
+  }
+
   private consumePendingPlan(position: PathPoint, target: PathTarget): PlannedPath | undefined {
     const rawTiles = this.pendingRawTiles;
+    // Route smoothing and corridor tracing must use the same passability the
+    // search did, or a hazard route is rejected the moment it is pulled taut.
+    this.hazardTraversal = this.pendingHazardTraversal;
     this.clearGoalSearchSession();
     if (rawTiles === undefined) return undefined;
     return this.assemblePlan(position, target, rawTiles);
@@ -593,12 +649,16 @@ export class ExplorativePathfinder {
     this.goalSearchSessionKey = undefined;
     this.goalSearchAttempts = undefined;
     this.goalSearchAttemptIndex = 0;
+    this.goalSearchHazardTraversal = 'block';
     this.pendingRawTiles = undefined;
   }
 
   private planSearchSessionKey(start: GridPoint, target: PathTarget): string {
     if (this.combatRange) {
-      const goals = this.combatGoals(target, start, this.combatRange);
+      // Always keyed off the hazard-free goal set: the key identifies the planning
+      // request, and letting the escalated tier change it would reset the session
+      // back to tier one every tick.
+      const goals = this.combatGoals(target, start, this.combatRange, 'block');
       return `${tileKey(start.x, start.y)}|combat:${goalsKey(goals)}|${this.revision}`;
     }
     return `${tileKey(start.x, start.y)}|goal:${Math.floor(target.x)},${Math.floor(target.y)}|${this.revision}`;
@@ -606,7 +666,7 @@ export class ExplorativePathfinder {
 
   private resolveGoalSearchAttempts(start: GridPoint, target: PathTarget): GridPoint[][] {
     if (this.combatRange) {
-      const goals = this.combatGoals(target, start, this.combatRange);
+      const goals = this.combatGoals(target, start, this.combatRange, this.hazardTraversal);
       return goals.length > 0 ? [goals] : [];
     }
 
@@ -676,6 +736,7 @@ export class ExplorativePathfinder {
     target: PathPoint,
     start: GridPoint,
     range: CombatPathfindingRange,
+    hazard: HazardTraversalPolicy,
   ): GridPoint[] {
     const goals: Array<GridPoint & { preference: number }> = [];
     const minX = Math.floor(target.x - range.maximumDistance - 0.5);
@@ -688,7 +749,7 @@ export class ExplorativePathfinder {
         const center = tileCenter({ x, y });
         const targetDistance = distance(center, target);
         if (targetDistance < range.minimumDistance || targetDistance > range.maximumDistance
-          || this.isPathBlocked(x, y, start)) {
+          || this.isPathBlocked(x, y, start, hazard)) {
           continue;
         }
         goals.push({ x, y, preference: Math.abs(targetDistance - range.preferredDistance) });
@@ -858,7 +919,10 @@ export class ExplorativePathfinder {
     start: GridPoint,
     goals: ReadonlyArray<GridPoint>,
   ): PathSearch {
-    const goalKey = goalsKey(goals);
+    const hazard = this.hazardTraversal;
+    // The tier is part of the search identity: a hazard-free search in flight must
+    // never be resumed as the escalated one, and vice versa.
+    const goalKey = `${hazard}|${goalsKey(goals)}`;
     const mapVersion = this.revision;
     const active = this.activePathSearch;
     if (active
@@ -873,8 +937,12 @@ export class ExplorativePathfinder {
     const search = new PathSearch({
       start,
       goals,
-      isPathBlocked: (x, y, s) => this.isPathBlocked(x, y, s),
+      isPathBlocked: (x, y, s) => this.isPathBlocked(x, y, s, hazard),
       mapVersion,
+      // Tier one pays nothing for the hook it does not need.
+      tileEntryPenalty: hazard === 'cost'
+        ? (x, y) => this.staticPassability.getTileTraversalPenalty(x, y)
+        : undefined,
     });
     this.activePathSearch = { search, start: { ...start }, goalKey, mapVersion };
     return search;
@@ -890,15 +958,26 @@ export class ExplorativePathfinder {
     return this.activePathSearch?.search === search;
   }
 
-  private isBlocked(x: number, y: number, start?: GridPoint): boolean {
+  private isBlocked(
+    x: number,
+    y: number,
+    start?: GridPoint,
+    hazard: HazardTraversalPolicy = this.hazardTraversal,
+  ): boolean {
     return this.staticPassability.isTileStaticallyBlocked(x, y, {
       consumer: 'pathfinding',
       exemptTile: start,
+      hazardTraversal: hazard,
     });
   }
 
-  private isPathBlocked(x: number, y: number, start?: GridPoint): boolean {
-    if (this.isBlocked(x, y, start)) return true;
+  private isPathBlocked(
+    x: number,
+    y: number,
+    start?: GridPoint,
+    hazard: HazardTraversalPolicy = this.hazardTraversal,
+  ): boolean {
+    if (this.isBlocked(x, y, start, hazard)) return true;
     if (!this.combatRange || !this.target || start && x === start.x && y === start.y) return false;
     const point = tileCenter({ x, y });
     const startPoint = start ? tileCenter(start) : undefined;

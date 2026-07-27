@@ -2,7 +2,7 @@ import { Position } from '../types/world/Position';
 import { Enemy } from '../types/entities/Enemy';
 
 export type CombatAimTarget = number | { objectId: number };
-export type AutoAimMode = 'closest' | 'closestToAim' | 'maxHp' | 'lowestHp' | 'random';
+export type AutoAimMode = 'closest' | 'closestToAim' | 'maxHp' | 'random';
 
 export interface AutoAimOptions {
     mode?: AutoAimMode;

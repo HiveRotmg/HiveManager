@@ -136,6 +136,8 @@ export interface ObjectDef {
   isContainer: boolean;
   /** True when the object XML contains `<Loot />` (dropped bags/stashes). */
   isLoot: boolean;
+  /** True when the object XML contains `<Static />`. */
+  static: boolean;
   /** Raw `<Tier>` text from objects.xml (numeric tier, UT, ST, …). */
   tierStr: string;
   /** Player-class inventory slot types from `<SlotTypes>`. */
@@ -258,9 +260,27 @@ function rotmgSlotTypeToSdkItemSlotType(slotType: number): Item['slotType'] {
   return 'consumable';
 }
 
+/** ProdMafia `Parameters.as:132` — `MAX_SINK_LEVEL`, the sinking decay denominator. */
+export const MAX_SINK_LEVEL = 18;
+
+/**
+ * ProdMafia `Player.as:1264-1265` scales the raw `<Animate dx/dy>` by this to get
+ * the per-millisecond push velocity applied to the player's move vector.
+ */
+export const TILE_PUSH_VELOCITY_SCALE = 0.001;
+
 export interface TilePushVector {
+  /** Unit push direction on X, already sign-inverted like ProdMafia's `-= dx_`. */
   dx: number;
+  /** Unit push direction on Y, already sign-inverted like ProdMafia's `-= dy_`. */
   dy: number;
+  /**
+   * Absolute `<Animate dx/dy>` magnitude from tiles.xml (1.5 - 3.0 in practice).
+   * ProdMafia applies `animate_.dx_ * 0.001` tiles/ms, so the magnitude is load
+   * bearing: a whirlpool at dx=2.5 pushes 0.0025 tiles/ms, about a quarter of a
+   * max-speed character. Absent for name-inferred vectors, where 1 is assumed.
+   */
+  magnitude?: number;
 }
 
 export interface EnchantmentDef {
@@ -573,6 +593,7 @@ export class GameDataLoader {
         isPlayer: obj.Player !== undefined,
         isContainer: obj.Container !== undefined,
         isLoot: obj.Loot !== undefined,
+        static: obj.Static !== undefined,
         tierStr: String(obj.Tier ?? '').trim(),
         slotTypes: typeof obj.SlotTypes === 'string'
           ? obj.SlotTypes.split(',').map((value: string) => Number(value.trim()))
@@ -924,11 +945,21 @@ export class GameDataLoader {
   private noWalkTileTypes = new Set<number>();
   /** Ground types with `<Sink />`. */
   private sinkTileTypes = new Set<number>();
+  /**
+   * Ground types with `<Sinking />` — a DISTINCT tag from `<Sink />`.
+   * ProdMafia `GroundProperties.as:99` parses it separately and `Player.as:4215`
+   * uses it to decay `moveMultiplier_` while the player stands on the tile.
+   */
+  private sinkingTileTypes = new Set<number>();
 
   /**
    * Parse tiles.xml and return tile walkability sets plus speed multipliers.
    * noWalkTiles:  tiles with <NoWalk /> — completely impassable
-   * sinkTiles:    tiles with <Sink />   — hazardous, also treated as impassable
+   * sinkTiles:    tiles with <Sink />   — walkable water/lava surfaces. ProdMafia
+   *               uses `sink_` ONLY for a projectile/render z-offset
+   *               (`Square.as:242`); `isWalkable()` never consults it.
+   * sinkingTiles: tiles with <Sinking /> — walkable, but progressively slow the
+   *               player (quicksand, honey). Distinct tag from <Sink />.
    * tileSpeedMap: tile type → speed multiplier (default 1.0 if no <Speed> tag)
    *               Values <1.0 = slower (quicksand, water floor), >1.0 = faster (pathways)
    * tileDamageMap: tile type → damage per tick (from MinDamage/MaxDamage, 0 if not damaging)
@@ -936,6 +967,7 @@ export class GameDataLoader {
   loadTiles(tilesXmlPath: string): {
     noWalkTiles:  Set<number>;
     sinkTiles:    Set<number>;
+    sinkingTiles: Set<number>;
     tileSpeedMap: Map<number, number>;
     tileDamageMap: Map<number, number>;
     tileSlideAmountMap: Map<number, number>;
@@ -944,6 +976,7 @@ export class GameDataLoader {
   } {
     const noWalkTiles  = new Set<number>();
     const sinkTiles    = new Set<number>();
+    const sinkingTiles = new Set<number>();
     this.tileSpeedMap = new Map<number, number>();
     this.tileNameMap = new Map<number, string>();
     this.tileTextureMap = new Map<number, TileTextureDef>();
@@ -993,8 +1026,9 @@ export class GameDataLoader {
           if (pushVector) this.tilePushVectorMap.set(type, pushVector);
         }
 
-        if (ground.NoWalk !== undefined) noWalkTiles.add(type);
-        if (ground.Sink   !== undefined) sinkTiles.add(type);
+        if (ground.NoWalk  !== undefined) noWalkTiles.add(type);
+        if (ground.Sink    !== undefined) sinkTiles.add(type);
+        if (ground.Sinking !== undefined) sinkingTiles.add(type);
         if (type === 254 || id.toLowerCase() === 'space') noWalkTiles.add(type);
 
         const speed = Number(ground.Speed ?? 0);
@@ -1034,14 +1068,16 @@ export class GameDataLoader {
 
     this.noWalkTileTypes = noWalkTiles;
     this.sinkTileTypes = sinkTiles;
+    this.sinkingTileTypes = sinkingTiles;
 
     Logger.log(
       'GameData',
-      `Tiles loaded - noWalk: ${noWalkTiles.size}, sink: ${sinkTiles.size}, speed variants: ${this.tileSpeedMap.size}, sliding: ${this.tileSlideAmountMap.size}, push: ${this.tilePushTypes.size}, push-vectors: ${this.tilePushVectorMap.size}, damaging: ${this.tileDamageMap.size}, damageAttrs: ${this.tileHasDamageAttrs.size}, conditionTiles: ${this.tileHasConditionEffect.size}`,
+      `Tiles loaded - noWalk: ${noWalkTiles.size}, sink: ${sinkTiles.size}, sinking: ${sinkingTiles.size}, speed variants: ${this.tileSpeedMap.size}, sliding: ${this.tileSlideAmountMap.size}, push: ${this.tilePushTypes.size}, push-vectors: ${this.tilePushVectorMap.size}, damaging: ${this.tileDamageMap.size}, damageAttrs: ${this.tileHasDamageAttrs.size}, conditionTiles: ${this.tileHasConditionEffect.size}`,
     );
     return {
       noWalkTiles,
       sinkTiles,
+      sinkingTiles,
       tileSpeedMap: this.tileSpeedMap,
       tileDamageMap: this.tileDamageMap,
       tileSlideAmountMap: this.tileSlideAmountMap,
@@ -1055,14 +1091,47 @@ export class GameDataLoader {
     return this.noWalkTileTypes.has(tileType);
   }
 
-  /** True when tiles.xml marks the type as Sink (hazardous / impassable for pathing). */
+  /**
+   * True when tiles.xml marks the type as `<Sink />` (water/lava surface).
+   *
+   * NOT a walkability test. ProdMafia reads `sink_` only to offset projectile and
+   * sprite z within the tile (`Square.as:242-243`); `Square.isWalkable()` consults
+   * `noWalk_` and object occupancy exclusively. Of 232 `<Sink />` ground types only
+   * 27 also carry `<NoWalk />`, so treating Sink as solid walled off 205 walkable
+   * types — the entire Abyssal Sanctuary floor, Moonlight Village water, and more.
+   * Consumers that want to avoid standing in water should gate this behind their
+   * own `safeWalk` policy, exactly as damaging ground is gated.
+   */
   tileIsSink(tileType: number): boolean {
     return this.sinkTileTypes.has(tileType);
   }
 
-  /** NoWalk, Sink, or otherwise blocking walk (matches pathfinding blocking tiles). */
+  /**
+   * True when tiles.xml marks the type as `<Sinking />` (quicksand, honey, venom).
+   * Walkable, but drags the player down — see {@link getSinkingSpeedMultiplier}.
+   */
+  tileIsSinking(tileType: number): boolean {
+    return this.sinkingTileTypes.has(tileType);
+  }
+
+  /**
+   * Impassable terrain, matching ProdMafia `Square.isWalkable()`
+   * (`Square.as:154-156`), which tests `noWalk_` only. `<Sink />` is deliberately
+   * excluded — see {@link tileIsSink}.
+   */
   tileIsBlockingWalk(tileType: number): boolean {
-    return this.noWalkTileTypes.has(tileType) || this.sinkTileTypes.has(tileType);
+    return this.noWalkTileTypes.has(tileType);
+  }
+
+  /**
+   * ProdMafia's sinking-tile speed decay (`Player.as:4215-4217`):
+   * `0.1 + (1 - sinkLevel / 18) * (speed - 0.1)`, with `sinkLevel` incremented
+   * once per MOVE (capped at {@link MAX_SINK_LEVEL}) and reset to 0 on leaving.
+   */
+  getSinkingSpeedMultiplier(tileType: number, sinkLevel: number): number {
+    const level = Math.min(MAX_SINK_LEVEL, Math.max(0, sinkLevel));
+    const speed = this.getTileSpeed(tileType);
+    return 0.1 + (1 - level / MAX_SINK_LEVEL) * (speed - 0.1);
   }
 
   /** Returns the movement speed multiplier for a tile type (1.0 if tile has no speed modifier). */
@@ -1102,6 +1171,19 @@ export class GameDataLoader {
   /** Returns the push vector for a tile type, or undefined if the tile does not push the player. */
   getTilePushVector(tileType: number): TilePushVector | undefined {
     return this.tilePushVectorMap.get(tileType);
+  }
+
+  /**
+   * Per-millisecond push velocity a `<Push />` tile adds to the player's move
+   * vector, mirroring ProdMafia `Player.as:1264-1265`
+   * (`moveVec_.x -= animate_.dx_ * 0.001`). Sign inversion already lives in the
+   * stored unit direction, so this multiplies rather than subtracts.
+   */
+  getTilePushVelocity(tileType: number): { dx: number; dy: number } | undefined {
+    const vector = this.tilePushVectorMap.get(tileType);
+    if (!vector) return undefined;
+    const scale = (vector.magnitude ?? 1) * TILE_PUSH_VELOCITY_SCALE;
+    return { dx: vector.dx * scale, dy: vector.dy * scale };
   }
 
   /** Returns true when the tile has a literal <Push /> tag in tiles.xml. */
@@ -1147,10 +1229,10 @@ export class GameDataLoader {
     const dx = Number(animate['@_dx'] ?? animate.dx);
     const dy = Number(animate['@_dy'] ?? animate.dy);
 
-    if (Number.isFinite(dx) && dx > 0) return { dx: -1, dy: 0 };
-    if (Number.isFinite(dx) && dx < 0) return { dx: 1, dy: 0 };
-    if (Number.isFinite(dy) && dy > 0) return { dx: 0, dy: -1 };
-    if (Number.isFinite(dy) && dy < 0) return { dx: 0, dy: 1 };
+    if (Number.isFinite(dx) && dx > 0) return { dx: -1, dy: 0, magnitude: dx };
+    if (Number.isFinite(dx) && dx < 0) return { dx: 1, dy: 0, magnitude: -dx };
+    if (Number.isFinite(dy) && dy > 0) return { dx: 0, dy: -1, magnitude: dy };
+    if (Number.isFinite(dy) && dy < 0) return { dx: 0, dy: 1, magnitude: -dy };
     return null;
   }
 
@@ -1232,6 +1314,7 @@ export class GameDataLoader {
     for (const t of this.tileHasConditionEffect) tileTypes.add(t);
     for (const t of this.noWalkTileTypes) tileTypes.add(t);
     for (const t of this.sinkTileTypes) tileTypes.add(t);
+    for (const t of this.sinkingTileTypes) tileTypes.add(t);
 
     const tiles: GameWikiTileRow[] = [];
     for (const type of tileTypes) {

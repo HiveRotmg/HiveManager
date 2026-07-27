@@ -3,10 +3,10 @@
  *
  * Step 4.1: types only. Implementation lands in 4.2; A* and dodge migration in 4.3/4.4.
  *
- * Scope: terrain, occupySquare/fullOccupy objects, learned blocks, map bounds.
+ * Scope: terrain, occupySquare/fullOccupy objects, learned blocks, map bounds,
+ * and the navigation hazard-traversal cost (see {@link HazardTraversalPolicy}).
  * Out of scope: combat enemy exclusion zones (see enemy-clearance-overlay.ts),
- * damaging-floor cost (dodge safeWalk is a query flag here), projectile segment cover
- * (DodgeCollisionWorld.isProjectilePathOpen).
+ * projectile segment cover (DodgeCollisionWorld.isProjectilePathOpen).
  */
 
 /** Integer tile coordinates on the map grid. */
@@ -32,7 +32,25 @@ export type StaticPassabilityConsumer = 'pathfinding' | 'dodge';
  * Bump when inflation, overlay, segment validation, or other shared predicates change
  * so long-lived pathfinder no-path cache entries self-invalidate on upgrade/revert.
  */
-export const PASSABILITY_SCHEMA_VERSION = 2;
+export const PASSABILITY_SCHEMA_VERSION = 3;
+
+/**
+ * How a navigation query treats hazardous-but-walkable ground — `<MinDamage>` /
+ * `<MaxDamage>` floors and `<Sink />` water/lava surfaces.
+ *
+ * - `block` (default): hazardous ground is impassable. This is the historical
+ *   behavior and stays the default so no caller silently starts routing through
+ *   lava.
+ * - `cost`: hazardous ground is passable and {@link
+ *   StaticPassabilityModel.getTileTraversalPenalty} reports what it costs.
+ *
+ * ProdMafia itself has no cost model: `GameSprite.apBuildPath` is an unweighted
+ * breadth-first search and `Map.canOccupyForDodge(x, y, true)` rejects damaging
+ * ground outright, so a route across lava simply does not exist there. `cost` is
+ * therefore our own addition, used only as an escalation after a hazard-free
+ * search has been proven impossible.
+ */
+export type HazardTraversalPolicy = 'block' | 'cost';
 
 /** Optional store configuration (Commit 5.1+). */
 export interface StaticPassabilityConfig {
@@ -44,6 +62,18 @@ export interface StaticPassabilityConfig {
 export interface StaticPassabilityDataProvider {
   tileIsBlockingWalk?(tileType: number): boolean;
   getTileDamage?(tileType: number): number | undefined;
+  /**
+   * `<Sink />` water/lava surfaces. Walkable in ProdMafia
+   * (`Square.isWalkable()` ignores `sink_`), so this only participates in the
+   * `safeWalk` avoidance policy alongside damaging ground.
+   */
+  tileIsSink?(tileType: number): boolean;
+  /** `<Sinking />` quicksand/honey — walkable, but decays movement speed. */
+  tileIsSinking?(tileType: number): boolean;
+  /** `<Speed>` multiplier; 1 when the tile does not alter movement speed. */
+  getTileSpeed?(tileType: number): number;
+  /** ProdMafia `Player.as:4215` sinking decay at a given sink level. */
+  getSinkingSpeedMultiplier?(tileType: number, sinkLevel: number): number;
   getObject?(objectType: number): StaticObjectPassabilityProfile | undefined;
 }
 
@@ -58,15 +88,29 @@ export interface StaticObjectPassabilityProfile {
 export interface StaticTileQuery {
   /**
    * Which consumer rules apply for unknown tiles and damaging floors.
-   * - pathfinding: unobserved tiles are walkable; damaging floors always block.
+   * - pathfinding: unobserved tiles are walkable; damaging floors block unless
+   *   {@link StaticTileQuery.hazardTraversal} is `cost`.
    * - dodge: unobserved tiles block unless explorativeUnknown; damaging floors
-   *   block only when safeWalk is false.
+   *   and sink (water/lava) surfaces block only when safeWalk is set.
    */
   consumer: StaticPassabilityConsumer;
   /** When set, that tile is treated as open (start-cell exemption). */
   exemptTile?: GridTile;
-  /** Dodge consumer only. When true, damaging floor tiles remain occupiable. */
+  /**
+   * Dodge consumer only. When true, prefer to keep the body off hazardous but
+   * walkable ground — damaging floors and `<Sink />` water/lava surfaces.
+   */
   safeWalk?: boolean;
+  /**
+   * Navigation-only hazard policy, defaulting to `block`. Setting `cost` makes
+   * damaging floors and `<Sink />` surfaces passable for this query alone and
+   * moves the decision onto {@link StaticPassabilityModel.getTileTraversalPenalty}.
+   *
+   * It overrides the damaging-ground and sink parts of {@link safeWalk} so the
+   * two pathfinders can escalate without a second query flavor. Dodge never
+   * passes it, so dodge semantics are untouched.
+   */
+  hazardTraversal?: HazardTraversalPolicy;
 }
 
 /** Options for fractional-position occupancy (dodge planner / local snapshots). */
@@ -137,6 +181,13 @@ export interface StaticPassabilityModel {
   /** True when an occupySquare object sits on the integer tile. */
   hasOccupySquareAt(tileX: number, tileY: number): boolean;
 
+  /**
+   * Extra traversal cost, in tile-steps, for entering this tile under
+   * {@link HazardTraversalPolicy} `cost`. Zero for ordinary dry ground, so a
+   * hazard-free route always beats a hazardous one of the same length.
+   */
+  getTileTraversalPenalty(tileX: number, tileY: number): number;
+
   /** Whether Commit 5.1 inflated passability is active on this store. */
   isInflatedPassabilityEnabled(): boolean;
 }
@@ -191,7 +242,8 @@ export interface StaticPassabilityStore
  *
  * Known disagreements:
  * - Unknown tiles: pathfinding walkable, dodge blocked unless explorativeUnknown.
- * - Damaging floors: pathfinding always blocks; dodge blocks only when safeWalk.
+ * - Damaging floors: pathfinding blocks unless hazardTraversal is `cost`; dodge
+ *   blocks only when safeWalk.
  * - Start-cell exemption: caller passes exemptTile on both sides.
  */
 export interface StaticPassabilityDualPredicates {

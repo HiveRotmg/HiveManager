@@ -62,3 +62,18 @@ export const HELLO_TOKEN = 'XQpu8CWkMehb5rLVP3DG47FcafExRUvg';
  * The TCP port game servers listen on.
  */
 export const GAME_PORT = 2050;
+
+/**
+ * Deepest `<Sinking />` level a player can reach, from ProdMafia
+ * `Parameters.as:132` (`MAX_SINK_LEVEL`). It is both the cap and the denominator
+ * of the sinking speed decay in `Player.as:4216-4217`.
+ */
+export const MAX_SINK_LEVEL = 18;
+
+/**
+ * A local frame longer than this counts as a stall for diagnostics. ProdMafia
+ * logs `frame_stall` from `GameSprite.monitorFrameStall` at a much coarser
+ * 500 ms; this client runs pathfinding and dodge planning on the frame thread,
+ * where a 3-frame hitch already costs measurable escape distance.
+ */
+export const FRAME_STALL_THRESHOLD_MS = 50;

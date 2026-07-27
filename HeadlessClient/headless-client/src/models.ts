@@ -1,4 +1,6 @@
 import type { PlayerData } from 'realmlib';
+import type { AutoConsumablesOptions } from './auto-consumables';
+import type { AutoLootOptions } from './auto-loot';
 import type { CombatDataProvider } from './combat-tracker';
 import type { ProxyConfig } from './proxy';
 
@@ -65,6 +67,10 @@ export interface ClientOptions {
   servers?: ClientServer[];
   /** Walk into the vault automatically once in the nexus. */
   autoEnterVault?: boolean;
+  /** Enable Auto Loot on creation, optionally overriding individual options. */
+  autoLoot?: boolean | Partial<AutoLootOptions>;
+  /** Enable auto HP/MP potions and auto heal on creation, with optional overrides. */
+  autoConsumables?: boolean | Partial<AutoConsumablesOptions>;
   /** Projectile/object definitions used to resolve combat hit claims. */
   combatData?: CombatDataProvider;
   /**

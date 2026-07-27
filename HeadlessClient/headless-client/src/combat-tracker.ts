@@ -115,11 +115,22 @@ export interface CombatWeaponSubattackDefinition {
 }
 
 export interface CombatObjectDefinition {
+  /** Source XML object id/display metadata used by ProdMafia Auto Play. */
+  id?: string;
+  displayId?: string;
+  objectClass?: string;
   isEnemy: boolean;
   /** True when this object type owns at least one projectile definition. */
   hasProjectiles?: boolean;
   invincible?: boolean;
   isPlayer?: boolean;
+  isContainer?: boolean;
+  isLoot?: boolean;
+  /** XML `<Static />`; structural Auto Play quests must not become movement targets. */
+  static?: boolean;
+  soulbound?: boolean;
+  bagType?: number;
+  dungeonName?: string;
   occupySquare: boolean;
   fullOccupy?: boolean;
   enemyOccupySquare?: boolean;
@@ -156,6 +167,16 @@ export interface CombatDataProvider {
   getTileDamage?(tileType: number): number | undefined;
   getTileSpeed?(tileType: number): number;
   tileIsBlockingWalk?(tileType: number): boolean;
+  /** `<Sink />` water/lava. Walkable; only the safeWalk policy avoids it. */
+  tileIsSink?(tileType: number): boolean;
+  /** `<Sinking />` quicksand/honey, which progressively slows the player. */
+  tileIsSinking?(tileType: number): boolean;
+  /** ProdMafia `Player.as:4217` sinking decay for a given accumulated sink level. */
+  getSinkingSpeedMultiplier?(tileType: number, sinkLevel: number): number;
+  /** `<SlideAmount>` ice momentum retention factor (ProdMafia `Player.as:1134-1145`). */
+  getTileSlideAmount?(tileType: number): number | undefined;
+  /** Per-ms push velocity of a `<Push />` tile (ProdMafia `Player.as:1264-1265`). */
+  getTilePushVelocity?(tileType: number): { dx: number; dy: number } | undefined;
 }
 
 export interface CombatEntity {
@@ -259,33 +280,87 @@ export class CombatTracker {
     }
   }
 
-  trackEnemyShoot(packet: EnemyShootPacket, ownerType: number | undefined, startTime: number): void {
+  /**
+   * Registers an enemy shot whose owner type is already known.
+   *
+   * Returns how many projectiles were added, so a caller can tell "this owner
+   * type has no projectile definition for that bulletType" apart from a tracked
+   * shot. That distinction used to be invisible: the shot was dropped here and
+   * never entered the threat model, so Auto Dodge was blind to it rather than
+   * bad at avoiding it (ProdMafia `GameServerConnectionConcrete.as:2547-2552`).
+   */
+  trackEnemyShoot(
+    packet: EnemyShootPacket,
+    ownerType: number | undefined,
+    startTime: number,
+  ): number {
     if (ownerType === undefined) {
-      return;
+      return 0;
     }
-    const definition = this.data.getProjectile(ownerType, packet.bulletType);
-    if (!definition || definition.lifetimeMs <= 0) {
-      return;
+    return this.addEnemyShoot(
+      enemyShootObservation(packet),
+      ownerType,
+      startTime,
+      -SIMULATION_STEP_MS,
+    );
+  }
+
+  /**
+   * Replays a deferred ENEMYSHOOT whose owner type only became resolvable after
+   * the packet arrived (ProdMafia `GameServerConnectionConcrete.as:2654-2657`).
+   *
+   * `shot.shotTime` stays the original packet time, so lifetime, geometry and
+   * the dodge planner's `predictProjectilePosition` all describe where the
+   * bullet is *now* rather than where it would be had it just spawned.
+   * Collision testing, however, starts at the shot's current age instead of
+   * zero: the span already flown happened against player positions this client
+   * no longer holds, and re-walking it against the present position would
+   * invent hits the server never claimed.
+   */
+  trackDeferredEnemyShoot(shot: PendingEnemyShoot, ownerType: number, now: number): number {
+    const age = Math.max(0, now - shot.shotTime);
+    return this.addEnemyShoot(
+      shot,
+      ownerType,
+      shot.shotTime,
+      Math.max(-SIMULATION_STEP_MS, age - SIMULATION_STEP_MS),
+    );
+  }
+
+  private addEnemyShoot(
+    shot: EnemyShootObservation,
+    ownerType: number,
+    shotTime: number,
+    simulatedElapsed: number,
+  ): number {
+    const definition = this.data.getProjectile(ownerType, shot.bulletType);
+    if (!definition || definition.lifetimeMs <= 0 || simulatedElapsed >= definition.lifetimeMs) {
+      return 0;
     }
-    const shotCount = packet.numShots > 0 && packet.numShots !== 0xff ? packet.numShots : 1;
+    const shotCount = enemyShotCount(shot.numShots);
     for (let index = 0; index < shotCount; index++) {
-      const bulletId = (packet.bulletId + index) & 0xff;
+      // ENEMYSHOOT, DAMAGE and PLAYERHIT all carry a uint16 bullet id, and every
+      // hit-report packet writes it back as a short. Masking to 8 bits aliased
+      // ids above 255 onto live projectiles of the same owner and named the
+      // wrong bullet in PLAYERHIT/OTHERHIT/SQUAREHIT.
+      const bulletId = (shot.bulletId + index) & 0xffff;
       this.add({
         side: 'enemy',
         bulletId,
-        bulletType: packet.bulletType,
-        ownerId: packet.ownerId,
+        bulletType: shot.bulletType,
+        ownerId: shot.ownerId,
         containerType: ownerType,
-        startX: packet.startingPos.x,
-        startY: packet.startingPos.y,
-        angle: packet.angle + packet.angleInc * index,
-        startTime,
-        simulatedElapsed: -SIMULATION_STEP_MS,
+        startX: shot.startX,
+        startY: shot.startY,
+        angle: shot.angle + shot.angleInc * index,
+        startTime: shotTime,
+        simulatedElapsed,
         definition,
-        damage: packet.damage,
+        damage: shot.damage,
         hitObjects: new Set(),
       });
     }
+    return shotCount;
   }
 
   /**
@@ -724,3 +799,589 @@ function positionAt(
   out.y = y;
   return out;
 }
+
+//#region ENEMYSHOOT deferral and owner-type recovery
+
+/**
+ * How long a shot with no resolvable owner stays queued, from ProdMafia
+ * `GameServerConnectionConcrete.as:1860`. Its comment records why the earlier
+ * 750 ms window was wrong: it discarded 1,711 locally relevant shot packets in
+ * one session (810 in Wine Cellar), every one of them invisible to Auto Dodge.
+ */
+export const PENDING_ENEMY_SHOOT_MS = 4000;
+
+/**
+ * Queue ceiling (ProdMafia `:1861`). The queue exists to survive a streaming
+ * race, not to buffer a hostile peer: at 256 entries the whole queue costs a
+ * few tens of KB, and every entry is re-examined on each UPDATE and NEWTICK on
+ * the same thread as the 16 ms frame timer. Overflow drops the newest shot and
+ * is counted rather than silent.
+ */
+export const MAX_PENDING_ENEMY_SHOOTS = 256;
+
+/**
+ * Launch-point distance beyond which a shot is never queued (ProdMafia
+ * `:1865`). Perimeter shooters in Malogia begin 20-27 tiles out during
+ * streaming, so the window has to exceed that; past it the bullet cannot reach
+ * the player inside the deferral window and buying queue slots for it only
+ * crowds out shots that matter.
+ */
+export const PENDING_ENEMY_SHOOT_DISTANCE = 35;
+
+/** ProdMafia `:1853`. */
+export const MAX_MAP_ENEMY_SHOOT_SOURCES = 512;
+
+/**
+ * ProdMafia `:1854`. Dungeon-owned shooters use small, layout-stable object
+ * ids; ids above this are per-instance and reused, so a learned association
+ * would be meaningless on the next entry.
+ */
+export const MAX_STABLE_MAP_OWNER_ID = 4096;
+
+/**
+ * Signature-table ceiling. ProdMafia leaves this table unbounded because it
+ * clears it on every MAPINFO; we clear it too, but cap it as well so a peer
+ * that streams distinct damage/count tuples cannot grow it without limit
+ * within one map.
+ */
+export const MAX_ENEMY_SHOOT_SIGNATURES = 2048;
+
+/** Distinct unresolved profiles retained for diagnostics before new ones are ignored. */
+export const MAX_UNRESOLVED_ENEMY_SHOOT_PROFILES = 256;
+
+/** Radius ProdMafia `Map.resolveStaticHostileSourceType` (`Map.as:773-774`) searches. */
+export const ENEMY_SHOOT_LAUNCH_MATCH_DISTANCE = 0.85;
+
+/**
+ * Which source produced an owner type. Strings match ProdMafia's
+ * `recoveryMode` values so log lines can be compared side by side.
+ */
+export type EnemyShootRecoveryMode =
+  | 'live'
+  | 'persistent_cache'
+  | 'map_source_cache'
+  | 'verified_map_source'
+  | 'launch_position'
+  | 'signature_cache'
+  | 'deferred'
+  | 'deferred_map_source'
+  | 'deferred_launch_position'
+  | 'deferred_signature';
+
+/** The primitive fields of an ENEMYSHOOT that a replay needs. */
+export interface EnemyShootObservation {
+  ownerId: number;
+  bulletId: number;
+  bulletType: number;
+  damage: number;
+  numShots: number;
+  angleInc: number;
+  angle: number;
+  startX: number;
+  startY: number;
+}
+
+export interface PendingEnemyShoot extends EnemyShootObservation {
+  /** Client time the packet arrived; a replay keeps it as the shot's origin. */
+  shotTime: number;
+  queuedAt: number;
+}
+
+/** Why a shot could not be handed straight to the threat model. */
+export type EnemyShootDeferral = 'queued' | 'distant' | 'overflow';
+
+/** World lookups the resolver needs from the client, supplied per pass. */
+export interface EnemyShootResolveContext {
+  /** Client clock, the same base as the shot times handed to the tracker. */
+  now: number;
+  /** Live object type for an owner id, falling back to the recent-type cache; -1 if unknown. */
+  ownerType(ownerId: number): number;
+  /** ProdMafia `Map.resolveStaticHostileSourceType`: nearest live enemy to a launch point, or -1. */
+  staticHostileType?(x: number, y: number): number;
+  /** ProdMafia `Map.cacheObjectType`: trains the recent-type cache from a recovered identity. */
+  cacheObjectType(ownerId: number, ownerType: number): void;
+  /** Distance from the local player to a launch point; -1 when our position is unknown. */
+  playerDistanceTo(x: number, y: number): number;
+  /** Hands a resolved shot to the threat model. */
+  replay(
+    shot: PendingEnemyShoot,
+    ownerType: number,
+    mode: EnemyShootRecoveryMode,
+    delayMs: number,
+  ): void;
+}
+
+interface MapEnemyShootSource {
+  type: number;
+  x: number;
+  y: number;
+}
+
+/**
+ * ENEMYSHOOT deferral and owner-type recovery, ported from ProdMafia
+ * `GameServerConnectionConcrete.as:2424-2907`.
+ *
+ * An ENEMYSHOOT can arrive before the UPDATE that streams its owner in. With no
+ * owner there is no object type; with no object type there is no projectile
+ * definition; and the shot was then dropped outright, so it never entered the
+ * threat model and the dodge planner was *blind* to it rather than bad at
+ * avoiding it. This queues those packets and recovers the owner type from three
+ * learned sources — a damage/count/spread signature, a position-verified
+ * per-map objectId association, and the nearest live enemy to the launch point
+ * — then replays the shot with its original timing.
+ *
+ * Every drop path increments a counter surfaced through `stats()`. The defect
+ * this fixes went unnoticed for as long as it did because the drop was silent.
+ */
+export class EnemyShootRecovery {
+  private readonly pending: PendingEnemyShoot[] = [];
+  /** Per-map: an unambiguous shot signature is object-type authority. */
+  private readonly typeBySignature = new Map<string, number>();
+  private readonly ambiguousSignatures = new Set<string>();
+  /**
+   * Keyed `mapName|ownerId` and retained across maps, exactly as ProdMafia's
+   * `static mapEnemyShootSources_` is (`:1850-1852`, never cleared by
+   * `onMapInfo`). The map name in the key plus the launch-position check is the
+   * scoping: an association learned in one map can never answer a lookup in
+   * another, and random-map id reuse cannot pass the position check.
+   */
+  private readonly mapSources = new Map<string, MapEnemyShootSource>();
+  private readonly ambiguousMapSources = new Set<string>();
+  private readonly unresolvedProfiles = new Map<string, number>();
+  private mapName = '';
+
+  private queuedCount = 0;
+  private recoveredCount = 0;
+  private signatureRecoveredCount = 0;
+  private mapSourceRecoveredCount = 0;
+  private positionRecoveredCount = 0;
+  private expiredCount = 0;
+  private distantSkippedCount = 0;
+  private overflowCount = 0;
+  private lateCount = 0;
+  private noDefinitionCount = 0;
+  private maxRecoveryDelayMs = 0;
+
+  constructor(private readonly data: CombatDataProvider) {}
+
+  /**
+   * ProdMafia `onMapInfo` (`:5391-5392`) empties the queue and calls
+   * `clearEnemyShootSignatures`. Signatures and unresolved profiles are learned
+   * from one map's population and must not answer for the next one; the
+   * position-verified per-map associations are keyed by map name and survive.
+   */
+  setMap(mapName: string): void {
+    this.mapName = mapName;
+    this.pending.length = 0;
+    this.typeBySignature.clear();
+    this.ambiguousSignatures.clear();
+    this.unresolvedProfiles.clear();
+  }
+
+  /**
+   * Trains both learned tables from a shot whose owner is present and alive —
+   * the only case where the owner id is authority for what it shoots
+   * (ProdMafia `:2428-2433`).
+   */
+  observeLiveShot(ownerType: number, shot: EnemyShootObservation): void {
+    this.rememberSignature(ownerType, shot);
+    this.rememberMapSource(shot.ownerId, ownerType, shot.startX, shot.startY);
+  }
+
+  /**
+   * Recovers the object type of a shot whose owner is *not* in the world, in
+   * ProdMafia's order of decreasing authority (`:2438-2477`), then trains the
+   * caches from the result (`:2511-2522`).
+   *
+   * Call this only once the owner is known to be absent or dead, matching
+   * ProdMafia's `if(owner == null || owner.dead_)` guard: a hit on
+   * `ctx.ownerType` here is therefore the recent-type cache, not a live object.
+   * `ownerType` is -1 when nothing resolved, in which case `mode` is unused.
+   */
+  resolveOwnerType(
+    shot: EnemyShootObservation,
+    ctx: EnemyShootResolveContext,
+  ): { ownerType: number; mode: EnemyShootRecoveryMode } {
+    let ownerType = ctx.ownerType(shot.ownerId);
+    let mode: EnemyShootRecoveryMode = 'persistent_cache';
+    if (ownerType < 0) {
+      ownerType = this.getMapEnemyShootSourceType(shot.ownerId, shot.bulletType, shot.startX, shot.startY);
+      if (ownerType >= 0) mode = 'map_source_cache';
+    }
+    if (ownerType < 0) {
+      ownerType = this.getBuiltInMapEnemyShootSourceType(shot.ownerId, shot.bulletType);
+      if (ownerType >= 0) mode = 'verified_map_source';
+    }
+    if (ownerType < 0 && ctx.staticHostileType) {
+      const nearby = ctx.staticHostileType(shot.startX, shot.startY);
+      if (this.hasProjectileDefinition(nearby, shot.bulletType)) {
+        ownerType = nearby;
+        mode = 'launch_position';
+      }
+    }
+    if (ownerType < 0) {
+      ownerType = this.getEnemyShootSignatureType(shot);
+      if (ownerType >= 0) mode = 'signature_cache';
+    }
+    if (ownerType < 0) {
+      return { ownerType: -1, mode: 'persistent_cache' };
+    }
+    // A launch-square match is good enough for this one shot but is not
+    // owner-id authority, so it must not train the persistent caches
+    // (ProdMafia `:2515-2522`).
+    if (mode !== 'signature_cache' && mode !== 'launch_position') {
+      ctx.cacheObjectType(shot.ownerId, ownerType);
+    }
+    if (mode !== 'launch_position') {
+      this.rememberSignature(ownerType, shot);
+      this.rememberMapSource(shot.ownerId, ownerType, shot.startX, shot.startY);
+    }
+    if (mode === 'map_source_cache' || mode === 'verified_map_source') this.mapSourceRecoveredCount++;
+    if (mode === 'launch_position') this.positionRecoveredCount++;
+    if (mode === 'signature_cache') this.signatureRecoveredCount++;
+    return { ownerType, mode };
+  }
+
+  /**
+   * Queues a shot that could not be resolved, so a following UPDATE can supply
+   * the owner (ProdMafia `:2482-2509`). The packet's primitive fields are
+   * copied because incoming messages are pooled.
+   */
+  deferUnresolved(
+    shot: EnemyShootObservation,
+    shotTime: number,
+    ctx: EnemyShootResolveContext,
+  ): EnemyShootDeferral {
+    this.recordUnresolvedEnemyShoot(shot);
+    const distance = ctx.playerDistanceTo(shot.startX, shot.startY);
+    if (distance >= 0 && distance > PENDING_ENEMY_SHOOT_DISTANCE) {
+      this.distantSkippedCount++;
+      return 'distant';
+    }
+    if (this.pending.length >= MAX_PENDING_ENEMY_SHOOTS) {
+      this.overflowCount++;
+      return 'overflow';
+    }
+    this.pending.push({
+      ownerId: shot.ownerId,
+      bulletId: shot.bulletId,
+      bulletType: shot.bulletType,
+      damage: shot.damage,
+      numShots: shot.numShots,
+      angleInc: shot.angleInc,
+      angle: shot.angle,
+      startX: shot.startX,
+      startY: shot.startY,
+      shotTime,
+      queuedAt: ctx.now,
+    });
+    this.queuedCount++;
+    return 'queued';
+  }
+
+  /**
+   * Re-attempts every queued shot, replaying the ones that now resolve and
+   * evicting the ones that timed out (ProdMafia `processPendingEnemyShoots`,
+   * `:2586-2692`). ProdMafia drives this from `onUpdate` and `onNewTick`.
+   */
+  resolvePending(ctx: EnemyShootResolveContext): void {
+    for (let index = this.pending.length - 1; index >= 0; index--) {
+      const shot = this.pending[index]!;
+      let ownerType = ctx.ownerType(shot.ownerId);
+      let signatureRecovery = false;
+      let mapSourceRecovery = false;
+      let positionRecovery = false;
+      if (ownerType < 0) {
+        ownerType = this.getMapEnemyShootSourceType(shot.ownerId, shot.bulletType, shot.startX, shot.startY);
+        mapSourceRecovery = ownerType >= 0;
+      }
+      if (ownerType < 0) {
+        ownerType = this.getBuiltInMapEnemyShootSourceType(shot.ownerId, shot.bulletType);
+        mapSourceRecovery = ownerType >= 0;
+      }
+      if (ownerType < 0 && ctx.staticHostileType) {
+        const nearby = ctx.staticHostileType(shot.startX, shot.startY);
+        if (this.hasProjectileDefinition(nearby, shot.bulletType)) {
+          ownerType = nearby;
+          positionRecovery = true;
+        }
+      }
+      if (ownerType < 0) {
+        ownerType = this.getEnemyShootSignatureType(shot);
+        signatureRecovery = ownerType >= 0;
+      }
+      if (ownerType < 0) {
+        if (ctx.now - shot.queuedAt >= PENDING_ENEMY_SHOOT_MS) {
+          this.expiredCount++;
+          this.removeAt(index);
+        }
+        continue;
+      }
+      if (!signatureRecovery && !positionRecovery) {
+        ctx.cacheObjectType(shot.ownerId, ownerType);
+      }
+      if (!positionRecovery) {
+        this.rememberSignature(ownerType, shot);
+        this.rememberMapSource(shot.ownerId, ownerType, shot.startX, shot.startY);
+      }
+      const recoveryDelay = Math.max(0, ctx.now - shot.queuedAt);
+      const definition = this.data.getProjectile(ownerType, shot.bulletType);
+      const shotAge = Math.max(0, ctx.now - shot.shotTime);
+      if (!definition || definition.lifetimeMs <= 0) {
+        this.noDefinitionCount++;
+      } else if (shotAge >= definition.lifetimeMs) {
+        // Rebuilding a shot after its configured lifetime adds an
+        // already-dead projectile for one frame and can make the dodge
+        // controller flee danger that no longer exists (ProdMafia `:2645-2649`).
+        this.lateCount++;
+      } else {
+        const mode: EnemyShootRecoveryMode = signatureRecovery
+          ? 'deferred_signature'
+          : mapSourceRecovery
+            ? 'deferred_map_source'
+            : positionRecovery
+              ? 'deferred_launch_position'
+              : 'deferred';
+        ctx.replay(shot, ownerType, mode, recoveryDelay);
+        this.recoveredCount++;
+        if (signatureRecovery) this.signatureRecoveredCount++;
+        if (mapSourceRecovery) this.mapSourceRecoveredCount++;
+        if (positionRecovery) this.positionRecoveredCount++;
+        this.maxRecoveryDelayMs = Math.max(this.maxRecoveryDelayMs, recoveryDelay);
+      }
+      this.removeAt(index);
+    }
+  }
+
+  /**
+   * Counts a shot whose owner type *was* resolved but whose bulletType has no
+   * projectile definition for it. ProdMafia only notes this to its packet log
+   * (`:2547-2552`); it stays a drop, because re-queuing cannot make a missing
+   * game-data entry appear.
+   */
+  noteMissingDefinition(): void {
+    this.noDefinitionCount++;
+  }
+
+  get pendingCount(): number {
+    return this.pending.length;
+  }
+
+  /**
+   * Counters for `debugInfo()`. `queued` / `bySignature` / `byMapSource` /
+   * `unresolved` are the four the dodge investigation needs: how many shots the
+   * old code would have thrown away, how each one was recovered, and how many
+   * are still being lost.
+   */
+  stats(): Record<string, unknown> {
+    return {
+      pending: this.pending.length,
+      queued: this.queuedCount,
+      recovered: this.recoveredCount,
+      bySignature: this.signatureRecoveredCount,
+      byMapSource: this.mapSourceRecoveredCount,
+      byLaunchPosition: this.positionRecoveredCount,
+      unresolved: this.expiredCount,
+      distantSkipped: this.distantSkippedCount,
+      queueOverflow: this.overflowCount,
+      tooLateToReplay: this.lateCount,
+      noProjectileDefinition: this.noDefinitionCount,
+      maxRecoveryDelayMs: this.maxRecoveryDelayMs,
+      learnedSignatures: this.typeBySignature.size,
+      ambiguousSignatures: this.ambiguousSignatures.size,
+      learnedMapSources: this.mapSources.size,
+      unresolvedProfiles: this.describeUnresolvedProfiles(),
+    };
+  }
+
+  /** ProdMafia `enemyShootSignature` (`:2738-2742`). */
+  private enemyShootSignature(shot: EnemyShootObservation): string {
+    return `${shot.bulletType}:${shot.damage}:${Math.max(1, shot.numShots)}:${Math.round(shot.angleInc * 10000)}`;
+  }
+
+  /**
+   * ProdMafia `rememberEnemyShootSignature` (`:2744-2761`). Two object types
+   * sharing a signature poisons it permanently for this map rather than
+   * letting the second one overwrite the first.
+   */
+  private rememberSignature(ownerType: number, shot: EnemyShootObservation): void {
+    if (ownerType < 0) {
+      return;
+    }
+    const key = this.enemyShootSignature(shot);
+    if (this.ambiguousSignatures.has(key)) {
+      return;
+    }
+    const previous = this.typeBySignature.get(key);
+    if (previous !== undefined) {
+      if (previous !== ownerType) {
+        this.typeBySignature.delete(key);
+        if (this.ambiguousSignatures.size < MAX_ENEMY_SHOOT_SIGNATURES) {
+          this.ambiguousSignatures.add(key);
+        }
+      }
+      return;
+    }
+    if (this.typeBySignature.size >= MAX_ENEMY_SHOOT_SIGNATURES) {
+      return;
+    }
+    this.typeBySignature.set(key, ownerType);
+  }
+
+  /** ProdMafia `getEnemyShootSignatureType` (`:2763-2772`). */
+  private getEnemyShootSignatureType(shot: EnemyShootObservation): number {
+    const key = this.enemyShootSignature(shot);
+    if (this.ambiguousSignatures.has(key)) {
+      return -1;
+    }
+    return this.typeBySignature.get(key) ?? -1;
+  }
+
+  /** ProdMafia `hasEnemyShootProjectileDefinition` (`:2774-2782`). */
+  private hasProjectileDefinition(ownerType: number, bulletType: number): boolean {
+    if (ownerType < 0) {
+      return false;
+    }
+    const definition = this.data.getProjectile(ownerType, bulletType);
+    return !!definition && definition.lifetimeMs > 0;
+  }
+
+  /** ProdMafia `mapEnemyShootSourceKey` (`:2784-2786`). */
+  private mapSourceKey(ownerId: number): string {
+    return `${this.mapName}|${ownerId}`;
+  }
+
+  /** ProdMafia `rememberMapEnemyShootSource` (`:2788-2820`). */
+  private rememberMapSource(ownerId: number, ownerType: number, startX: number, startY: number): void {
+    if (ownerId < 0 || ownerId > MAX_STABLE_MAP_OWNER_ID || ownerType < 0
+      || !Number.isFinite(startX) || !Number.isFinite(startY)) {
+      return;
+    }
+    // The nexus and the realm recycle low object ids across a huge, changing
+    // population, so nothing learned there is worth keeping.
+    if (this.mapName === '' || this.mapName === 'Nexus' || this.mapName === 'Realm of the Mad God') {
+      return;
+    }
+    const key = this.mapSourceKey(ownerId);
+    if (this.ambiguousMapSources.has(key)) {
+      return;
+    }
+    const previous = this.mapSources.get(key);
+    if (previous) {
+      const dx = previous.x - startX;
+      const dy = previous.y - startY;
+      if (previous.type !== ownerType || dx * dx + dy * dy > 1) {
+        this.mapSources.delete(key);
+        if (this.ambiguousMapSources.size < MAX_MAP_ENEMY_SHOOT_SOURCES) {
+          this.ambiguousMapSources.add(key);
+        }
+      }
+      return;
+    }
+    if (this.mapSources.size >= MAX_MAP_ENEMY_SHOOT_SOURCES) {
+      return;
+    }
+    this.mapSources.set(key, { type: ownerType, x: startX, y: startY });
+  }
+
+  /** ProdMafia `getMapEnemyShootSourceType` (`:2822-2841`). */
+  private getMapEnemyShootSourceType(
+    ownerId: number,
+    bulletType: number,
+    startX: number,
+    startY: number,
+  ): number {
+    if (!Number.isFinite(startX) || !Number.isFinite(startY)) {
+      return -1;
+    }
+    const key = this.mapSourceKey(ownerId);
+    if (this.ambiguousMapSources.has(key)) {
+      return -1;
+    }
+    const source = this.mapSources.get(key);
+    if (!source) {
+      return -1;
+    }
+    const dx = source.x - startX;
+    const dy = source.y - startY;
+    return dx * dx + dy * dy <= 1 && this.hasProjectileDefinition(source.type, bulletType)
+      ? source.type
+      : -1;
+  }
+
+  /**
+   * ProdMafia `getBuiltInMapEnemyShootSourceType` (`:2843-2870`). Neo Forax's
+   * perimeter sources are server-owned map objects that never enter UPDATE
+   * until the player streams their sector. Their low ids and types were stable
+   * across the July 15, 17 and 21 captures; the bullet-type check makes a
+   * changed layout fail closed into ordinary deferral.
+   */
+  private getBuiltInMapEnemyShootSourceType(ownerId: number, bulletType: number): number {
+    if (this.mapName !== 'Neo Forax') {
+      return -1;
+    }
+    let ownerType = -1;
+    switch (ownerId) {
+      case 4: ownerType = 0xdcd0; break; // background watcher
+      case 5:
+      case 15: ownerType = 0xdcd1; break; // background watchling
+      case 7: ownerType = 0xdcd2; break; // background watcher sentinel
+      case 10: ownerType = 0xdcd3; break; // background hunger
+      default: return -1;
+    }
+    return this.hasProjectileDefinition(ownerType, bulletType) ? ownerType : -1;
+  }
+
+  /** ProdMafia `recordUnresolvedEnemyShoot` (`:2872-2881`). */
+  private recordUnresolvedEnemyShoot(shot: EnemyShootObservation): void {
+    const key = this.enemyShootSignature(shot);
+    const count = this.unresolvedProfiles.get(key);
+    if (count === undefined && this.unresolvedProfiles.size >= MAX_UNRESOLVED_ENEMY_SHOOT_PROFILES) {
+      return;
+    }
+    this.unresolvedProfiles.set(key, (count ?? 0) + 1);
+  }
+
+  /**
+   * ProdMafia `consumeUnresolvedEnemyShootProfiles` (`:2883-2893`) drains this
+   * into a one-second summary log. `debugInfo()` is polled instead of pushed,
+   * so this reports without consuming.
+   */
+  private describeUnresolvedProfiles(): string {
+    const parts: string[] = [];
+    for (const [key, count] of this.unresolvedProfiles) {
+      if (parts.length >= 8) break;
+      parts.push(`${key}x${count}`);
+    }
+    return parts.join(',');
+  }
+
+  /** ProdMafia `removePendingEnemyShoot` (`:2732-2736`): swap with the tail. */
+  private removeAt(index: number): void {
+    const last = this.pending.length - 1;
+    this.pending[index] = this.pending[last]!;
+    this.pending.length = last;
+  }
+}
+
+/** ProdMafia treats a zero/unset shot count as one (`:2553`). */
+export function enemyShotCount(numShots: number): number {
+  return numShots > 0 && numShots !== 0xff ? numShots : 1;
+}
+
+/** Copies the primitive ENEMYSHOOT fields out of a pooled packet object. */
+export function enemyShootObservation(packet: EnemyShootPacket): EnemyShootObservation {
+  return {
+    ownerId: packet.ownerId,
+    bulletId: packet.bulletId,
+    bulletType: packet.bulletType,
+    damage: packet.damage,
+    numShots: packet.numShots,
+    angleInc: packet.angleInc,
+    angle: packet.angle,
+    startX: packet.startingPos.x,
+    startY: packet.startingPos.y,
+  };
+}
+
+//#endregion

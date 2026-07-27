@@ -7,7 +7,19 @@ export interface MovementSnapshot {
   localPos: { x: number; y: number };
   serverPos?: { x: number; y: number };
   condition?: number;
+  /**
+   * ProdMafia's `moveMultiplier_` (`Player.as:4215-4225`): the occupied tile's
+   * `<Speed>`, or the decayed sinking multiplier on a `<Sinking />` tile.
+   */
   tileSpeed?: number;
+  /**
+   * `<SlideAmount>` of the occupied tile (0 when it does not slide). ProdMafia
+   * retains this fraction of last frame's move vector each frame, blending the
+   * commanded direction in at `1 - slideAmount`.
+   */
+  tileSlideAmount?: number;
+  /** Per-ms push velocity of the occupied `<Push />` tile, already sign-corrected. */
+  tilePushVelocity?: { dx: number; dy: number };
 }
 
 export interface MoveTarget {
@@ -51,6 +63,8 @@ const SPEED_MIN = 0.004;
 const SPEED_MAX = 0.0096;
 const MAX_COLLISION_STEP = 0.4;
 const COLLISION_EPSILON = 1e-6;
+/** ProdMafia `Player.as:1228` treats a move vector below this length as stopped. */
+const IDLE_SLIDE_EPSILON = 0.00012;
 
 /** Owns movement target state and local dead-reckoning between server ticks. */
 export class MovementController {
@@ -58,6 +72,11 @@ export class MovementController {
   private bestDist = Infinity;
   private stallMs = 0;
   private stallWarned = false;
+  /**
+   * ProdMafia's persistent `moveVec_`. Only ice and push tiles read it, but it is
+   * kept current on every frame so stepping onto ice inherits real momentum.
+   */
+  private moveVec: MovementVelocity = { x: 0, y: 0 };
 
   setTarget(target: { x: number; y: number }, threshold = config.arriveThreshold): void {
     this.target = { x: target.x, y: target.y, threshold };
@@ -82,16 +101,30 @@ export class MovementController {
     return this.target ? { ...this.target } : undefined;
   }
 
+  /** Discards retained ice/push momentum after an authoritative position snap. */
+  resetMomentum(): void {
+    this.moveVec = { x: 0, y: 0 };
+  }
+
+  /** @internal Test hook — the retained ProdMafia `moveVec_` in tiles/ms. */
+  getMomentumForTest(): MovementVelocity {
+    return { ...this.moveVec };
+  }
+
   update(snapshot: MovementSnapshot, dt: number, options: MovementUpdateOptions = {}): MovementUpdate {
     if (!this.target && !options.velocityOverride) {
+      // ProdMafia still decays the move vector on an input-free frame
+      // (Player.as:1228-1229) so ice coasts to a stop instead of freezing.
+      this.decayIdleMomentum(snapshot);
       return { pos: snapshot.localPos };
     }
     const base = options.integrateFromLocal
       ? snapshot.localPos
       : snapshot.serverPos ?? snapshot.localPos;
-    const intended = options.velocityOverride
+    const commanded = options.velocityOverride
       ? this.stepWithVelocity(snapshot, dt, options.velocityOverride, !!options.integrateFromLocal)
       : this.stepToward(snapshot, dt, !!options.integrateFromLocal);
+    const intended = this.applyTerrainMotion(snapshot, base, commanded, dt);
     const pos = options.resolvePosition
       ? options.resolvePosition(base, intended)
       : intended;
@@ -104,7 +137,10 @@ export class MovementController {
     const stalled = options.velocityOverride && !options.trackTargetProgress
       ? undefined
       : this.detectStall(snapshot.serverPos, dt);
-    const confirmedPos = snapshot.serverPos ?? pos;
+    // Arrival must use the same position the step was integrated from. Checking
+    // lagged serverPos while integrating locally freezes movement at each
+    // waypoint until NewTick acknowledges the predicted body.
+    const confirmedPos = options.integrateFromLocal ? pos : (snapshot.serverPos ?? pos);
     if (Math.hypot(this.target.x - confirmedPos.x, this.target.y - confirmedPos.y) < this.target.threshold) {
       const reached = { x: this.target.x, y: this.target.y };
       this.clear();
@@ -135,10 +171,15 @@ export class MovementController {
     const dx = target.x - base.x;
     const dy = target.y - base.y;
     const dist = Math.hypot(dx, dy);
-    if (dist <= step || dist === 0) {
-      return { x: target.x, y: target.y };
+    if (dist === 0) {
+      return { x: base.x, y: base.y };
     }
-    return { x: base.x + (dx / dist) * step, y: base.y + (dy / dist) * step };
+    // Never snap onto the target and park there. ProdMafia keeps a continuous
+    // move vector toward the path head; clamping the step to remaining distance
+    // arrives without a one-frame zero-velocity stall when the controller still
+    // owns the same waypoint for this tick.
+    const travel = Math.min(step, dist);
+    return { x: base.x + (dx / dist) * travel, y: base.y + (dy / dist) * travel };
   }
 
   private stepWithVelocity(
@@ -149,6 +190,65 @@ export class MovementController {
   ): { x: number; y: number } {
     const base = integrateFromLocal ? snapshot.localPos : snapshot.serverPos ?? snapshot.localPos;
     return { x: base.x + velocity.x * dt, y: base.y + velocity.y * dt };
+  }
+
+  /**
+   * Rewrites a commanded step into the step the body can physically execute on
+   * ice and push tiles, and records the resulting move vector.
+   *
+   * Ice (ProdMafia `Player.as:1134-1145`): the retained vector keeps
+   * `slideAmount` of its magnitude, and the commanded direction is blended in at
+   * `1 - slideAmount` only while the retained vector is still under top speed —
+   * so acceleration and braking both lag, which is what makes ice feel slippery.
+   *
+   * Push (ProdMafia `Player.as:1263-1266`): a constant per-ms offset applied
+   * after the blend, and folded into the retained vector so a whirlpool on ice
+   * keeps accumulating exactly as it does in Flash.
+   */
+  private applyTerrainMotion(
+    snapshot: MovementSnapshot,
+    base: Readonly<{ x: number; y: number }>,
+    commanded: Readonly<{ x: number; y: number }>,
+    dt: number,
+  ): { x: number; y: number } {
+    if (dt <= 0) return { x: commanded.x, y: commanded.y };
+
+    const commandedVelocity = {
+      x: (commanded.x - base.x) / dt,
+      y: (commanded.y - base.y) / dt,
+    };
+    const slideAmount = snapshot.tileSlideAmount ?? 0;
+    const push = snapshot.tilePushVelocity;
+    if (slideAmount <= 0 && !push) {
+      this.moveVec = commandedVelocity;
+      return { x: commanded.x, y: commanded.y };
+    }
+
+    const next = { ...commandedVelocity };
+    if (slideAmount > 0) {
+      next.x = this.moveVec.x * slideAmount;
+      next.y = this.moveVec.y * slideAmount;
+      const topSpeed = movementSpeed(snapshot);
+      if (next.x * next.x + next.y * next.y < topSpeed * topSpeed) {
+        next.x += commandedVelocity.x * (1 - slideAmount);
+        next.y += commandedVelocity.y * (1 - slideAmount);
+      }
+    }
+    if (push) {
+      next.x += push.dx;
+      next.y += push.dy;
+    }
+    this.moveVec = next;
+    return { x: base.x + next.x * dt, y: base.y + next.y * dt };
+  }
+
+  private decayIdleMomentum(snapshot: MovementSnapshot): void {
+    const slideAmount = snapshot.tileSlideAmount ?? 0;
+    if (slideAmount > 0 && Math.hypot(this.moveVec.x, this.moveVec.y) > IDLE_SLIDE_EPSILON) {
+      this.moveVec = { x: this.moveVec.x * slideAmount, y: this.moveVec.y * slideAmount };
+      return;
+    }
+    this.moveVec = { x: 0, y: 0 };
   }
 
   private detectStall(serverPos: { x: number; y: number } | undefined, dt: number): { distance: number } | undefined {

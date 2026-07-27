@@ -58,6 +58,19 @@ export interface DodgePlanningAoe {
   /** Learned armor-piercing flag from the matching AOE packet. */
   armorPiercing?: boolean;
   /**
+   * True once the same location has been observed pulsing again, or when a
+   * packet-confirmed cadence is already known for the source
+   * (`Map.as:1108-1130`, `Map.as:1179-1199`).
+   *
+   * A one-off raw AOE packet describes damage that has ALREADY happened, so it
+   * must not be charged as future damage — only its geometry keeps the route
+   * rejected (`AutoDodgeController.as:1860-1870`). Charging it anyway is the
+   * phantom damage that fired Auto Nexus on explosions that were already over.
+   * Pre-impact AoEs (`landingTime` still in the future) always charge damage
+   * regardless of this flag (`AutoDodgeController.as:1505-1518`).
+   */
+  repeating?: boolean;
+  /**
    * Duration in ms the blast stays dangerous after `landingTime`. Falsy or
    * missing = single-frame (existing behavior). When set, both AoE-sample
    * sites sweep `[landingTime, landingTime + blastDurationMs]` at
@@ -101,6 +114,15 @@ export interface DodgePlannerMetrics {
   averagePlanningDurationMs: number;
   worstPlanningDurationMs: number;
   coalescedProjectileUpdates: number;
+  /**
+   * Candidate x threat exact-scoring operations, ProdMafia's `candidateChecks`
+   * (`AutoDodgeController.as:379`, incremented at `:1370`, `:1494`, `:1582`,
+   * `:1673`, `:1754`). Distinct from `candidatesGenerated`, which is the size of
+   * the fixed direction buffer: a volley the broad phase rejected costs zero
+   * checks while still laying out all 34 directions. Optional because the
+   * space-time planner does not have a comparable stage.
+   */
+  candidateChecks?: number;
 }
 
 /**

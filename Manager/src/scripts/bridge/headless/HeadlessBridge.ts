@@ -17,8 +17,15 @@ import {
 import {
   ClientEvent,
   ENEMY_AVOID_RADIUS,
+  PacketType,
+  anchorTeleportCommand,
+  selectClosestPlayerTeleport,
+  selectQuestTeleportTarget,
   type Client,
   type CombatPathfindingRange,
+  type FollowPlayer,
+  type QuestObjectIdPacket,
+  type TrackedObject,
 } from 'headless-client';
 import type { BridgeDeps } from '../BridgeDeps.js';
 import { Logger } from '../../../util/Logger.js';
@@ -239,18 +246,63 @@ interface FollowState {
   objectId: number;
   lastX?: number;
   lastY?: number;
+  /** Resolved `PlayerFollowOptions`. */
+  arriveThreshold: number;
+  teleportDistance: number;
+  teleportCooldownMs: number;
+  followIntoPortals: boolean;
+  lastTeleportAt: number;
   onTick: () => void;
   onMapChange: () => void;
+  onObjectRemoved: (object: TrackedObject) => void;
 }
 
 const follows = new WeakMap<Client, FollowState>();
+/** `Parameters.data.anchorName`, per connected account. */
+const anchors = new WeakMap<Client, string>();
+const questIds = new WeakMap<Client, number>();
+const questHooks = new WeakSet<Client>();
+
+const DEFAULT_FOLLOW_ARRIVE_THRESHOLD = 1.5;
+const DEFAULT_FOLLOW_TELEPORT_DISTANCE = 10;
+const DEFAULT_FOLLOW_TELEPORT_COOLDOWN_MS = 6000;
 
 function stopFollowing(client: Client): void {
   const state = follows.get(client);
   if (!state) return;
   client.off(ClientEvent.Tick, state.onTick);
   client.off(ClientEvent.MapChange, state.onMapChange);
+  client.off(ClientEvent.ObjectRemoved, state.onObjectRemoved);
   follows.delete(client);
+}
+
+/** Tracks QUESTOBJID so quest teleport knows what the current quest is. */
+function questTargetId(client: Client): number {
+  if (!questHooks.has(client)) {
+    questHooks.add(client);
+    client.onPacket<QuestObjectIdPacket>(PacketType.QUESTOBJID, (packet) => {
+      questIds.set(client, Number(packet.objectId) || -1);
+    });
+  }
+  return questIds.get(client) ?? -1;
+}
+
+/** Visible players plus the local player, as `teleQuest` iterates the object dict. */
+function teleportCandidates(client: Client, deps: BridgeDeps): FollowPlayer[] {
+  const position = client.getServerPosition() ?? client.getPosition();
+  const candidates: FollowPlayer[] = [
+    { objectId: client.getObjectId(), x: position.x, y: position.y },
+  ];
+  for (const object of client.visibleObjects()) {
+    if (deps.gameData.getObjectCategory(object.type) !== 'Player') continue;
+    candidates.push({
+      objectId: object.objectId,
+      name: object.player?.name || object.name,
+      x: object.x,
+      y: object.y,
+    });
+  }
+  return candidates;
 }
 
 function findPlayer(client: Client, deps: BridgeDeps, query: string, objectId?: number) {
@@ -535,7 +587,7 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
     const portal = client.realmPortals().sort((a, b) => client.distanceTo(a) - client.distanceTo(b))[0];
     return portal ? client.moveToObject(portal.objectId) : false;
   };
-  Walking.followPlayer = (name: string) => {
+  Walking.followPlayer = (name: string, options = {}) => {
     const client = active(deps);
     const query = name.trim().toLowerCase();
     if (!query) return false;
@@ -543,9 +595,15 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
     if (!player) return false;
 
     stopFollowing(client);
+    const arriveThreshold = options.arriveThreshold ?? DEFAULT_FOLLOW_ARRIVE_THRESHOLD;
     const state: FollowState = {
       query,
       objectId: player.objectId,
+      arriveThreshold,
+      teleportDistance: options.teleportDistance ?? DEFAULT_FOLLOW_TELEPORT_DISTANCE,
+      teleportCooldownMs: options.teleportCooldownMs ?? DEFAULT_FOLLOW_TELEPORT_COOLDOWN_MS,
+      followIntoPortals: options.followIntoPortals ?? false,
+      lastTeleportAt: Number.NEGATIVE_INFINITY,
       onTick: () => {
         const target = findPlayer(client, deps, state.query, state.objectId);
         if (!target) {
@@ -555,23 +613,95 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
           return;
         }
         state.objectId = target.objectId;
+        const now = Date.now();
+        // Player.as:953 — teleport instead of walking once too far behind.
+        if (
+          client.distanceTo(target) > state.teleportDistance
+          && now - state.lastTeleportAt > state.teleportCooldownMs
+          && client.canTeleport()
+        ) {
+          const selection = selectClosestPlayerTeleport(
+            target,
+            teleportCandidates(client, deps),
+            client.getObjectId(),
+          );
+          if (selection.kind === 'teleport') {
+            state.lastTeleportAt = now;
+            client.teleportTo(selection.objectId);
+          }
+        }
         const targetMoved = state.lastX === undefined || state.lastY === undefined
           || Math.hypot(target.x - state.lastX, target.y - state.lastY) >= 0.1;
-        if (client.distanceTo(target) > 1.5 && (targetMoved || !client.isMoving())) {
-          client.moveToObject(target.objectId, 1.5);
-        } else if (client.distanceTo(target) <= 1.5 && client.isMoving()) {
+        if (client.distanceTo(target) > state.arriveThreshold && (targetMoved || !client.isMoving())) {
+          client.moveToObject(target.objectId, state.arriveThreshold);
+        } else if (client.distanceTo(target) <= state.arriveThreshold && client.isMoving()) {
           client.stopMoving();
         }
         state.lastX = target.x;
         state.lastY = target.y;
       },
-      onMapChange: () => stopFollowing(client),
+      // The follow survives the map change so it resumes on the other side.
+      onMapChange: () => {
+        state.lastX = undefined;
+        state.lastY = undefined;
+      },
+      // Player.as:1467 — the followed player vanished; take the portal they used.
+      onObjectRemoved: (object: TrackedObject) => {
+        if (!state.followIntoPortals || object.objectId !== state.objectId) return;
+        const portal = client.visibleObjects().find(
+          (candidate) => deps.gameData.getObjectCategory(candidate.type) === 'Portal'
+            && (candidate.x - object.x) ** 2 + (candidate.y - object.y) ** 2 <= 1,
+        );
+        if (!portal) return;
+        Logger.log('Walking', `followPlayer: following into portal ${portal.objectId}`);
+        client.usePortal(portal.objectId);
+      },
     };
     follows.set(client, state);
     client.on(ClientEvent.Tick, state.onTick);
     client.on(ClientEvent.MapChange, state.onMapChange);
+    client.on(ClientEvent.ObjectRemoved, state.onObjectRemoved);
     state.onTick();
     return true;
+  };
+  Walking.getAnchor = () => anchors.get(active(deps)) ?? '';
+  Walking.setAnchor = (name: string) => {
+    const anchor = name.trim();
+    anchors.set(active(deps), anchor);
+    return anchor;
+  };
+  Walking.anchorTeleport = () => {
+    const client = active(deps);
+    const command = anchorTeleportCommand(anchors.get(client) ?? '');
+    if (!command) {
+      Logger.warn('Walking', 'anchorTeleport: no anchor set — use Walking.setAnchor(name)');
+      return false;
+    }
+    client.say(command);
+    return true;
+  };
+  Walking.teleportToQuestPlayer = () => {
+    const client = active(deps);
+    if (!client.canTeleport()) {
+      Logger.warn('Walking', 'teleportToQuestPlayer: teleport not allowed in this map');
+      return 'not_allowed';
+    }
+    const questObjectId = questTargetId(client);
+    const quest = questObjectId > 0 ? client.getVisibleObject(questObjectId) : undefined;
+    const selection = selectQuestTeleportTarget({
+      questObjectId,
+      questPosition: quest ? { x: quest.x, y: quest.y } : undefined,
+      players: teleportCandidates(client, deps),
+      selfObjectId: client.getObjectId(),
+    });
+    switch (selection.kind) {
+      case 'teleport':
+        return client.teleportTo(selection.objectId) ? 'teleported' : 'not_allowed';
+      case 'none':
+        return 'no_players';
+      default:
+        return selection.kind;
+    }
   };
   Walking.enterPortal = (objectId: number) => {
     const client = active(deps);
@@ -620,6 +750,32 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
   Walking.disableAutoDodge = () => active(deps).disableAutoDodge();
   Walking.isAutoDodgeEnabled = () => optional(deps)?.isAutoDodgeEnabled() ?? false;
   Walking.getAutoDodgeState = () => optional(deps)?.getAutoDodgeState() ?? null;
+  Walking.enableProdMafiaAutoPlay = (options = {}) => (
+    active(deps).enableProdMafiaAutoPlay(options)
+  );
+  Walking.disableProdMafiaAutoPlay = () => active(deps).disableProdMafiaAutoPlay();
+  Walking.isProdMafiaAutoPlayEnabled = () => (
+    optional(deps)?.isProdMafiaAutoPlayEnabled() ?? false
+  );
+  Walking.getProdMafiaAutoPlayState = () => (
+    optional(deps)?.getProdMafiaAutoPlayState() ?? {
+      enabled: false,
+      state: 'disabled',
+      navigationMode: 'stop',
+      target: null,
+      targetObjectId: null,
+      arriveThreshold: 0.6,
+      allowWallEscape: true,
+      usePortalObjectId: null,
+      teleportObjectId: null,
+      nexus: false,
+      autoAim: false,
+      autoAbility: false,
+      combatTargetObjectId: null,
+      reconnectServerHost: null,
+      movementSpeedScale: 1,
+    }
+  );
   Walking.setDodgeMovementIntent = (intent: DodgeMovementIntent | null) => (
     active(deps).setDodgeMovementIntent(intent)
   );

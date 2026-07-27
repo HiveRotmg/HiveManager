@@ -3,12 +3,17 @@
 import './auto-vault';
 import './anti-spam';
 import './auto-quest';
+import './auto-responder';
+import './boss-phase-timer';
 import './chat-logger';
+import './follow-teleport';
 import './inventory-tracker';
 import './live-container-swap-test';
+import './o3-guard-capture';
 import './packet-logger';
 import './pet-bag-round-trip';
 import './pet-to-vault';
+import './portal-automation';
 import './realm-finder';
 import './realm-host-mapper';
 import './seasonal-vault-withdraw';

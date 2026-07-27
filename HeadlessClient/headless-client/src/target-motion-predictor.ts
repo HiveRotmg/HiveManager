@@ -7,6 +7,13 @@ export interface MotionObservation extends MotionPoint {
   objectId: number;
 }
 
+/** The fields consumed verbatim by ProdMafia's Player.leadEnemy. */
+export interface AutoAimMotion {
+  position: MotionPoint;
+  velocity: MotionPoint;
+  turnRate: number;
+}
+
 interface TimedPoint extends MotionPoint {
   at: number;
 }
@@ -205,6 +212,27 @@ export class TargetMotionPredictor {
     return {
       x: anchor.x + velocity.x * beyondMs,
       y: anchor.y + velocity.y * beyondMs,
+    };
+  }
+
+  /**
+   * Mirrors the target fields read by ProdMafia's auto aim: x_/y_, moveVec_
+   * and aimTurnRate_.  Keep this separate from the generic predictor so aim
+   * does not inherit any of its cycle/harmonic extrapolation.
+   */
+  autoAimMotion(objectId: number, fallback: MotionPoint, now: number): AutoAimMotion {
+    const track = this.tracks.get(objectId);
+    if (!track || !Number.isFinite(now) || now - track.lastObservedAt > MAX_MOTION_AGE_MS) {
+      return { position: { ...fallback }, velocity: { x: 0, y: 0 }, turnRate: 0 };
+    }
+    if (track.modelDirty) {
+      track.model = fitMotionModel(track.samples, this.model);
+      track.modelDirty = false;
+    }
+    return {
+      position: segmentPosition(track, now),
+      velocity: segmentVelocity(track),
+      turnRate: track.model?.kind === 'turn' ? track.model.omega : 0,
     };
   }
 }

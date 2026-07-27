@@ -223,6 +223,12 @@ export function predictAutoNexusRouteDamage(
     const landingOffset = aoe.landingTime - options.now;
     const dwellEnd = landingOffset + Math.max(0, aoe.blastDurationMs ?? 0);
     if (dwellEnd < 0 || landingOffset > leadMs) continue;
+    // AutoDodgeController.as:1863-1870. A one-off blast whose impact has already
+    // passed describes damage that already landed and was already applied to HP
+    // by the server. Charging it again is phantom damage that nexuses the player
+    // for an explosion that is over. Only an observed repeating location, or a
+    // blast still ahead of us, predicts damage we have yet to take.
+    if (landingOffset < 0 && aoe.repeating !== true) continue;
     const firstOffset = Math.max(0, landingOffset);
     const lastOffset = Math.min(leadMs, Math.max(firstOffset, dwellEnd));
     let hitAt: number | null = null;

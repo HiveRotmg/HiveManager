@@ -1,4 +1,5 @@
 import {
+  Classes,
   ConditionEffectBits,
   PlayerData,
   StatType,
@@ -10,15 +11,14 @@ import type {
 } from './combat-tracker';
 import type { WeaponAimPreview } from './command-sender';
 import type { TrackedObject } from './models';
-import { projectileDistanceAt as sharedProjectileDistanceAt } from './projectile-motion';
 import { TargetMotionPredictor, type MotionObservation } from './target-motion-predictor';
 
 /**
- * The four ProdMafia modes plus the retained `lowestHp` compatibility mode.
+ * The four ProdMafia auto-aim modes.
  * `closestToAim` is the client's "closest to cursor" mode; scripts supply its
  * cursor-equivalent world coordinate through `aimPoint`.
  */
-export type AutoAimMode = 'closest' | 'closestToAim' | 'maxHp' | 'lowestHp' | 'random';
+export type AutoAimMode = 'closest' | 'closestToAim' | 'maxHp' | 'random';
 
 export interface AutoAimOptions {
   mode?: AutoAimMode;
@@ -44,7 +44,43 @@ export interface AutoAimOptions {
   /** Source `AABoundingDist`, in tiles, for `closestToAim`. */
   boundingDistance?: number;
   weaponSlot?: number;
+  /**
+   * Source `avoidO3Shield`: never fire at Oryx the Mad God 3 while his GUARD
+   * sprite is raised, because further damage triggers a 30s unpurifiable
+   * Silence. The source detects the guard by alt-texture id but has not yet
+   * captured which id that is, so the ids live in `o3GuardAltTextureIds`.
+   */
+  avoidO3Shield?: boolean;
+  /**
+   * Alt-texture ids that mark O3's raised shield. Empty reproduces the source's
+   * current behaviour, where the capture is still outstanding and nothing is
+   * suppressed. Non-player objects carry this id in the BXP stat slot.
+   */
+  o3GuardAltTextureIds?: readonly number[];
 }
+
+/** One step of the source's Tomb boss rotation. */
+export interface TombBossPhase {
+  /** The name the source flashes when the key selects this boss. */
+  name: string;
+  /** Tomb of the Ancients type followed by its Ice Tomb counterpart. */
+  types: readonly number[];
+}
+
+/**
+ * Source `TombCycleKey` (`MapUserInput.as:763-798`): rotating which Tomb of the
+ * Ancients boss stays attackable kills them in the order the dungeon requires.
+ * Each step keeps one boss out of the ignore list and puts the other two in,
+ * covering the Ice Tomb variants alongside the originals.
+ */
+export const TOMB_BOSS_CYCLE: readonly TombBossPhase[] = [
+  // Tomb Support (0x0d26) / Ice Tomb Support (0x7fb4).
+  { name: 'Bes', types: [3366, 32692] },
+  // Tomb Attacker (0x0d27) / Ice Tomb Attacker (0x7fb5).
+  { name: 'Nut', types: [3367, 32693] },
+  // Tomb Defender (0x0d28) / Ice Tomb Defender (0x7fb6).
+  { name: 'Geb', types: [3368, 32694] },
+];
 
 export interface AutoAbilityOptions {
   /** Minimum current MP percentage (0-100). */
@@ -59,6 +95,33 @@ export interface AutoAbilityOptions {
   cooldownMs?: number;
   /** Teleporting abilities are skipped unless explicitly enabled. */
   allowTeleport?: boolean;
+  /**
+   * Source `spellbombHPThreshold`: minimum enemy MAX HP before a single-target
+   * ability (Wizard spellbomb, Archer quiver, Knight shield) may target it.
+   * Zero keeps the generic path, which only consults `minTargetHp`.
+   */
+  singleTargetHpThreshold?: number;
+  /**
+   * Source `skullHPThreshold`: the same gate for AoE abilities (Necromancer,
+   * Assassin, Huntress, Sorcerer, and a group-stasis Mystic). Zero disables it.
+   */
+  aoeHpThreshold?: number;
+  /**
+   * Source `skullTargets`: how many enemies must sit inside the AoE radius
+   * before the ability fires at that cluster. Zero keeps the generic
+   * single-target path, so `aoeHpThreshold` acts alone.
+   */
+  aoeMinTargets?: number;
+  /** Source `<Activate radius>` of the equipped AoE ability, in tiles. */
+  aoeRadius?: number;
+  /**
+   * Source `spamPrismNumber`: fire non-teleporting Trickster prisms in place
+   * once more than this many enemies are nearby. Zero disables the spam, and
+   * teleporting prisms are never spammed regardless of `allowTeleport`.
+   */
+  spamPrismTargets?: number;
+  /** Source `mysticAAShootGroup`: stasis enemy groups instead of the player. */
+  mysticStasisGroup?: boolean;
 }
 
 export interface AutoCombatState {
@@ -69,6 +132,8 @@ export interface AutoCombatState {
   fixedPosition: { x: number; y: number } | null;
   autoAim: Required<AutoAimOptions>;
   autoAbility: Required<AutoAbilityOptions>;
+  /** Name of the Tomb boss the rotation currently leaves attackable. */
+  tombBoss: string | null;
 }
 
 export interface AutoCombatSnapshot {
@@ -80,6 +145,7 @@ export interface AutoCombatSnapshot {
 }
 
 export interface AutoCombatActions {
+  /** Retained for command compatibility; ProdMafia auto aim does not consult it. */
   previewWeaponAim?(weaponSlot: number): WeaponAimPreview | null;
   shootAt(target: { x: number; y: number }, weaponSlot: number): boolean;
   useAbilityAt(target: { x: number; y: number }): boolean;
@@ -109,6 +175,8 @@ const DEFAULT_AUTO_AIM: Required<AutoAimOptions> = {
   aimPoint: { x: 0, y: 0 },
   boundingDistance: 4,
   weaponSlot: 0,
+  avoidO3Shield: true,
+  o3GuardAltTextureIds: [],
 };
 
 const DEFAULT_AUTO_ABILITY: Required<AutoAbilityOptions> = {
@@ -118,13 +186,79 @@ const DEFAULT_AUTO_ABILITY: Required<AutoAbilityOptions> = {
   range: 0,
   cooldownMs: 0,
   allowTeleport: false,
+  singleTargetHpThreshold: 0,
+  aoeHpThreshold: 0,
+  aoeMinTargets: 0,
+  aoeRadius: 0,
+  spamPrismTargets: 0,
+  mysticStasisGroup: false,
+};
+
+/**
+ * The source's shipped values for the class-specific gates
+ * (`Parameters.as:749-751`, `:980`, `:1000`). Our own defaults leave every one
+ * of these paths switched off so existing scripts keep the generic behaviour;
+ * pass this to `configureAutoAbility` to opt into the source's tuning.
+ */
+export const PRODMAFIA_AUTO_ABILITY_DEFAULTS: Readonly<AutoAbilityOptions> = {
+  singleTargetHpThreshold: 250,
+  aoeHpThreshold: 800,
+  aoeMinTargets: 5,
+  spamPrismTargets: 0,
+  mysticStasisGroup: false,
 };
 
 const DEFAULT_WEAPON_RANGE = 8;
 const DEFAULT_ABILITY_RANGE = 12;
 const DEFAULT_ABILITY_COOLDOWN_MS = 550;
-const SHOT_SPAWN_OFFSET = 0.3;
-const INTERCEPT_SAMPLE_MS = 8;
+
+/** Upper bounds of the source `spellbombHPThreshold` / `skullHPThreshold` choice lists. */
+const MAX_SINGLE_TARGET_HP_THRESHOLD = 20_000;
+const MAX_AOE_HP_THRESHOLD = 8_000;
+/** Upper bound shared by the `skullTargets` and `spamPrismNumber` choice lists. */
+const MAX_AOE_TARGETS = 10;
+
+/**
+ * Both nearby-enemy scans in the source gate on `getDistSquared(...) <= 225`
+ * — the prism count (`Player.as:2510`) and the cluster search
+ * (`Player.as:3036`).
+ */
+const AOE_SEARCH_RANGE = 15;
+
+/**
+ * Fallback AoE radius when none is configured: the top-tier `VampireBlast`
+ * radius from the source assets, the skull being what the cluster search was
+ * written for. The source instead reads `<Activate radius>` off the equipped
+ * ability, which our game data does not carry.
+ */
+const DEFAULT_AOE_RADIUS = 3.75;
+
+/** Oryx the Mad God 3 (`Player.as:2610`). */
+const ORYX3_TYPE = 0xb133;
+
+/**
+ * Non-player objects carry their alt-texture id in the BXP stat slot, which the
+ * source aliases as `StatData.ALT_TEXTURE_STAT`.
+ */
+const ALT_TEXTURE_STAT = StatType.BXP_STAT;
+
+/**
+ * Classes whose ability is single-target, and so gated on
+ * `spellbombHPThreshold`: the Wizard spellbomb takes the `rangeSq == 144`
+ * branch (`Player.as:2665`) while the Archer and Knight pass
+ * `applySpellbombThreshold` (`Player.as:2521-2529`).
+ */
+const SINGLE_TARGET_CLASSES: readonly number[] = [Classes.Wizard, Classes.Archer, Classes.Knight];
+
+/** The Sorcerer scepter takes the `rangeSq == 49` branch (`Player.as:2707`). */
+const AOE_TARGET_CLASSES: readonly number[] = [Classes.Sorcerer];
+
+/** Classes the source routes through `getNecroTarget` (`Player.as:2468-2483`). */
+const AOE_GROUP_CLASSES: readonly number[] = [
+  Classes.Assassin,
+  Classes.Necromancer,
+  Classes.Huntress,
+];
 
 /** Per-client target selection and firing state. Driven by Client's combat timer. */
 export class AutoCombatController {
@@ -135,6 +269,8 @@ export class AutoCombatController {
   private fixedObjectId: number | null = null;
   private fixedPosition: { x: number; y: number } | null = null;
   private selectedObjectId: number | null = null;
+  /** Index into `TOMB_BOSS_CYCLE`; -1 until the cycle is first advanced. */
+  private tombPhase = -1;
   private lastAbilityAt = -Infinity;
   private lastUpdateAt = -Infinity;
   // Auto Aim deliberately uses ProdMafia's conservative two-confirming-turn
@@ -196,8 +332,43 @@ export class AutoCombatController {
       aimPoint: next.aimPoint === undefined ? this.aim.aimPoint : finitePoint(next.aimPoint, this.aim.aimPoint),
       boundingDistance: finiteNonNegative(next.boundingDistance, this.aim.boundingDistance),
       weaponSlot: Math.trunc(finiteNonNegative(next.weaponSlot, this.aim.weaponSlot)),
+      avoidO3Shield: next.avoidO3Shield ?? this.aim.avoidO3Shield,
+      o3GuardAltTextureIds: next.o3GuardAltTextureIds === undefined
+        ? this.aim.o3GuardAltTextureIds
+        : normalizeObjectTypes(next.o3GuardAltTextureIds),
     };
     return true;
+  }
+
+  /**
+   * Advances the source's Tomb boss rotation and returns the boss that is now
+   * attackable. Like the source hotkey this works purely through the ignore
+   * list, so it needs `includeIgnored` (source `damageIgnored`) left off.
+   */
+  cycleTombBoss(): TombBossPhase {
+    this.tombPhase = (this.tombPhase + 1) % TOMB_BOSS_CYCLE.length;
+    const active = TOMB_BOSS_CYCLE[this.tombPhase]!;
+    const ignored = new Set(this.aim.ignoredTypes);
+    for (const phase of TOMB_BOSS_CYCLE) {
+      for (const type of phase.types) {
+        if (phase === active) ignored.delete(type);
+        else ignored.add(type);
+      }
+    }
+    this.aim.ignoredTypes = [...ignored];
+    return active;
+  }
+
+  /** Source `/tomb`: drops every Tomb boss type back out of the ignore list. */
+  clearTombBossCycle(): void {
+    const cycled = new Set(TOMB_BOSS_CYCLE.flatMap((phase) => phase.types));
+    this.aim.ignoredTypes = this.aim.ignoredTypes.filter((type) => !cycled.has(type));
+    this.tombPhase = -1;
+  }
+
+  /** The Tomb boss the cycle currently leaves attackable, or null when unused. */
+  getTombBoss(): TombBossPhase | null {
+    return TOMB_BOSS_CYCLE[this.tombPhase] ?? null;
   }
 
   enableAutoAbility(options?: AutoAbilityOptions): boolean {
@@ -214,6 +385,28 @@ export class AutoCombatController {
       range: finiteNonNegative(options.range, this.ability.range),
       cooldownMs: finiteNonNegative(options.cooldownMs, this.ability.cooldownMs),
       allowTeleport: options.allowTeleport ?? this.ability.allowTeleport,
+      singleTargetHpThreshold: clamp(
+        finiteNonNegative(options.singleTargetHpThreshold, this.ability.singleTargetHpThreshold),
+        0,
+        MAX_SINGLE_TARGET_HP_THRESHOLD,
+      ),
+      aoeHpThreshold: clamp(
+        finiteNonNegative(options.aoeHpThreshold, this.ability.aoeHpThreshold),
+        0,
+        MAX_AOE_HP_THRESHOLD,
+      ),
+      aoeMinTargets: Math.trunc(clamp(
+        finiteNonNegative(options.aoeMinTargets, this.ability.aoeMinTargets),
+        0,
+        MAX_AOE_TARGETS,
+      )),
+      aoeRadius: clamp(finiteNonNegative(options.aoeRadius, this.ability.aoeRadius), 0, AOE_SEARCH_RANGE),
+      spamPrismTargets: Math.trunc(clamp(
+        finiteNonNegative(options.spamPrismTargets, this.ability.spamPrismTargets),
+        0,
+        MAX_AOE_TARGETS,
+      )),
+      mysticStasisGroup: options.mysticStasisGroup ?? this.ability.mysticStasisGroup,
     };
     return true;
   }
@@ -231,6 +424,7 @@ export class AutoCombatController {
       fixedPosition: this.fixedPosition ? { ...this.fixedPosition } : null,
       autoAim: { ...this.aim, aimPoint: { ...this.aim.aimPoint } },
       autoAbility: { ...this.ability },
+      tombBoss: this.getTombBoss()?.name ?? null,
     };
   }
 
@@ -286,14 +480,14 @@ export class AutoCombatController {
 
     const player = snapshot.player;
     const weaponType = player.inventory?.[this.aim.weaponSlot] ?? -1;
-    const weaponAim = actions.previewWeaponAim?.(this.aim.weaponSlot) ?? undefined;
     const rangeProjectile = weaponType >= 0 ? this.data.getProjectile(weaponType, 0) : undefined;
-    const weaponProjectile = weaponType >= 0 && weaponAim
-      ? this.data.getProjectile(weaponType, weaponAim.projectileId) ?? rangeProjectile
-      : rangeProjectile;
-    const weaponRange = this.aim.range || projectileRange(rangeProjectile) || DEFAULT_WEAPON_RANGE;
+    // Direct port: Player.shootAutoAimWeaponAngle always takes projectiles_[0]
+    // and calcAvgSpeed/calcMaxRange from that definition.
+    const weaponRange = this.aim.range
+      || projectileRange(rangeProjectile, player.projSpeedMult, player.projLifeMult)
+      || DEFAULT_WEAPON_RANGE;
     const weaponCandidates = this.candidates(objects, snapshot.playerPos, weaponRange);
-    const selected = this.resolveTarget(weaponCandidates);
+    const selected = this.resolveTarget(weaponCandidates, weaponRange);
     const fixedPoint = this.fixedPosition;
     const shouldShoot = !!fixedPoint || this.fixedObjectId !== null || this.autoAimEnabled;
 
@@ -302,10 +496,9 @@ export class AutoCombatController {
         ? this.aimPoint(
             selected.object,
             snapshot.playerPos,
-            weaponProjectile,
+            rangeProjectile,
             player.projSpeedMult,
             player.projLifeMult,
-            weaponAim,
           )
         : null);
       this.selectedObjectId = selected?.object.objectId ?? null;
@@ -331,9 +524,8 @@ export class AutoCombatController {
     const definition = this.data.getObject(abilityType);
     if (definition?.usable === false) return;
     const effects = definition?.activateEffects?.map((effect) => effect.toLowerCase()) ?? [];
-    if (!this.ability.allowTeleport && effects.some((effect) => effect.includes('teleport'))) {
-      return;
-    }
+    const teleporting = effects.some((effect) => effect.includes('teleport'));
+    if (!this.ability.allowTeleport && teleporting) return;
     const maxMp = Math.max(0, player.maxMP ?? 0);
     const mpPercent = maxMp > 0 ? (player.mp ?? 0) / maxMp * 100 : 0;
     if (mpPercent < this.ability.minMpPercent) return;
@@ -341,19 +533,112 @@ export class AutoCombatController {
     const projectile = this.data.getProjectile(abilityType, 0);
     const range = this.ability.range || projectileRange(projectile) || DEFAULT_ABILITY_RANGE;
     const candidates = this.candidates(objects, snapshot.playerPos, range);
-    if (candidates.length < this.ability.minTargets) return;
-    const selected = this.fixedObjectId !== null
-      ? candidates.find((candidate) => candidate.object.objectId === this.fixedObjectId) ?? null
-      : weaponTarget && weaponTarget.distance <= range
-        ? weaponTarget
-        : this.selectCandidate(candidates);
-    if (selected && selected.hp < this.ability.minTargetHp) return;
-    const point = this.fixedPosition
-      ?? (selected ? this.aimPoint(selected.object, snapshot.playerPos, projectile) : snapshot.playerPos);
+    const inRange = candidates.filter((candidate) => candidate.distance < range);
+    if (inRange.length < this.ability.minTargets) return;
+    const point = this.abilityPoint(snapshot, objects, weaponTarget, inRange, range, projectile, teleporting);
+    if (!point) return;
     const itemCooldown = Math.max(DEFAULT_ABILITY_COOLDOWN_MS, definition?.cooldownMs ?? 0);
     const cooldown = Math.max(itemCooldown, this.ability.cooldownMs);
     if (now < this.lastAbilityAt + cooldown) return;
     if (actions.useAbilityAt(point)) this.lastAbilityAt = now;
+  }
+
+  /**
+   * Where the ability should be aimed, or null to hold this frame. The source
+   * splits this by class in `Player.useAutoAbility`, so the class-specific
+   * branches take precedence over the generic single-target selection; each one
+   * stays inert until its own option is turned on.
+   */
+  private abilityPoint(
+    snapshot: AutoCombatSnapshot,
+    objects: TrackedObject[],
+    weaponTarget: TargetCandidate | null,
+    inRange: TargetCandidate[],
+    range: number,
+    projectile: CombatProjectileDefinition | undefined,
+    teleporting: boolean,
+  ): { x: number; y: number } | null {
+    const playerClass = snapshot.player?.class ?? -1;
+
+    // Trickster prisms are thrown in place and never lead a target
+    // (`Player.as:2506-2519`). The source's Trickster branch bails out entirely
+    // when the prism teleports, so `allowTeleport` cannot re-enable it here.
+    if (playerClass === Classes.Trickster && this.ability.spamPrismTargets > 0) {
+      if (teleporting) return null;
+      const nearby = this.countNearbyEnemies(objects, snapshot.playerPos);
+      return nearby > this.ability.spamPrismTargets ? { ...snapshot.playerPos } : null;
+    }
+
+    // Cluster targeting for the AoE abilities, plus a Mystic asked to stasis
+    // groups rather than itself (`Player.as:2468-2483`, `:2562`).
+    const groupTargeting = AOE_GROUP_CLASSES.includes(playerClass)
+      || (playerClass === Classes.Mystic && this.ability.mysticStasisGroup);
+    if (groupTargeting && this.ability.aoeMinTargets > 0) {
+      const cluster = this.clusterTarget(objects, snapshot.playerPos);
+      if (cluster) return { x: cluster.object.x, y: cluster.object.y };
+      // Only the Necromancer falls back to raising its summons in place.
+      return playerClass === Classes.Necromancer ? { ...snapshot.playerPos } : null;
+    }
+
+    const threshold = SINGLE_TARGET_CLASSES.includes(playerClass)
+      ? this.ability.singleTargetHpThreshold
+      : AOE_TARGET_CLASSES.includes(playerClass) ? this.ability.aoeHpThreshold : 0;
+    // Both source thresholds compare against MAX HP, not current HP, despite the
+    // option text; `minTargetHp` keeps its own current-HP meaning.
+    const pool = threshold > 0 ? inRange.filter((candidate) => candidate.maxHp >= threshold) : inRange;
+    if (pool.length < this.ability.minTargets) return null;
+    const selected = this.fixedObjectId !== null
+      ? pool.find((candidate) => candidate.object.objectId === this.fixedObjectId) ?? null
+      : weaponTarget && weaponTarget.distance <= range && weaponTarget.maxHp >= threshold
+        ? weaponTarget
+        : this.selectCandidate(pool, range);
+    if (selected && selected.hp < this.ability.minTargetHp) return null;
+    return this.fixedPosition
+      ?? (selected ? this.aimPoint(selected.object, snapshot.playerPos, projectile) : snapshot.playerPos);
+  }
+
+  /**
+   * Port of the prism count at `Player.as:2509-2511`, which walks every object
+   * and only checks `isEnemy` and the 15-tile radius — no HP, condition or
+   * ignore-list filtering.
+   */
+  private countNearbyEnemies(objects: TrackedObject[], playerPos: { x: number; y: number }): number {
+    let count = 0;
+    for (const object of objects) {
+      if (!this.data.getObject(object.type)?.isEnemy) continue;
+      if (Math.hypot(object.x - playerPos.x, object.y - playerPos.y) <= AOE_SEARCH_RANGE) count++;
+    }
+    return count;
+  }
+
+  /**
+   * Port of `Player.getNecroTarget` and `Player.getNumNearbyEnemies`
+   * (`Player.as:3027-3062`): the enemy within 15 tiles that has the most
+   * above-threshold company inside the ability radius. Both the centre and its
+   * neighbours must clear `aoeHpThreshold`, and the count must strictly exceed
+   * `aoeMinTargets`, matching the source's comparisons.
+   */
+  private clusterTarget(objects: TrackedObject[], playerPos: { x: number; y: number }): TargetCandidate | null {
+    const radius = this.ability.aoeRadius || DEFAULT_AOE_RADIUS;
+    const minTargets = this.ability.aoeMinTargets;
+    // Reusing the aim filter also applies the ignore/exception lists, so the
+    // Tomb rotation keeps holding for abilities as well as the weapon.
+    const eligible = this.candidates(objects, playerPos, AOE_SEARCH_RANGE)
+      .filter((candidate) => candidate.maxHp >= this.ability.aoeHpThreshold);
+    let best: TargetCandidate | null = null;
+    let bestCount = 0;
+    for (const centre of eligible) {
+      if (centre.distance > AOE_SEARCH_RANGE) continue;
+      const count = eligible.filter((other) => Math.hypot(
+        other.object.x - centre.object.x,
+        other.object.y - centre.object.y,
+      ) <= radius).length;
+      if (count > minTargets && count > bestCount) {
+        best = centre;
+        bestCount = count;
+      }
+    }
+    return bestCount < minTargets ? null : best;
   }
 
   private candidates(objects: TrackedObject[], playerPos: { x: number; y: number }, range: number): TargetCandidate[] {
@@ -364,6 +649,7 @@ export class AutoCombatController {
       if (!this.aim.shootAtWalls && definition.isCharacter === false) continue;
       if (!this.aim.includeIgnored && this.aim.ignoredTypes.includes(object.type)) continue;
       if (this.aim.onlyExcepted && !this.aim.exceptedTypes.includes(object.type)) continue;
+      if (this.isO3ShieldBlocked(object)) continue;
       const condition = object.player?.condition ?? rawNumber(object, StatType.CONDITION_STAT, 0);
       const blocked = ConditionEffectBits.PAUSED | ConditionEffectBits.STASIS | ConditionEffectBits.INVINCIBLE;
       if ((condition & blocked) !== 0) continue;
@@ -371,9 +657,6 @@ export class AutoCombatController {
       const hp = object.player?.hp ?? rawNumber(object, StatType.HP_STAT, definition.maxHp ?? 0);
       if (hp <= 0) continue;
       const distance = Math.hypot(object.x - playerPos.x, object.y - playerPos.y);
-      // ProdMafia's `< range` range test intentionally does not select a
-      // target exactly on the outer edge.
-      if (distance >= range) continue;
       const maxHp = object.player?.maxHP ?? rawNumber(object, StatType.MAX_HP_STAT, definition.maxHp ?? hp);
       result.push({
         object,
@@ -387,38 +670,89 @@ export class AutoCombatController {
     return result;
   }
 
-  private resolveTarget(candidates: TargetCandidate[]): TargetCandidate | null {
-    if (this.fixedObjectId !== null) {
-      return candidates.find((candidate) => candidate.object.objectId === this.fixedObjectId) ?? null;
-    }
-    return this.autoAimEnabled || this.autoAbilityEnabled ? this.selectCandidate(candidates) : null;
+  /**
+   * Port of `Player.isO3ShieldBlocked`. Damaging Oryx 3 through his guard makes
+   * him counter with a 30s unpurifiable Silence, which for an unattended client
+   * means no abilities and a likely death. The source identifies the guard by
+   * its alt-texture swap rather than a condition bit, because O3's ordinary
+   * Invulnerable and Armored spells are harmless; it has not captured the guard
+   * id yet, so the ids stay configurable and an empty list suppresses nothing.
+   */
+  private isO3ShieldBlocked(object: TrackedObject): boolean {
+    if (!this.aim.avoidO3Shield || object.type !== ORYX3_TYPE) return false;
+    if (this.aim.o3GuardAltTextureIds.length === 0) return false;
+    return this.aim.o3GuardAltTextureIds.includes(rawNumber(object, ALT_TEXTURE_STAT, -1));
   }
 
-  private selectCandidate(candidates: TargetCandidate[]): TargetCandidate | null {
+  private resolveTarget(candidates: TargetCandidate[], range: number): TargetCandidate | null {
+    if (this.fixedObjectId !== null) {
+      return candidates.find((candidate) => candidate.object.objectId === this.fixedObjectId && candidate.distance < range) ?? null;
+    }
+    return this.autoAimEnabled || this.autoAbilityEnabled ? this.selectCandidate(candidates, range) : null;
+  }
+
+  /** Direct structural port of Player.calcAimAngle's target-selection loop. */
+  private selectCandidate(candidates: TargetCandidate[], range: number): TargetCandidate | null {
     if (candidates.length === 0) return null;
-    // Matches ProdMafia's two-pass scan: prefer any boss, then retry all
-    // eligible enemies if no boss was found. A Quest flag is sufficient; the
-    // old HP threshold incorrectly discarded low-HP quest targets.
-    const bosses = this.aim.bossPriority ? candidates.filter((candidate) => candidate.boss) : [];
-    const pool = bosses.length > 0 ? bosses : candidates;
+    const scans = this.aim.bossPriority ? [true, false] : [false];
+    for (const bossOnly of scans) {
+      const pool = bossOnly ? candidates.filter((candidate) => candidate.boss) : candidates;
+      if (pool.length === 0) continue;
+      const selected = this.selectProdMafiaMode(pool, range, bossOnly);
+      if (selected) return selected;
+    }
+    return null;
+  }
+
+  private selectProdMafiaMode(pool: TargetCandidate[], range: number, bossOnly: boolean): TargetCandidate | null {
     switch (this.aim.mode) {
       case 'closestToAim': {
         const origin = this.aim.aimPoint;
-        const bound = this.aim.boundingDistance;
-        return [...pool]
-          .filter((candidate) => Math.hypot(candidate.object.x - origin.x, candidate.object.y - origin.y) <= bound)
-          .sort((a, b) => Math.hypot(a.object.x - origin.x, a.object.y - origin.y)
-            - Math.hypot(b.object.x - origin.x, b.object.y - origin.y))[0] ?? null;
+        const boundSq = this.aim.boundingDistance ** 2;
+        let best: TargetCandidate | null = null;
+        let bestDistanceSq = Infinity;
+        for (const candidate of pool) {
+          if (candidate.distance > range) continue; // source mode 0 is <=
+          const cursorDistanceSq = (candidate.object.x - origin.x) ** 2 + (candidate.object.y - origin.y) ** 2;
+          if (cursorDistanceSq > boundSq) continue;
+          // Player.as intentionally uses the last boss encountered here.
+          if (bossOnly || cursorDistanceSq <= bestDistanceSq) {
+            best = candidate;
+            bestDistanceSq = cursorDistanceSq;
+          }
+        }
+        return best;
       }
-      case 'maxHp':
-        return [...pool].sort((a, b) => b.maxHp - a.maxHp || b.hp - a.hp || a.distance - b.distance)[0] ?? null;
-      case 'lowestHp':
-        return [...pool].sort((a, b) => a.hp - b.hp || a.distance - b.distance)[0] ?? null;
+      case 'maxHp': {
+        let best: TargetCandidate | null = null;
+        let bestMaxHp = -2_147_483_648;
+        let bestHp = -2_147_483_648;
+        let bestDistance = Infinity;
+        for (const candidate of pool) {
+          if (candidate.distance >= range || candidate.maxHp < bestMaxHp) continue;
+          // This is deliberately the same ordering/overwrite behaviour as
+          // Player.calcAimAngle, including its scan-order tie handling.
+          if (candidate.maxHp === bestMaxHp && candidate.hp <= bestHp
+            && !(candidate.hp === bestHp && candidate.distance > bestDistance)) {
+            best = candidate;
+            bestHp = candidate.hp;
+            bestDistance = candidate.distance;
+          }
+          best = candidate;
+          bestMaxHp = candidate.maxHp;
+          bestHp = candidate.hp;
+          bestDistance = candidate.distance;
+          if (bossOnly) return best;
+        }
+        return best;
+      }
       case 'random':
-        return pool[Math.floor(Math.random() * pool.length)] ?? null;
+        if (bossOnly) return pool.find((candidate) => candidate.distance < range) ?? null;
+        { const eligible = pool.filter((candidate) => candidate.distance < range); return eligible[Math.floor(Math.random() * eligible.length)] ?? null; }
       case 'closest':
       default:
-        return [...pool].sort((a, b) => a.distance - b.distance)[0] ?? null;
+        return pool.filter((candidate) => candidate.distance < range)
+          .sort((a, b) => a.distance - b.distance)[0] ?? null;
     }
   }
 
@@ -428,19 +762,12 @@ export class AutoCombatController {
     projectile: CombatProjectileDefinition | undefined,
     speedMultiplier = 1,
     lifetimeMultiplier = 1,
-    shotProfile?: WeaponAimPreview,
   ): { x: number; y: number } {
-    const current = this.motion.currentPosition(object.objectId, object, this.lastUpdateAt);
+    const motion = this.motion.autoAimMotion(object.objectId, object, this.lastUpdateAt);
+    const current = motion.position;
     if (!this.aim.leadTargets || !projectile) return current;
-    return predictedInterceptPoint(
-      playerPos,
-      current,
-      projectile,
-      speedMultiplier,
-      lifetimeMultiplier,
-      shotProfile,
-      (futureMs) => this.motion.predictPosition(object.objectId, object, this.lastUpdateAt, futureMs),
-    ) ?? current;
+    return prodMafiaLeadEnemy(playerPos, current, motion.velocity, motion.turnRate,
+      projectileAverageSpeed(projectile, speedMultiplier, lifetimeMultiplier)) ?? current;
   }
 }
 
@@ -452,10 +779,28 @@ function rawNumber(object: TrackedObject, stat: number, fallback: number): numbe
 
 function projectileRange(
   projectile: CombatProjectileDefinition | undefined,
+  speedMultiplier = 1,
+  lifetimeMultiplier = 1,
 ): number {
-  return projectile && projectile.speed > 0 && projectile.lifetimeMs > 0
-    ? projectile.speed * projectile.lifetimeMs / 10_000
-    : 0;
+  if (!projectile) return 0;
+  // ProjectileProperties.calcMaxRange -> calcDistance, copied directly.
+  if (projectile.laserDistance && projectile.laserDistance > 0) return projectile.laserDistance;
+  const elapsed = projectile.lifetimeMs * validMultiplier(lifetimeMultiplier);
+  const baseSpeed = projectile.speed * validMultiplier(speedMultiplier) / 10_000;
+  let distance = baseSpeed * elapsed;
+  if (projectile.acceleration === 0 || elapsed <= projectile.accelerationDelay) return distance;
+  const accelerationTime = elapsed - projectile.accelerationDelay;
+  const accelerationPerMs = projectile.acceleration / 10_000_000;
+  const clampSpeed = projectile.speedClamp / 10_000;
+  const speedDifference = projectile.acceleration > 0
+    ? Math.max(clampSpeed, baseSpeed) - baseSpeed
+    : Math.min(clampSpeed, baseSpeed) - baseSpeed;
+  const timeToClamp = speedDifference / accelerationPerMs;
+  if (accelerationTime <= timeToClamp) {
+    return distance + 0.5 * accelerationPerMs * accelerationTime ** 2;
+  }
+  distance += 0.5 * accelerationPerMs * timeToClamp ** 2;
+  return distance + speedDifference * (accelerationTime - timeToClamp);
 }
 
 function normalizeMode(mode: string): AutoAimMode | null {
@@ -465,7 +810,6 @@ function normalizeMode(mode: string): AutoAimMode | null {
     case 'closesttocursor':
     case 'cursor': return 'closestToAim';
     case 'maxhp': return 'maxHp';
-    case 'lowesthp': return 'lowestHp';
     case 'random': return 'random';
     default: return null;
   }
@@ -496,143 +840,65 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-function predictedInterceptPoint(
+/** Direct TypeScript port of Player.leadEnemy (including five arc refinements). */
+function prodMafiaLeadEnemy(
   shooter: { x: number; y: number },
-  currentTarget: { x: number; y: number },
-  projectile: CombatProjectileDefinition,
-  speedMultiplier: number,
-  lifetimeMultiplier: number,
-  shotProfile: WeaponAimPreview | undefined,
-  targetAt: (futureMs: number) => { x: number; y: number },
+  target: { x: number; y: number },
+  velocity: { x: number; y: number },
+  turnRate: number,
+  projectileSpeed: number,
 ): { x: number; y: number } | null {
-  const lifetime = projectile.lifetimeMs * validMultiplier(lifetimeMultiplier);
-  if (lifetime <= 0) return null;
-  const separation = (time: number): number => {
-    const target = time === 0 ? currentTarget : targetAt(time);
-    const projectilePosition = projectileLocalPositionAt(
-      projectile,
-      time,
-      speedMultiplier,
-      lifetimeMultiplier,
-      shotProfile,
-    );
-    return Math.hypot(target.x - shooter.x, target.y - shooter.y)
-      - Math.hypot(projectilePosition.x, projectilePosition.y);
-  };
-  const aimAt = (time: number): { x: number; y: number } | null => {
-    const target = time === 0 ? currentTarget : targetAt(time);
-    const targetX = target.x - shooter.x;
-    const targetY = target.y - shooter.y;
-    const targetDistance = Math.hypot(targetX, targetY);
-    const projectilePosition = projectileLocalPositionAt(
-      projectile,
-      time,
-      speedMultiplier,
-      lifetimeMultiplier,
-      shotProfile,
-    );
-    const projectileDistance = Math.hypot(projectilePosition.x, projectilePosition.y);
-    if (targetDistance <= 1e-9 || projectileDistance <= 1e-9) return null;
-    const baseAngle = Math.atan2(targetY, targetX)
-      - Math.atan2(projectilePosition.y, projectilePosition.x);
-    return {
-      x: shooter.x + targetDistance * Math.cos(baseAngle),
-      y: shooter.y + targetDistance * Math.sin(baseAngle),
-    };
-  };
-
-  let previousTime = 0;
-  let previousSeparation = separation(0);
-  if (Math.abs(previousSeparation) <= 1e-9) return aimAt(0);
-  for (let time = Math.min(INTERCEPT_SAMPLE_MS, lifetime); time <= lifetime; time += INTERCEPT_SAMPLE_MS) {
-    const currentTime = Math.min(time, lifetime);
-    const currentSeparation = separation(currentTime);
-    if (Math.abs(currentSeparation) <= 1e-9
-      || Math.sign(currentSeparation) !== Math.sign(previousSeparation)) {
-      let low = previousTime;
-      let high = currentTime;
-      const lowSign = Math.sign(previousSeparation);
-      for (let iteration = 0; iteration < 20; iteration++) {
-        const middle = (low + high) * 0.5;
-        if (Math.sign(separation(middle)) === lowSign) low = middle;
-        else high = middle;
-      }
-      return aimAt(high);
-    }
-    previousTime = currentTime;
-    previousSeparation = currentSeparation;
-    if (currentTime === lifetime) break;
-    if (time + INTERCEPT_SAMPLE_MS > lifetime) time = lifetime - INTERCEPT_SAMPLE_MS;
+  if (Math.abs(turnRate) < 0.00001 || projectileSpeed <= 0 || Number.isNaN(projectileSpeed)) {
+    if (projectileSpeed <= 0 || Number.isNaN(projectileSpeed)) return { ...target };
+    return prodMafiaLinearLead(shooter, target, velocity, projectileSpeed);
   }
-  return null;
-}
-
-function projectileLocalPositionAt(
-  projectile: CombatProjectileDefinition,
-  elapsedMs: number,
-  speedMultiplier = 1,
-  lifetimeMultiplier = 1,
-  shotProfile?: WeaponAimPreview,
-): { x: number; y: number } {
-  const profile = shotProfile ?? {
-    projectileId: 0,
-    bulletId: 0,
-    angleOffset: 0,
-    spawnDistance: SHOT_SPAWN_OFFSET,
-    spawnOffsetX: 0,
-  };
-  const trajectoryLifetime = projectile.trajectoryLifetimeMs ?? projectile.lifetimeMs;
-  const elapsed = Math.max(0, Math.min(
-    projectile.lifetimeMs * validMultiplier(lifetimeMultiplier),
-    elapsedMs,
-  ));
-  const phase = profile.bulletId % 2 === 0 ? 0 : Math.PI;
-  let travelX: number;
-  let travelY: number;
-
-  if (projectile.parametric) {
-    const t = trajectoryLifetime > 0 ? elapsed / trajectoryLifetime * 2 * Math.PI : 0;
-    travelX = Math.sin(t) * (profile.bulletId % 2 ? 1 : -1) * projectile.magnitude;
-    travelY = Math.sin(2 * t) * (profile.bulletId % 4 < 2 ? 1 : -1) * projectile.magnitude;
-  } else {
-    const distance = projectileDistanceAt(projectile, elapsed, speedMultiplier, lifetimeMultiplier);
-    if (projectile.wavy) {
-      const waveAngle = Math.PI / 64 * Math.sin(phase + 6 * Math.PI * elapsed / 1000);
-      travelX = distance * Math.cos(waveAngle);
-      travelY = distance * Math.sin(waveAngle);
+  let interceptTime = Math.hypot(target.x - shooter.x, target.y - shooter.y) / projectileSpeed;
+  let predicted = { ...target };
+  for (let iteration = 0; iteration < 5; iteration++) {
+    const turn = Math.max(-Math.PI, Math.min(Math.PI, turnRate * interceptTime));
+    const effectiveRate = interceptTime > 0 ? turn / interceptTime : turnRate;
+    if (Math.abs(effectiveRate) < 0.0000001) {
+      predicted = { x: target.x + velocity.x * interceptTime, y: target.y + velocity.y * interceptTime };
     } else {
-      travelX = distance;
-      travelY = projectile.amplitude * Math.sin(
-        phase + (trajectoryLifetime > 0 ? elapsed / trajectoryLifetime : 0)
-          * projectile.frequency * 2 * Math.PI,
-      );
+      const sin = Math.sin(turn);
+      const cos = Math.cos(turn);
+      predicted = {
+        x: target.x + (velocity.x * sin + velocity.y * (cos - 1)) / effectiveRate,
+        y: target.y + (velocity.x * (1 - cos) + velocity.y * sin) / effectiveRate,
+      };
     }
+    const refined = Math.hypot(predicted.x - shooter.x, predicted.y - shooter.y) / projectileSpeed;
+    if (Math.abs(refined - interceptTime) < 0.5) break;
+    interceptTime = refined;
   }
-
-  const cos = Math.cos(profile.angleOffset);
-  const sin = Math.sin(profile.angleOffset);
-  return {
-    x: profile.spawnDistance + travelX * cos - travelY * sin,
-    y: profile.spawnOffsetX + travelX * sin + travelY * cos,
-  };
+  return predicted;
 }
 
-function projectileDistanceAt(
-  projectile: CombatProjectileDefinition,
-  elapsedMs: number,
-  speedMultiplier = 1,
-  lifetimeMultiplier = 1,
-): number {
-  return sharedProjectileDistanceAt(projectile, elapsedMs, {
-    speedMultiplier,
-    lifetimeMultiplier,
-    // auto-combat folds boomerangs unconditionally, clamps elapsed, and floors
-    // the result at zero; combat-tracker does none of the three. Preserving each
-    // call site exactly - see the divergence note in projectile-motion.ts.
-    applyBoomerang: true,
-    clampElapsed: true,
-    floorAtZero: true,
-  });
+function prodMafiaLinearLead(shooter: { x: number; y: number }, target: { x: number; y: number }, velocity: { x: number; y: number }, speed: number): { x: number; y: number } | null {
+  const dx = target.x - shooter.x;
+  const dy = target.y - shooter.y;
+  const a = velocity.x ** 2 + velocity.y ** 2 - speed ** 2;
+  const b = 2 * (dx * velocity.x + dy * velocity.y);
+  const c = dx ** 2 + dy ** 2;
+  let time = Infinity;
+  if (Math.abs(a) < 1e-10) {
+    if (Math.abs(b) > 1e-10) { const value = -c / b; if (value >= 0) time = value; }
+  } else {
+    const discriminant = b ** 2 - 4 * a * c;
+    if (discriminant >= 0) {
+      const root = Math.sqrt(discriminant);
+      const first = (-b - root) / (2 * a);
+      const second = (-b + root) / (2 * a);
+      if (first >= 0) time = first;
+      if (second >= 0 && second < time) time = second;
+    }
+  }
+  return Number.isFinite(time) ? { x: target.x + velocity.x * time, y: target.y + velocity.y * time } : null;
+}
+
+function projectileAverageSpeed(projectile: CombatProjectileDefinition, speedMultiplier = 1, lifetimeMultiplier = 1): number {
+  const lifetime = projectile.lifetimeMs * validMultiplier(lifetimeMultiplier);
+  return lifetime > 0 ? projectileRange(projectile, speedMultiplier, lifetimeMultiplier) / lifetime : 0;
 }
 
 function validMultiplier(value: number | undefined): number {

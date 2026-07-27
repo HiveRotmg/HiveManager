@@ -61,6 +61,7 @@ import {
   IncomingPartyMemberInfoPacket,
   PartyMemberAddedPacket,
   PartyActionPacket,
+  QuestObjectIdPacket,
   parseEnchantments,
 } from 'realmlib';
 import {
@@ -76,6 +77,20 @@ import {
   type AutoCombatState,
 } from './auto-combat';
 import {
+  AutoConsumablesController,
+  DEFAULT_AUTO_CONSUMABLES,
+  type AutoConsumablesOptions,
+  type AutoConsumablesState,
+  type PotionStatSnapshot,
+} from './auto-consumables';
+import {
+  AutoLootController,
+  DEFAULT_AUTO_LOOT,
+  itemCatalogLootData,
+  type AutoLootOptions,
+  type AutoLootState,
+} from './auto-loot';
+import {
   AutoNexusMonitor,
   calculateAutoNexusDamage,
   isAutoNexusSafeMap,
@@ -89,12 +104,28 @@ import { ClientLifecycle, ClientLifecycleState } from './client-lifecycle';
 import { CommandSender, type SlotRef } from './command-sender';
 import {
   CombatTracker,
+  ENEMY_SHOOT_LAUNCH_MATCH_DISTANCE,
+  EnemyShootRecovery,
+  enemyShootObservation,
+  enemyShotCount,
   type CombatProjectileDefinition,
   type CombatProjectileSnapshot,
+  type EnemyShootRecoveryMode,
+  type EnemyShootResolveContext,
+  type PendingEnemyShoot,
 } from './combat-tracker';
-import { BUILD_VERSION, GAME_ID, GAME_PORT, HELLO_TOKEN } from './constants';
+import {
+  BUILD_VERSION,
+  FRAME_STALL_THRESHOLD_MS,
+  GAME_ID,
+  GAME_PORT,
+  HELLO_TOKEN,
+  MAX_SINK_LEVEL,
+} from './constants';
 import { config } from './config';
 import { ClientEvent } from './events';
+import { planVaultDepositAll, VAULT_SWEEP_STAGGER_MS } from './inventory';
+import { loadItemCatalog, type ItemCatalog } from './item-metadata';
 import {
   type CombatPathfindingRange,
 } from './explorative-pathfinder';
@@ -124,6 +155,11 @@ import {
   type TrackedThrownAoe,
 } from './predictive-auto-dodge';
 import { ProdMafiaAutoDodgeController } from './prodmafia-auto-dodge';
+import {
+  ProdMafiaAutoPlayController,
+  type ProdMafiaAutoPlayDecision,
+  type ProdMafiaAutoPlayOptions,
+} from './prodmafia-autoplay';
 import { RealmPortal, ClientOptions, ClientServer, TrackedObject, TrackedTile } from './models';
 import { PortalTracker } from './portal-tracker';
 import { connectThroughProxy, proxyConfigToUrl } from './proxy';
@@ -422,6 +458,12 @@ export class Client extends EventEmitter {
   private readonly pathfinder: ProdMafiaPathfinder;
   private readonly dodgeWorld: DodgeCollisionWorld | undefined;
   private readonly autoDodge: ProdMafiaAutoDodgeController | undefined;
+  private readonly prodMafiaAutoPlay = new ProdMafiaAutoPlayController();
+  private prodMafiaSavedAutomation: {
+    autoDodge: boolean;
+    autoAim: boolean;
+    autoAbility: boolean;
+  } | undefined;
   private dodgeDiagnosticsEnabled = false;
   private dodgeDiagnosticSequence = 0;
   private dodgeMoveSequence = 0;
@@ -448,6 +490,9 @@ export class Client extends EventEmitter {
   private readonly portalTracker = new PortalTracker();
   private readonly autoNexus: AutoNexusMonitor;
   private readonly combat: CombatTracker | undefined;
+  /** Queues ENEMYSHOOTs whose owner has not streamed in yet; see EnemyShootRecovery. */
+  private readonly enemyShootRecovery: EnemyShootRecovery | undefined;
+  private lastEnemyShootRecoveryLogAt = 0;
   private readonly weaponEnchantRateCache = new Map<string, number>();
   /** Debug protection matching ProdMafia's Partial Godmode. Defaults off. */
   private partialGodModeEnabled = false;
@@ -458,6 +503,13 @@ export class Client extends EventEmitter {
   private readonly viewerAoes: ViewerAoeSnapshot[] = [];
   private nextViewerAoeId = 1;
   private readonly autoCombat: AutoCombatController | undefined;
+  private readonly autoConsumables = new AutoConsumablesController();
+  /** Auto Loot needs object XML; both are loaded on first use, not at startup. */
+  private itemCatalog: ItemCatalog | undefined;
+  private autoLoot: AutoLootController | undefined;
+  /** Client time of the last INVSWAP from any source; Auto Loot paces off it. */
+  private lastInvSwapAt: number | null = null;
+  private vaultSweepTimers: TimerHandle[] = [];
   private readonly commands = new CommandSender(() => ({
     io: this.io,
     time: this.time(),
@@ -565,6 +617,17 @@ export class Client extends EventEmitter {
   private connectStart = Date.now();
   private lastFrameTime = 0;
   private lastLocalMovementAt = 0;
+  /** ProdMafia `Player.sinkLevel`: depth into a `<Sinking />` tile, 0-18, per MOVE. */
+  private sinkLevel = 0;
+  /** Local frames whose delta exceeded {@link FRAME_STALL_THRESHOLD_MS}. */
+  private frameStallCount = 0;
+  private worstFrameMs = 0;
+  private lastFrameStallLoggedAt = 0;
+  /** Frame delta of the most recent local frame, for hit-vs-stall correlation. */
+  private lastFrameDeltaMs = 0;
+  /** Hits reported while the previous local frame overran the stall threshold. */
+  private hitsDuringStalledFrames = 0;
+  private hitsReported = 0;
   private lastGroundDamageAt = 0;
   private conditionDamageRemainder = 0;
   private lastCombatDamageAt = -Infinity;
@@ -581,6 +644,7 @@ export class Client extends EventEmitter {
   private mapWidth = 0;
   private mapHeight = 0;
   private allowPlayerTeleport = false;
+  private questObjectId = -1;
   private lastInvResult: InvResultSnapshot | undefined;
   private lastVaultContent: VaultContentSnapshot | undefined;
   /** Latest slot contents learned from successful INVRESULTs, keyed by container object id. */
@@ -662,15 +726,27 @@ export class Client extends EventEmitter {
       ? new CombatTracker(
           opts.combatData,
           (packet) => this.io.send(packet),
-          (hit) => this.applyPredictedDamage(
-            hit.damage,
-            !!hit.projectile.armorPiercing,
-            'projectile',
-            { ownerId: hit.ownerId, bulletId: hit.bulletId },
-          ),
+          (hit) => {
+            this.recordHitFrameTiming();
+            return this.applyPredictedDamage(
+              hit.damage,
+              !!hit.projectile.armorPiercing,
+              'projectile',
+              { ownerId: hit.ownerId, bulletId: hit.bulletId },
+            );
+          },
         )
       : undefined;
+    this.enemyShootRecovery = opts.combatData
+      ? new EnemyShootRecovery(opts.combatData)
+      : undefined;
     this.autoCombat = opts.combatData ? new AutoCombatController(opts.combatData) : undefined;
+    const autoLoot = opts.autoLoot ?? config.autoLoot;
+    if (autoLoot) this.enableAutoLoot(autoLoot === true ? undefined : autoLoot);
+    const autoConsumables = opts.autoConsumables ?? config.autoConsumables;
+    if (autoConsumables) {
+      this.enableAutoConsumables(autoConsumables === true ? undefined : autoConsumables);
+    }
   }
 
   //#region typed event surface
@@ -935,6 +1011,47 @@ export class Client extends EventEmitter {
 
   getAutoDodgeState(): AutoDodgeState | null {
     return this.autoDodge?.getState() ?? null;
+  }
+
+  /** Starts ProdMafia's complete Auto Play target, pathing, combat and dodge loop. */
+  enableProdMafiaAutoPlay(options: ProdMafiaAutoPlayOptions = {}): boolean {
+    if (!this.autoDodge || !this.dodgeWorld || !this.combat || !this.autoCombat) return false;
+    if (!this.prodMafiaAutoPlay.isEnabled()) {
+      const combatState = this.autoCombat.getState();
+      this.prodMafiaSavedAutomation = {
+        autoDodge: this.autoDodge.isEnabled(),
+        autoAim: combatState.autoAimEnabled,
+        autoAbility: combatState.autoAbilityEnabled,
+      };
+    }
+    this.prodMafiaAutoPlay.setEnabled(true, options);
+    // ProdMafia enables predictive dodge for diagnostic Auto Play runs but
+    // leaves the user's normal avoid-damaging-ground preference unchanged.
+    this.autoDodge.setEnabled(true);
+    this.autoCombat.enableAutoAim();
+    this.autoCombat.enableAutoAbility();
+    return true;
+  }
+
+  disableProdMafiaAutoPlay(): void {
+    this.prodMafiaAutoPlay.setEnabled(false);
+    this.stopMoving();
+    const saved = this.prodMafiaSavedAutomation;
+    this.prodMafiaSavedAutomation = undefined;
+    if (!saved) return;
+    if (!saved.autoDodge) this.autoDodge?.setEnabled(false);
+    if (saved.autoAim) this.autoCombat?.enableAutoAim();
+    else this.autoCombat?.stopAiming();
+    if (saved.autoAbility) this.autoCombat?.enableAutoAbility();
+    else this.autoCombat?.disableAutoAbility();
+  }
+
+  isProdMafiaAutoPlayEnabled(): boolean {
+    return this.prodMafiaAutoPlay.isEnabled();
+  }
+
+  getProdMafiaAutoPlayState(): ProdMafiaAutoPlayDecision {
+    return this.prodMafiaAutoPlay.getState();
   }
 
   /** Enables the high-volume planner event used by Hive's opt-in file logger. */
@@ -1218,6 +1335,13 @@ export class Client extends EventEmitter {
       tickTimeMs: this.lastTickTime,
       lastActivityAt: this.lastActivityAt > 0 ? new Date(this.lastActivityAt).toISOString() : undefined,
       activityAgeMs: this.lastActivityAt > 0 ? now - this.lastActivityAt : undefined,
+      frameStalls: this.frameStallCount,
+      worstFrameMs: Math.round(this.worstFrameMs),
+      lastFrameMs: Math.round(this.lastFrameDeltaMs),
+      sinkLevel: this.sinkLevel,
+      hitsReported: this.hitsReported,
+      hitsAfterStalledFrame: this.hitsDuringStalledFrames,
+      enemyShootRecovery: this.enemyShootRecovery?.stats(),
       autoNexus: this.autoNexus.getState(),
       connectAgeMs: this.connectStartedAt > 0 ? now - this.connectStartedAt : undefined,
       reconnectAttempts: this.reconnectAttempts,
@@ -1582,7 +1706,11 @@ export class Client extends EventEmitter {
    * false if the client is not yet in-world.
    */
   invSwap(from: SlotRef, to: SlotRef): boolean {
-    return this.commands.invSwap(from, to);
+    const sent = this.commands.invSwap(from, to);
+    // Auto Loot shares the reference's single 500 ms swap window with every
+    // other source of INVSWAP, including manual ones.
+    if (sent) this.lastInvSwapAt = this.time();
+    return sent;
   }
 
   /** Walks into range of any non-player container involved, then sends INVSWAP. */
@@ -2285,6 +2413,126 @@ export class Client extends EventEmitter {
     return this.autoCombat?.getState();
   }
 
+  /** Advances the Tomb boss rotation; returns the boss now attackable. */
+  cycleTombBoss(): string | undefined {
+    return this.autoCombat?.cycleTombBoss().name;
+  }
+
+  /** Clears the Tomb boss rotation so every Tomb boss becomes attackable again. */
+  clearTombBossCycle(): void {
+    this.autoCombat?.clearTombBossCycle();
+  }
+
+  // ------------------------------------------------------------- auto loot
+
+  /**
+   * Enables Auto Loot. Object XML is parsed on the first call, so a client with
+   * no metadata available (see {@link loadItemCatalog}) cannot enable it.
+   */
+  enableAutoLoot(options?: Partial<AutoLootOptions>): boolean {
+    const controller = this.ensureAutoLoot();
+    if (!controller) return false;
+    if (options) controller.configure(options);
+    controller.setEnabled(true);
+    return true;
+  }
+
+  disableAutoLoot(): void {
+    this.autoLoot?.setEnabled(false);
+  }
+
+  configureAutoLoot(options: Partial<AutoLootOptions>): AutoLootOptions | undefined {
+    return this.ensureAutoLoot()?.configure(options);
+  }
+
+  getAutoLootState(): AutoLootState | undefined {
+    return this.autoLoot?.getState();
+  }
+
+  /** ProdMafia's Auto Loot defaults, available without loading the catalog. */
+  getAutoLootDefaults(): AutoLootOptions {
+    return { ...DEFAULT_AUTO_LOOT };
+  }
+
+  private ensureAutoLoot(): AutoLootController | undefined {
+    if (this.autoLoot) return this.autoLoot;
+    this.itemCatalog = sharedItemCatalog();
+    if (this.itemCatalog.size === 0) {
+      console.warn(`${this.tag} auto loot unavailable - no object metadata loaded`);
+      return undefined;
+    }
+    this.autoLoot = new AutoLootController(itemCatalogLootData(this.itemCatalog));
+    return this.autoLoot;
+  }
+
+  // ------------------------------------------------------ auto consumables
+
+  /** Enables auto HP/MP potions and the auto heal ability. */
+  enableAutoConsumables(options?: Partial<AutoConsumablesOptions>): boolean {
+    if (options) this.autoConsumables.configure(options);
+    this.autoConsumables.setEnabled(true);
+    return true;
+  }
+
+  disableAutoConsumables(): void {
+    this.autoConsumables.setEnabled(false);
+  }
+
+  configureAutoConsumables(options: Partial<AutoConsumablesOptions>): AutoConsumablesOptions {
+    return this.autoConsumables.configure(options);
+  }
+
+  getAutoConsumablesState(): AutoConsumablesState {
+    return this.autoConsumables.getState();
+  }
+
+  /** ProdMafia's auto-potion defaults. */
+  getAutoConsumablesDefaults(): AutoConsumablesOptions {
+    return { ...DEFAULT_AUTO_CONSUMABLES };
+  }
+
+  // -------------------------------------------------------- vault sweeps
+
+  /**
+   * ProdMafia's one-shot "deposit everything" sweep (`MapUserInput`'s deposit
+   * key): every carried item into the first free main-vault slots, staggered by
+   * {@link VAULT_SWEEP_STAGGER_MS}. Returns the number of swaps scheduled.
+   */
+  depositAllToVault(): number {
+    if (!this.isInVault()) {
+      console.warn(`${this.tag} deposit-all requires being in the vault`);
+      return 0;
+    }
+    const carried = new Set(this.getCarriedInventorySlotIds());
+    const steps = planVaultDepositAll(
+      this.getInventorySlots()
+        .filter((slot) => carried.has(slot.slotId))
+        .map((slot) => slotRef(slot)),
+      this.getVaultSlots().map((slot) => slotRef(slot)),
+    );
+    this.cancelVaultSweep();
+    for (const step of steps) {
+      // Item types shift as earlier swaps land, so each leg re-reads the slots
+      // it was planned against and skips if the server moved something else.
+      this.vaultSweepTimers.push(this.timers.setTimeout(() => {
+        const from = this.getContainerSlot('inventory', step.from.slotId);
+        const to = this.getContainerSlot('vault', step.to.slotId);
+        if (!from || !to || from.objectType !== step.from.itemType || to.objectType !== -1) return;
+        this.invSwap(slotRef(from), slotRef(to));
+      }, step.delayMs));
+    }
+    if (steps.length > 0) {
+      console.log(`${this.tag} deposit-all: ${steps.length} swap(s) scheduled`);
+    }
+    return steps.length;
+  }
+
+  /** Drops any deposit-all legs that have not fired yet. */
+  cancelVaultSweep(): void {
+    for (const handle of this.vaultSweepTimers) this.timers.clear(handle);
+    this.vaultSweepTimers = [];
+  }
+
   enableProjectileNoclip(): boolean {
     return this.setProjectileNoclip(true);
   }
@@ -2870,6 +3118,8 @@ export class Client extends EventEmitter {
     this.allowPlayerTeleport = false;
     this.lastFrameTime = 0;
     this.lastLocalMovementAt = 0;
+    this.sinkLevel = 0;
+    this.lastFrameDeltaMs = 0;
     this.lastGroundDamageAt = 0;
     this.conditionDamageRemainder = 0;
     this.lastCombatDamageAt = -Infinity;
@@ -2900,9 +3150,16 @@ export class Client extends EventEmitter {
     this.autoNexus.reset();
     this.autoNexus.setSafeMap(true);
     this.combat?.clear();
+    // A reconnect can land us in a different map before its MAPINFO arrives, so
+    // queued shots from the old one must not replay into the new world.
+    this.enemyShootRecovery?.setMap('');
     this.viewerOtherProjectiles.clear();
     this.viewerAoes.length = 0;
     this.autoCombat?.clearMap();
+    this.autoLoot?.clearMap();
+    this.autoConsumables.clear();
+    this.cancelVaultSweep();
+    this.lastInvSwapAt = null;
     this.portalTracker.clear();
   }
 
@@ -3334,6 +3591,9 @@ export class Client extends EventEmitter {
     this.io.on(PacketType.INCOMING_PARTY_MEMBER_INFO, (p: IncomingPartyMemberInfoPacket) => this.handlePartyRoster(p));
     this.io.on(PacketType.PARTY_MEMBER_ADDED, (p: PartyMemberAddedPacket) => this.handlePartyMemberAdded(p));
     this.io.on(PacketType.PARTY_ACTION, (p: PartyActionPacket)           => this.handlePartyAction(p));
+    this.io.on(PacketType.QUESTOBJID, (p: QuestObjectIdPacket)           => {
+      this.questObjectId = p.objectId;
+    });
     this.io.on(PacketType.QUEUE_INFORMATION, (p: QueueInfoPacket)         => this.handleQueueInformation(p));
     this.io.on(PacketType.RECONNECT, (p: ReconnectPacket)                 => this.handleReconnect(p));
     this.io.on(PacketType.FAILURE, (p: FailurePacket)                     => this.handleFailure(p));
@@ -3377,10 +3637,15 @@ export class Client extends EventEmitter {
 
   /** Handles map metadata, then creates or loads the configured character. */
   private handleMapInfo(p: MapInfoPacket): void {
+    this.questObjectId = -1;
     console.log(`${this.tag} ✓ MapInfo accepted: "${p.name}" (${p.width}x${p.height})`);
     this.mapName = p.name;
     this.mapWidth = p.width;
     this.mapHeight = p.height;
+    // Drops the queue and the per-map signature table, and re-scopes the learned
+    // objectId associations to this map name, so nothing learned in the previous
+    // map can answer for this one (ProdMafia `onMapInfo`, `:5391-5392`).
+    this.enemyShootRecovery?.setMap(p.name);
     this.allowPlayerTeleport = p.allowPlayerTeleport;
     this.pathfinder.setMapBounds(p.width, p.height);
     this.dodgeWorld?.setMapBounds(p.width, p.height);
@@ -3514,6 +3779,9 @@ export class Client extends EventEmitter {
       }
       this.containerSlotItems.delete(id);
     }
+    // The owners this UPDATE just streamed in are what queued ENEMYSHOOTs were
+    // waiting for (ProdMafia `GameServerConnectionConcrete.as:3097`).
+    this.resolvePendingEnemyShoots(now);
     this.maybeDumpObjects();
     this.findVaultPortal();
     this.findPendingPortal();
@@ -3550,6 +3818,10 @@ export class Client extends EventEmitter {
           y: status.pos.y,
         })),
     );
+    // Before updateCombat, so a shot recovered this tick is advanced and seen by
+    // the dodge planner immediately (ProdMafia
+    // `GameServerConnectionConcrete.as:3270`, after its status loop).
+    this.resolvePendingEnemyShoots(now);
     this.sendMove(p, now);
     this.applyPendingAuthoritativeRebase();
     this.updateCombat(now);
@@ -3562,9 +3834,17 @@ export class Client extends EventEmitter {
   /** Mirrors ProdMafia's render-frame movement integration at roughly 60 Hz. */
   private updateLocalFrame(now: number): void {
     if (this.posKnown && this.player) {
-      const dt = this.lastLocalMovementAt > 0
-        ? Math.min(34, Math.max(0, now - this.lastLocalMovementAt))
+      const rawDelta = this.lastLocalMovementAt > 0
+        ? Math.max(0, now - this.lastLocalMovementAt)
         : 0;
+      this.recordFrameDelta(rawDelta, now);
+      // 34 ms matches ProdMafia's movement integration clamp exactly
+      // (`Player.as:1234`: `_mvDt = dt > 34 ? 34 : dt`). GameSprite's separate
+      // 200 ms clamp bounds the *world* delta handed to Map.update, which this
+      // client applies through absolute timestamps instead, so it has no
+      // equivalent here. Raising this to 200 would out-run the server's
+      // move-speed validation, which is what the Flash comment warns about.
+      const dt = Math.min(34, rawDelta);
       this.lastLocalMovementAt = now;
       // ProdMafia expires unacknowledged projectile/environment predictions in
       // its per-frame health check rather than carrying phantom damage forever.
@@ -3578,6 +3858,53 @@ export class Client extends EventEmitter {
       this.lastLocalMovementAt = 0;
     }
     this.updateCombat(now);
+  }
+
+  /**
+   * Counts local frames that overran {@link FRAME_STALL_THRESHOLD_MS}, the
+   * equivalent of ProdMafia's `GameSprite.monitorFrameStall`.
+   *
+   * A stalled frame is doubly costly here: movement integrates at most 34 ms of
+   * the gap, so the excess is escape distance the dodge planner believed it had,
+   * and projectiles then advance the full gap in one batch. Without this counter
+   * both effects are invisible.
+   */
+  private recordFrameDelta(deltaMs: number, now: number): void {
+    this.lastFrameDeltaMs = deltaMs;
+    if (deltaMs > this.worstFrameMs) this.worstFrameMs = deltaMs;
+    if (deltaMs <= FRAME_STALL_THRESHOLD_MS) return;
+    this.frameStallCount++;
+    // Rate limited like ProdMafia's, which logs at most once a second.
+    if (now - this.lastFrameStallLoggedAt < 1000) return;
+    this.lastFrameStallLoggedAt = now;
+    console.warn(
+      `${this.tag} local frame stalled ${deltaMs.toFixed(0)}ms ` +
+        `(movement integrated 34ms; ${this.frameStallCount} stalls, ` +
+        `worst ${this.worstFrameMs.toFixed(0)}ms)`,
+    );
+  }
+
+  /**
+   * Correlates player hits with frame stalls, to test whether `CombatTracker`
+   * catch-up stepping manufactures retroactive hits.
+   *
+   * `advance` walks a stalled gap in 16 ms projectile steps but tests every step
+   * against one fixed player position, so a bullet that crossed the player's tile
+   * earlier in the gap can still register. The size of that error is bounded by
+   * how far the player actually moved during the gap, and movement integrates at
+   * most 34 ms per frame — so the bound is roughly a third of a tile, not the full
+   * gap. If retroactive collision were a real source of damage, hits would
+   * concentrate in frames where this gap is large; a flat ratio says it is not.
+   */
+  private recordHitFrameTiming(): void {
+    this.hitsReported++;
+    if (this.lastFrameDeltaMs > FRAME_STALL_THRESHOLD_MS) {
+      this.hitsDuringStalledFrames++;
+      console.warn(
+        `${this.tag} player hit reported after a ${this.lastFrameDeltaMs.toFixed(0)}ms frame ` +
+          `(${this.hitsDuringStalledFrames}/${this.hitsReported} hits follow a stalled frame)`,
+      );
+    }
   }
 
   /** Advances locally simulated projectiles against the latest world snapshot. */
@@ -3594,6 +3921,7 @@ export class Client extends EventEmitter {
         : undefined,
     });
     this.updateGroundDamage(now);
+    this.updateAutomation(now);
     this.autoCombat?.update(now, {
       inWorld: this.isInWorld(),
       safeMap: this.isInNexus() || this.isInVault() || this.isInPetYard()
@@ -3606,6 +3934,133 @@ export class Client extends EventEmitter {
       shootAt: (target, weaponSlot) => this.commands.shootAt(target, weaponSlot),
       useAbilityAt: (target) => this.commands.useAbilityAt(target),
     });
+  }
+
+  /**
+   * Drives Auto Loot and the auto consumables on the same frame as auto combat.
+   * Potions run first: the reference's `checkHealth` precedes everything else,
+   * and a loot swap must never delay a heal.
+   */
+  private updateAutomation(now: number): void {
+    if (this.autoConsumables.isEnabled()) this.updateAutoConsumables(now);
+    if (this.autoLoot?.isEnabled()) this.updateAutoLoot(now);
+  }
+
+  private updateAutoConsumables(now: number): void {
+    const player = this.player;
+    if (!player) return;
+    const nexus = this.autoNexus.getState();
+    const abilityType = player.inventory?.[1] ?? -1;
+    const ability = abilityType > 0 ? this.opts.combatData?.getObject(abilityType) : undefined;
+    this.autoConsumables.update(now, {
+      inWorld: this.isInWorld(),
+      safeMap: isAutoNexusSafeMap(this.mapName),
+      playerObjectId: this.objectId,
+      // The reference drinks when any of its three health figures crosses the
+      // threshold, which is the lowest of them.
+      hp: lowestDefined(nexus.predictedHp, nexus.serverHp, nexus.syncedHp),
+      maxHp: nexus.maxHp ?? player.maxHP ?? null,
+      mp: player.mp ?? 0,
+      maxMp: player.maxMP ?? 0,
+      condition: (player.condition ?? 0) >>> 0,
+      inventory: player.inventory ?? [],
+      inventoryEndIndex: this.autoLootInventoryEndIndex(),
+      quickSlots: [],
+      abilityMpCost: ability?.mpCost ?? null,
+      // The reference gates auto heal on the Priest class; keying off the
+      // activate effect instead also covers Paladin's HealNova, which self-heals.
+      abilityHeals: (ability?.activateEffects ?? []).some((effect) => /heal/i.test(effect)),
+      bags: this.adjacentContainers().map((bag) => ({
+        objectId: bag.objectId,
+        slots: bag.slots,
+      })),
+    }, {
+      useItem: (slot) => {
+        const known = slot.objectId === this.objectId
+          ? SlotObjectData.from(slot.objectId, slot.slotId, slot.itemType)
+          : this.getWorldContainerSlot(slot.objectId, slot.slotId);
+        return known ? this.useItem(known) : false;
+      },
+      useAbilityAtSelf: () => this.commands.useAbilityAt(this.serverPos ?? this.pos),
+    });
+  }
+
+  private updateAutoLoot(now: number): void {
+    const controller = this.autoLoot;
+    const player = this.player;
+    if (!controller || !player) return;
+    const action = controller.update(now, {
+      inWorld: this.isInWorld(),
+      inVault: this.isInVault(),
+      playerObjectId: this.objectId,
+      position: this.serverPos ?? this.pos,
+      inventory: player.inventory ?? [],
+      inventoryEndIndex: this.autoLootInventoryEndIndex(),
+      quickSlots: [],
+      equipSlotTypes: this.itemCatalog?.info(player.class)?.slotTypes ?? [],
+      stats: this.potionStatSnapshot(),
+      bags: this.adjacentContainers(),
+      lastInvSwapAt: this.lastInvSwapAt,
+    }, {
+      swap: (from, to) => this.invSwap(from, to),
+      useFromBag: (slot) => {
+        const known = this.getWorldContainerSlot(slot.objectId, slot.slotId);
+        return known ? this.useItem(known) : false;
+      },
+    });
+    if (!action) return;
+    console.log(action.kind === 'pickup'
+      ? `${this.tag} auto loot: item ${action.itemType} from bag ${action.bagObjectId} ` +
+        `slot ${action.bagSlotId} -> inventory slot ${action.destinationSlotId}` +
+        (action.replacedItemType === -1 ? '' : ` (displacing ${action.replacedItemType})`)
+      : `${this.tag} auto loot: consuming item ${action.itemType} in bag ${action.bagObjectId} ` +
+        `slot ${action.bagSlotId} (${action.reason})`);
+  }
+
+  /** `Player.inventoryEndIndex`: 4 equipment slots plus every carried slot. */
+  private autoLootInventoryEndIndex(): number {
+    return 4 + MAIN_INVENTORY_SLOT_IDS.length + this.getBackpackSlotCount();
+  }
+
+  /** Visible loot containers whose contents are known, within one tile. */
+  private adjacentContainers(): AdjacentContainer[] {
+    const position = this.serverPos ?? this.pos;
+    const result: AdjacentContainer[] = [];
+    for (const object of this.objects.values()) {
+      const definition = this.opts.combatData?.getObject(object.type);
+      if (!definition?.isContainer) continue;
+      if ((position.x - object.x) ** 2 + (position.y - object.y) ** 2 > 1) continue;
+      const slots = this.containerSlotItems.get(object.objectId);
+      if (!slots?.size) continue;
+      const highest = Math.max(...slots.keys());
+      result.push({
+        objectId: object.objectId,
+        objectType: object.type,
+        definitionId: definition.id ?? definition.displayId,
+        x: object.x,
+        y: object.y,
+        slots: Array.from({ length: highest + 1 }, (_, slotId) => slots.get(slotId) ?? -1),
+      });
+    }
+    return result;
+  }
+
+  /** Stat values, gear boosts and class caps for `Player.shouldDrink`. */
+  private potionStatSnapshot(): PotionStatSnapshot | undefined {
+    const player = this.player;
+    const maximums = this.itemCatalog?.statMaximums(player?.class ?? -1);
+    if (!player || !maximums) return undefined;
+    return {
+      attack: { value: player.atk ?? 0, boost: player.atkBoost ?? 0 },
+      defense: { value: player.def ?? 0, boost: player.defBoost ?? 0 },
+      speed: { value: player.spd ?? 0, boost: player.spdBoost ?? 0 },
+      dexterity: { value: player.dex ?? 0, boost: player.dexBoost ?? 0 },
+      vitality: { value: player.vit ?? 0, boost: player.vitBoost ?? 0 },
+      wisdom: { value: player.wis ?? 0, boost: player.wisBoost ?? 0 },
+      maxHp: { value: player.maxHP ?? 0, boost: player.maxHPBoost ?? 0 },
+      maxMp: { value: player.maxMP ?? 0, boost: player.maxMPBoost ?? 0 },
+      maximums,
+    };
   }
 
   /** Mirrors the current client's 500 ms damaging-ground prediction and acknowledgement. */
@@ -3651,6 +4106,16 @@ export class Client extends EventEmitter {
 
   /** Advances navigation intent, with predictive dodge optionally replacing only its velocity. */
   private updateTarget(dt: number, integrateFromLocal = false, now = this.time()): void {
+    if (this.prodMafiaAutoPlay.isEnabled()) this.applyProdMafiaAutoPlay(now);
+    const previousDodgeOverride = this.autoDodge?.getState().overrideActive ?? false;
+    this.pathfinder.setRuntimeContext({
+      time: now,
+      mapName: this.mapName,
+      dodgeOverrideActive: previousDodgeOverride,
+      allowWallEscape: this.prodMafiaAutoPlay.isEnabled()
+        ? this.prodMafiaAutoPlay.getState().allowWallEscape
+        : true,
+    }, this.pos);
     const selectedIntent = this.dodgeMovementIntent ?? this.suspendedDodgeMovementIntent;
     const selectedCombatTargetId = selectedIntent?.mode === 'combat_range'
       ? selectedIntent.targetId
@@ -3667,8 +4132,11 @@ export class Client extends EventEmitter {
     }
     const usingPathfinding = this.pathfinder.hasTarget();
     if (usingPathfinding) {
-      const authoritativePos = this.serverPos ?? this.pos;
-      const navigation = this.pathfinder.next(authoritativePos, PROD_MAFIA_PATH_SEARCH_BUDGET);
+      // ProdMafia steers from the live client position every frame. When we are
+      // integrating locally, advancing waypoints from lagged serverPos parks the
+      // predicted body on each tile center until the next NewTick (~stop-go).
+      const navigationPos = integrateFromLocal ? this.pos : (this.serverPos ?? this.pos);
+      const navigation = this.pathfinder.next(navigationPos, PROD_MAFIA_PATH_SEARCH_BUDGET);
       if (navigation.reached) {
         this.movement.clear();
         this.dodgeMovementIntent = null;
@@ -3719,9 +4187,16 @@ export class Client extends EventEmitter {
 
     const snapshot = this.movementSnapshot();
     const movementLocked = this.isMovementLocked();
-    const intentVelocity = movementLocked
+    const rawIntentVelocity = movementLocked
       ? { x: 0, y: 0 }
       : this.movement.getIntendedVelocity(snapshot, integrateFromLocal);
+    const autoPlaySpeedScale = this.prodMafiaAutoPlay.isEnabled()
+      ? this.prodMafiaAutoPlay.getState().movementSpeedScale
+      : 1;
+    const intentVelocity = {
+      x: rawIntentVelocity.x * autoPlaySpeedScale,
+      y: rawIntentVelocity.y * autoPlaySpeedScale,
+    };
     const movementGoal = this.movement.getTarget();
     const dodgeGoal = movementGoal
       ? boundedMovementGoal(this.pos, movementGoal, PROD_MAFIA_MAX_LOCAL_GOAL_DISTANCE)
@@ -3746,6 +4221,10 @@ export class Client extends EventEmitter {
           time: now,
           playerId: this.objectId,
           position: this.pos,
+          serverPosition: this.serverPos ?? undefined,
+          autonomousIntent: this.prodMafiaAutoPlay.isEnabled()
+            || !!movementGoal
+            || this.pathfinder.hasTarget(),
           goal: dodgeGoal,
           movementIntent: this.dodgeMovementIntent,
           routeRevision: this.pathfinder.getIntentRevisions().routeRevision,
@@ -3763,6 +4242,15 @@ export class Client extends EventEmitter {
           movementLocked,
           projectiles: activeProjectiles,
           aoes: activeAoes,
+          pointBlankEmitters: this.visibleObjects().filter((object) => {
+            const definition = this.opts.combatData?.getObject(object.type);
+            return !!definition?.quest && !!definition.hasProjectiles
+              && definition.isCharacter !== false;
+          }).map((object) => ({
+            objectId: object.objectId,
+            x: object.x,
+            y: object.y,
+          })),
           environment: this.dodgeWorld!,
         })
       : undefined;
@@ -3828,7 +4316,7 @@ export class Client extends EventEmitter {
     }
     const velocityOverride = dodgeState?.overrideActive
       ? dodgeState.velocity
-      : undefined;
+      : autoPlaySpeedScale < 1 ? intentVelocity : undefined;
     if (movementLocked) return;
     if (!this.movement.hasTarget() && !velocityOverride) return;
 
@@ -3845,7 +4333,8 @@ export class Client extends EventEmitter {
       // A goal_blocked dodge decision intentionally commands a controlled stop.
       // Treating that stop as failed server movement poisons both pathfinding and
       // dodge collision with learned blocked cells, making the condition persist.
-      trackTargetProgress: dodgeState?.decision === 'follow_goal'
+      trackTargetProgress: !dodgeState
+        || dodgeState.decision === 'follow_goal'
         || dodgeState?.decision === 'goal_path' && dodgeState.threatCount === 0,
     });
     this.pos = update.pos;
@@ -3941,14 +4430,50 @@ export class Client extends EventEmitter {
 
   private movementSnapshot(): MovementSnapshot {
     const tile = this.tiles.get(`${Math.floor(this.pos.x)},${Math.floor(this.pos.y)}`);
+    const data = this.opts.combatData;
     return {
       localPos: this.pos,
       serverPos: this.serverPos,
       playerSpeed: this.player?.spd ?? 0,
       playerSpeedBoost: this.player?.spdBoost ?? 0,
       condition: this.player?.condition ?? 0,
-      tileSpeed: tile ? this.opts.combatData?.getTileSpeed?.(tile.type) ?? 1 : 1,
+      tileSpeed: tile ? this.tileMoveMultiplier(tile.type) : 1,
+      tileSlideAmount: tile ? data?.getTileSlideAmount?.(tile.type) ?? 0 : 0,
+      tilePushVelocity: tile ? data?.getTilePushVelocity?.(tile.type) : undefined,
     };
+  }
+
+  /**
+   * ProdMafia's `moveMultiplier_` (`Player.as:4215-4225`): the tile's `<Speed>`,
+   * except on `<Sinking />` ground where the accumulated sink level drags it
+   * toward 0.1. Quicksand at full sink runs the player at a sixth of its
+   * nominal tile speed, which is why a dodge planned at commanded speed cannot
+   * be executed there.
+   */
+  private tileMoveMultiplier(tileType: number): number {
+    const data = this.opts.combatData;
+    if (this.sinkLevel > 0 && data?.tileIsSinking?.(tileType)) {
+      return data.getSinkingSpeedMultiplier?.(tileType, this.sinkLevel)
+        ?? data.getTileSpeed?.(tileType) ?? 1;
+    }
+    return data?.getTileSpeed?.(tileType) ?? 1;
+  }
+
+  /**
+   * ProdMafia advances `sinkLevel` in `Player.onMove()`, which
+   * `GameServerConnectionConcrete.as:1790` calls once per MOVE packet — not once
+   * per render frame. Ticking it per frame would bottom the player out roughly
+   * six times too fast.
+   */
+  private advanceSinkLevel(): void {
+    const data = this.opts.combatData;
+    if (!data?.tileIsSinking) return;
+    const tile = this.tiles.get(`${Math.floor(this.pos.x)},${Math.floor(this.pos.y)}`);
+    if (tile && data.tileIsSinking(tile.type)) {
+      this.sinkLevel = Math.min(this.sinkLevel + 1, MAX_SINK_LEVEL);
+    } else {
+      this.sinkLevel = 0;
+    }
   }
 
   private isMovementLocked(): boolean {
@@ -3967,6 +4492,8 @@ export class Client extends EventEmitter {
     // ProdMafia stamps the record with the frame that integrated this position,
     // not the slightly later time at which NEWTICK happened to arrive.
     record.time = this.lastLocalMovementAt > 0 ? Math.min(now, this.lastLocalMovementAt) : now;
+    // Player.onMove() runs off the MOVE send, so the sink level deepens here.
+    this.advanceSinkLevel();
     const currentSpeed = movementSpeed(this.movementSnapshot());
     const desiredMovePosition = { ...this.pos };
     let movePosition = { ...desiredMovePosition };
@@ -4013,6 +4540,118 @@ export class Client extends EventEmitter {
     }
   }
 
+  private applyProdMafiaAutoPlay(now: number): void {
+    if (!this.dodgeWorld || !this.combat || !this.autoCombat) return;
+    const definitions = this.opts.combatData;
+    const player = this.player;
+    const decision = this.prodMafiaAutoPlay.tick({
+      time: now,
+      mapName: this.mapName,
+      safeMap: isAutoNexusSafeMap(this.mapName),
+      inRealmQueue: this.inQueue,
+      position: { ...this.pos },
+      level: player?.level ?? 1,
+      weaponRange: this.prodMafiaWeaponRange(),
+      moveSpeed: movementSpeed(this.movementSnapshot()),
+      questObjectId: this.questObjectId,
+      combatAimTargetObjectId: this.autoCombat.getState().targetObjectId,
+      objects: this.visibleObjects().map((object) => ({
+        ...object,
+        definition: definitions?.getObject(object.type),
+        equipment: [...(this.containerSlotItems.get(object.objectId)?.values() ?? [])],
+      })),
+      hostileProjectileCount: [...this.combat.getActiveProjectiles()].filter(
+        (projectile) => projectile.side === 'enemy',
+      ).length,
+      dodgeOverrideActive: this.autoDodge?.getState().overrideActive ?? false,
+      teleportAllowed: this.canTeleport(),
+      pathStuckCount: this.pathfinder.getStuckCount(),
+      pathRouteEmpty: this.pathfinder.getRemainingPath().length === 0,
+      currentServerHost: this.host,
+      serverHosts: (this.opts.servers ?? []).map((server) => server.address),
+      canOccupy: (x, y, safeWalk) =>
+        this.dodgeWorld!.canOccupyForProdMafia(x, y, safeWalk),
+      canTraverse: (fromX, fromY, toX, toY) =>
+        this.pathfinder.canTraverseForAutoPlay(fromX, fromY, toX, toY),
+      hasExactPathTo: (toX, toY) =>
+        this.pathfinder.hasExactPathTo(this.pos.x, this.pos.y, toX, toY),
+      projectile: (objectType, projectileId) =>
+        definitions?.getProjectile(objectType, projectileId),
+      // Without Auto Loot enabled a bag is worth servicing if it holds anything,
+      // which is the behaviour before this predicate existed.
+      wantsLoot: this.autoLoot?.isEnabled()
+        ? (itemType) => this.autoLoot!.wantsItemType(itemType)
+        : undefined,
+    });
+
+    if (decision.autoAim) this.autoCombat.enableAutoAim();
+    else this.autoCombat.stopAiming();
+    if (decision.autoAbility) this.autoCombat.enableAutoAbility();
+    else this.autoCombat.disableAutoAbility();
+    if (decision.reconnectServerHost !== null) {
+      this.connectToServer(decision.reconnectServerHost);
+      return;
+    }
+    if (decision.state === 'stuck_quest_teleport_recovery') {
+      this.pathfinder.rememberFailedRouteRegion(this.pos.x, this.pos.y);
+    }
+    if (decision.teleportObjectId !== null) this.teleportTo(decision.teleportObjectId);
+    if (decision.usePortalObjectId !== null) this.usePortal(decision.usePortalObjectId);
+    if (decision.nexus) {
+      this.escape();
+      return;
+    }
+    // GameSprite.autoPilot returns immediately while Auto Dodge owns the
+    // frame. Preserve the strategic route so the 250 ms yield resumes from
+    // the dodge endpoint instead of rebuilding/clearing it every dodge frame.
+    if (decision.state === 'dodge_yield') return;
+
+    if (decision.navigationMode === 'stop' || !decision.target) {
+      this.pathfinder.clearTarget();
+      this.movement.clear();
+      this.dodgeMovementIntent = null;
+      this.suspendedDodgeMovementIntent = null;
+      this.navigationStatus = 'idle';
+      return;
+    }
+    if (decision.navigationMode === 'direct') {
+      this.pathfinder.clearTarget();
+      this.movement.setTarget(decision.target, decision.arriveThreshold);
+      this.navigationStatus = 'moving';
+    } else {
+      this.pathfinder.setTarget(
+        decision.target,
+        decision.arriveThreshold,
+        decision.targetObjectId ?? decision.state,
+        decision.state === 'hub_portal' || decision.state === 'dungeon_progression_portal'
+          ? 'portal'
+          : decision.state === 'soulbound_bag'
+            || decision.state === 'quest_path'
+            || decision.state === 'enemy_path' ? 'guarded' : 'none',
+      );
+      this.navigationStatus = 'planning';
+    }
+    this.dodgeMovementIntent = {
+      mode: 'goal',
+      goalX: decision.target.x,
+      goalY: decision.target.y,
+      goalId: decision.targetObjectId ?? decision.state,
+      arriveThreshold: decision.arriveThreshold,
+    };
+    this.suspendedDodgeMovementIntent = null;
+  }
+
+  private prodMafiaWeaponRange(): number {
+    const weaponType = this.player?.inventory?.[0] ?? -1;
+    const projectile = weaponType >= 0
+      ? this.opts.combatData?.getProjectile(weaponType, 0)
+      : undefined;
+    if (!projectile || projectile.speed <= 0 || projectile.lifetimeMs <= 0) return 4;
+    return Math.min(16, projectile.speed * projectile.lifetimeMs / 10_000
+      * Math.max(0.01, this.player?.projSpeedMult ?? 1)
+      * Math.max(0.01, this.player?.projLifeMult ?? 1));
+  }
+
   /**
    * The server's NEWTICK position is intentionally a little behind the most
    * recent local frame. Allow that normal prediction window, but use the
@@ -4036,6 +4675,8 @@ export class Client extends EventEmitter {
     // The next local frame must integrate from this correction, not from a
     // timestamp belonging to the rejected local trajectory.
     this.lastLocalMovementAt = now;
+    // Retained ice/push momentum described the trajectory the server rejected.
+    this.movement.resetMomentum();
     this.autoDodge?.rebase(position, now);
   }
 
@@ -4356,18 +4997,153 @@ export class Client extends EventEmitter {
     });
   }
 
-  /** Acknowledges enemy projectile events so the server does not drop us. */
+  /**
+   * Acknowledges enemy projectile events so the server does not drop us, and
+   * gets the shot into the threat model — deferring it when its owner has not
+   * streamed in yet instead of dropping it (ProdMafia `onEnemyShoot`,
+   * `GameServerConnectionConcrete.as:2424-2531`).
+   */
   private handleEnemyShoot(p: EnemyShootPacket): void {
+    // Ack once, immediately. A deferred replay only rebuilds the local
+    // projectile and must never acknowledge the same server shot twice
+    // (ProdMafia `:2434-2436`).
     const ack = new ShootAckPacket();
     ack.time = this.lastFrameTime;
     ack.ackCount = 1;
     this.io.send(ack);
     this.pathfinder.markEnemyThreat(p.ownerId);
     this.dodgeWorld?.markEnemyThreat(p.ownerId);
-    const ownerType = this.objects.get(p.ownerId)?.type ?? this.recentObjectTypes.get(p.ownerId);
-    this.combat?.trackEnemyShoot(p, ownerType, this.time());
-    const shotCount = p.numShots > 0 && p.numShots !== 0xff ? p.numShots : 1;
-    this.autoDodge?.noteProjectileUpdate(shotCount);
+    const now = this.time();
+    const recovery = this.enemyShootRecovery;
+    const liveType = this.objects.get(p.ownerId)?.type;
+    let ownerType: number | undefined = liveType;
+    if (liveType !== undefined) {
+      // Only a live owner is authority for what its object id shoots.
+      recovery?.observeLiveShot(liveType, enemyShootObservation(p));
+    } else if (recovery) {
+      const observation = enemyShootObservation(p);
+      const ctx = this.enemyShootResolveContext(now);
+      const resolved = recovery.resolveOwnerType(observation, ctx);
+      if (resolved.ownerType < 0) {
+        recovery.deferUnresolved(observation, now, ctx);
+        this.autoDodge?.noteProjectileUpdate(enemyShotCount(p.numShots));
+        return;
+      }
+      ownerType = resolved.ownerType;
+    } else {
+      ownerType = this.recentObjectTypes.get(p.ownerId);
+    }
+    const added = this.combat?.trackEnemyShoot(p, ownerType, now) ?? 0;
+    // The owner type is known but its bulletType has no projectile definition,
+    // so the shot still cannot be modelled. Count it: this was the second
+    // silent drop that hid the invisible-damage defect (ProdMafia `:2547-2552`).
+    if (added === 0 && ownerType !== undefined) recovery?.noteMissingDefinition();
+    this.autoDodge?.noteProjectileUpdate(enemyShotCount(p.numShots));
+  }
+
+  /**
+   * Builds the world-lookup context one resolution pass needs. The live-enemy
+   * tile index is built lazily and at most once per context, because the queue
+   * holds up to {@link MAX_PENDING_ENEMY_SHOOTS} shots and this runs on the
+   * same thread as the 16 ms frame timer.
+   */
+  private enemyShootResolveContext(now: number): EnemyShootResolveContext {
+    let enemyTiles: Map<string, TrackedObject[]> | undefined;
+    return {
+      now,
+      ownerType: (ownerId) =>
+        this.objects.get(ownerId)?.type ?? this.recentObjectTypes.get(ownerId) ?? -1,
+      staticHostileType: (x, y) => {
+        enemyTiles ??= this.buildEnemyTileIndex();
+        return this.staticHostileSourceType(enemyTiles, x, y);
+      },
+      cacheObjectType: (ownerId, ownerType) => {
+        if (ownerId >= 0 && ownerType >= 0) this.recentObjectTypes.set(ownerId, ownerType);
+      },
+      playerDistanceTo: (x, y) =>
+        this.posKnown ? Math.hypot(x - this.pos.x, y - this.pos.y) : -1,
+      replay: (shot, ownerType, mode, delayMs) =>
+        this.replayDeferredEnemyShoot(shot, ownerType, mode, delayMs, now),
+    };
+  }
+
+  /** Live enemies bucketed by tile, for launch-point owner recovery. */
+  private buildEnemyTileIndex(): Map<string, TrackedObject[]> {
+    const index = new Map<string, TrackedObject[]>();
+    for (const object of this.objects.values()) {
+      if (!this.opts.combatData?.getObject(object.type)?.isEnemy) continue;
+      const key = `${Math.floor(object.x)},${Math.floor(object.y)}`;
+      const bucket = index.get(key);
+      if (bucket) bucket.push(object);
+      else index.set(key, [object]);
+    }
+    return index;
+  }
+
+  /**
+   * ProdMafia `Map.resolveStaticHostileSourceType` (`Map.as:773-802`): the type
+   * of the live enemy nearest a shot's launch point, or -1. Server-owned map
+   * shooters keep firing from a fixed square, so their launch point identifies
+   * them even when the packet's owner id means nothing to us yet.
+   */
+  private staticHostileSourceType(
+    enemyTiles: Map<string, TrackedObject[]>,
+    x: number,
+    y: number,
+  ): number {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return -1;
+    const maxDistance = ENEMY_SHOOT_LAUNCH_MATCH_DISTANCE;
+    let bestType = -1;
+    let bestDistanceSq = maxDistance * maxDistance;
+    const minX = Math.floor(x - maxDistance);
+    const maxX = Math.floor(x + maxDistance);
+    const minY = Math.floor(y - maxDistance);
+    const maxY = Math.floor(y + maxDistance);
+    for (let tileY = minY; tileY <= maxY; tileY++) {
+      for (let tileX = minX; tileX <= maxX; tileX++) {
+        for (const object of enemyTiles.get(`${tileX},${tileY}`) ?? []) {
+          const dx = object.x - x;
+          const dy = object.y - y;
+          const distanceSq = dx * dx + dy * dy;
+          if (distanceSq <= bestDistanceSq) {
+            bestDistanceSq = distanceSq;
+            bestType = object.type;
+          }
+        }
+      }
+    }
+    return bestType;
+  }
+
+  /** Re-attempts queued ENEMYSHOOTs (ProdMafia calls this from UPDATE and NEWTICK). */
+  private resolvePendingEnemyShoots(now: number): void {
+    const recovery = this.enemyShootRecovery;
+    if (!recovery || recovery.pendingCount === 0) return;
+    recovery.resolvePending(this.enemyShootResolveContext(now));
+  }
+
+  /** Puts a recovered shot into the threat model with its original shot time. */
+  private replayDeferredEnemyShoot(
+    shot: PendingEnemyShoot,
+    ownerType: number,
+    mode: EnemyShootRecoveryMode,
+    delayMs: number,
+    now: number,
+  ): void {
+    const added = this.combat?.trackDeferredEnemyShoot(shot, ownerType, now) ?? 0;
+    if (added === 0) {
+      this.enemyShootRecovery?.noteMissingDefinition();
+      return;
+    }
+    this.pathfinder.markEnemyThreat(shot.ownerId);
+    this.dodgeWorld?.markEnemyThreat(shot.ownerId);
+    this.autoDodge?.noteProjectileUpdate(added);
+    if (now - this.lastEnemyShootRecoveryLogAt < 1000) return;
+    this.lastEnemyShootRecoveryLogAt = now;
+    console.log(
+      `${this.tag} recovered deferred ENEMYSHOOT owner ${shot.ownerId} type ${ownerType} ` +
+        `via ${mode} after ${delayMs.toFixed(0)}ms (${added} projectile(s))`,
+    );
   }
 
   /** Tracks announced thrown-projectile endpoints before their AOE packet arrives. */
@@ -4497,6 +5273,9 @@ export class Client extends EventEmitter {
       petrified: (condition2 & ConditionEffectBits2.PETRIFIED) !== 0,
       cursed: (condition2 & ConditionEffectBits2.CURSE) !== 0,
     });
+    if (source === 'projectile' && this.autoDodge?.isEnabled()) {
+      this.autoDodge.noteProjectileHit(this.pos, this.time(), damage);
+    }
     return this.recordDamageTaken(damage, source, projectile);
   }
 
@@ -4512,6 +5291,9 @@ export class Client extends EventEmitter {
     }
     if (source === 'projectile' && projectile) {
       this.predictedPlayerDamage.set(`${projectile.ownerId}:${projectile.bulletId}`, Date.now());
+    }
+    if (source === 'server' && this.autoDodge?.isEnabled()) {
+      this.autoDodge.noteUnmodeledDamage(this.pos, this.time(), damage);
     }
 
     const state = this.autoNexus.getState();
@@ -4704,6 +5486,16 @@ export class Client extends EventEmitter {
         this.lastVaultContent.revision += 1;
       }
     }
+    if (!p.success && !p.isUseItemAck() && this.autoLoot) {
+      // `Player.onAutoLootSwapRejected`: quarantine the destination slot and the
+      // item, so a restricted item or stale slot is not retried every frame.
+      const destination = [p.fromSlot, p.toSlot].find((slot) => slot.objectId === this.objectId);
+      this.autoLoot.noteSwapRejected(
+        destination?.slotId ?? -1,
+        [p.fromSlot, p.toSlot].find((slot) => slot.objectId !== this.objectId)?.objectType ?? -1,
+        this.time(),
+      );
+    }
     const origin = p.isUseItemAck() ? 'USEITEM' : 'INVSWAP';
     console.log(
       `${this.tag} INVRESULT ok=${p.success} ackType=${p.ackType} origin=${origin} flags=0x${p.flags.toString(16)} ` +
@@ -4823,6 +5615,34 @@ export class Client extends EventEmitter {
 
 function distance(a: { x: number; y: number }, b: { x: number; y: number }): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+/** A visible loot container the player is standing on. */
+interface AdjacentContainer {
+  objectId: number;
+  objectType: number;
+  definitionId?: string;
+  x: number;
+  y: number;
+  /** Dense slot list indexed by slot id, -1 for empty. */
+  slots: number[];
+}
+
+/**
+ * Object XML is identical for every client in the process, and parsing it is
+ * measured in hundreds of milliseconds, so the first client to enable Auto Loot
+ * loads it for all of them.
+ */
+let itemCatalogCache: ItemCatalog | undefined;
+function sharedItemCatalog(): ItemCatalog {
+  itemCatalogCache ??= loadItemCatalog();
+  return itemCatalogCache;
+}
+
+/** Lowest of several optional figures, or null when none is known. */
+function lowestDefined(...values: (number | null | undefined)[]): number | null {
+  const known = values.filter((value): value is number => typeof value === 'number');
+  return known.length === 0 ? null : Math.min(...known);
 }
 
 function validMoveTarget(target: { x: number; y: number }, threshold: number): boolean {

@@ -411,6 +411,9 @@ test('Client combined navigation enables dodge and never gives it a goal farther
     player: { spd: 75, spdBoost: 0, condition: 0, condition2: 0 },
   });
   state.pathfinder.setMapBounds(30, 3);
+  for (let y = 0; y < 3; y++) {
+    for (let x = 0; x < 30; x++) state.pathfinder.observeTile(x, y, 0);
+  }
 
   assert.equal(client.navigateTo({ x: 20.5, y: 0.5 }), true);
   assert.equal(client.isAutoDodgeEnabled(), true);
@@ -423,7 +426,7 @@ test('Client combined navigation enables dodge and never gives it a goal farther
   state.updateTarget(16, false, 1000);
 
   const dodge = client.getAutoDodgeState();
-  assert.equal(dodge?.decision, 'goal_path');
+  assert.equal(dodge?.decision, 'no_threat');
   assert.ok(dodge?.goal);
   assert.ok(Math.hypot(dodge.goal.x - start.x, dodge.goal.y - start.y)
     <= MAX_LOCAL_GOAL_DISTANCE + 1e-9);
@@ -534,6 +537,9 @@ test('repeated script refreshes still allow an authoritative stall to replan', (
     player: { spd: 75, spdBoost: 0, condition: 0, condition2: 0 },
   });
   state.pathfinder.setMapBounds(10, 3);
+  for (let y = 0; y < 3; y++) {
+    for (let x = 0; x < 10; x++) state.pathfinder.observeTile(x, y, 0);
+  }
 
   for (let refresh = 0; refresh < 5; refresh++) {
     assert.equal(client.pathfindingWalkTo(target, 0.2), true);
@@ -546,7 +552,7 @@ test('repeated script refreshes still allow an authoritative stall to replan', (
   assert.ok(state.pathfinder.getPlannedTiles().some((tile) => tile.y !== 1));
 });
 
-test('Client exposes no-path state, suspends goal dodge, and recovers after map knowledge changes', () => {
+test('Client advances to ProdMafia closest frontier and rebuilds after map knowledge changes', () => {
   const BLOCKED = 99;
   const client = new Client({
     alias: 'navigation-state-test',
@@ -576,24 +582,31 @@ test('Client exposes no-path state, suspends goal dodge, and recovers after map 
     player: { spd: 75, spdBoost: 0, condition: 0, condition2: 0 },
   });
   state.pathfinder.setMapBounds(7, 5);
+  for (let y = 0; y < 5; y++) {
+    for (let x = 0; x < 7; x++) state.pathfinder.observeTile(x, y, 0);
+  }
   for (let y = 0; y < 5; y++) state.pathfinder.observeTile(3, y, BLOCKED);
 
   assert.equal(client.navigateTo(target), true);
   state.updateTarget(16, false, 1000);
 
   assert.deepEqual(client.getNavigationState(), {
-    status: 'no_path',
+    status: 'moving',
     target: { ...target, threshold: 0.5 },
-    path: [],
-    dodgeDecision: 'idle',
+    path: [{ x: 1.5, y: 2.5 }, { x: 2.5, y: 2.5 }],
+    dodgeDecision: 'no_threat',
   });
-  assert.equal(client.isMoving(), false);
-  assert.equal(client.getDodgeMovementIntent(), null);
-  assert.deepEqual(state.pos, start);
-  assert.equal(client.navigateTo(target), false, 'cached no-path requests must remain rejected');
+  assert.equal(client.isMoving(), true);
+  assert.deepEqual(client.getDodgeMovementIntent(), {
+    mode: 'goal',
+    goalX: target.x,
+    goalY: target.y,
+    arriveThreshold: 0.5,
+  });
+  assert.equal(client.navigateTo(target), true);
 
   state.pathfinder.observeTile(3, 2, 0);
-  state.updateTarget(16, false, 1100);
+  state.updateTarget(16, false, 2100);
 
   assert.equal(client.getNavigationState().status, 'moving');
   assert.equal(client.isMoving(), true);

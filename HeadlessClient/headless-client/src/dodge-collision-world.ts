@@ -238,6 +238,22 @@ export class DodgeCollisionWorld {
     return !avoidEnemies || this.enemyOverlay.satisfiesHardClearance(x, y);
   }
 
+  /** ProdMafia Map.isDamagingGround equivalent for Auto Play traversal. */
+  isDamagingGround(x: number, y: number): boolean {
+    const type = this.staticPassability.getObservedTileType(Math.floor(x), Math.floor(y));
+    return type !== undefined && (this.data.getTileDamage?.(type) ?? 0) > 0;
+  }
+
+  /** Physical occupancy used by ProdMafia's continuous blocked-start escape. */
+  canOccupyForProdMafia(x: number, y: number, safeWalk: boolean): boolean {
+    return this.staticPassability.canOccupyAt(x, y, {
+      consumer: 'dodge',
+      safeWalk,
+      checkFullOccupyNeighbors: true,
+      allowUnknown: false,
+    });
+  }
+
   /**
    * Physical movement cannot rely on exploratory unknown cells. It ignores
    * enemy avoidance and damaging-floor policy because this is collision only.

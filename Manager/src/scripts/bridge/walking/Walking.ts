@@ -1,6 +1,7 @@
 import { Walking } from '@hive/sdk';
 import type { Position } from '@hive/sdk';
 import type { Enemy } from '@hive/sdk';
+import type { PlayerFollowOptions } from '@hive/sdk';
 import type { BridgeDeps } from '../BridgeDeps.js';
 import { warnUnimplemented } from '../stubWarn.js';
 import { Logger } from '../../../util/Logger.js';
@@ -83,9 +84,29 @@ export class BridgeWalking {
       return false;
     };
 
-    Walking.followPlayer = (_name: string) => {
+    Walking.followPlayer = (_name: string, _options?: PlayerFollowOptions) => {
       warnUnimplemented('Walking.followPlayer');
       return false;
+    };
+
+    Walking.getAnchor = () => {
+      warnUnimplemented('Walking.getAnchor');
+      return '';
+    };
+
+    Walking.setAnchor = (_name: string) => {
+      warnUnimplemented('Walking.setAnchor');
+      return '';
+    };
+
+    Walking.anchorTeleport = () => {
+      warnUnimplemented('Walking.anchorTeleport');
+      return false;
+    };
+
+    Walking.teleportToQuestPlayer = () => {
+      warnUnimplemented('Walking.teleportToQuestPlayer');
+      return 'not_allowed';
     };
 
     Walking.stopMoving = () => {
@@ -131,6 +152,35 @@ export class BridgeWalking {
     Walking.isAutoDodgeEnabled = () => false;
 
     Walking.getAutoDodgeState = () => null;
+
+    Walking.enableProdMafiaAutoPlay = () => {
+      warnUnimplemented('Walking.enableProdMafiaAutoPlay');
+      return false;
+    };
+
+    Walking.disableProdMafiaAutoPlay = () => {
+      warnUnimplemented('Walking.disableProdMafiaAutoPlay');
+    };
+
+    Walking.isProdMafiaAutoPlayEnabled = () => false;
+
+    Walking.getProdMafiaAutoPlayState = () => ({
+      enabled: false,
+      state: 'disabled',
+      navigationMode: 'stop',
+      target: null,
+      targetObjectId: null,
+      arriveThreshold: 0.6,
+      allowWallEscape: true,
+      usePortalObjectId: null,
+      teleportObjectId: null,
+      nexus: false,
+      autoAim: false,
+      autoAbility: false,
+      combatTargetObjectId: null,
+      reconnectServerHost: null,
+      movementSpeedScale: 1,
+    });
 
     Walking.setDodgeMovementIntent = () => {
       warnUnimplemented('Walking.setDodgeMovementIntent');

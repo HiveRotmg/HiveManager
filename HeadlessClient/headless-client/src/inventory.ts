@@ -91,6 +91,41 @@ export function buildInvSwap(
   return swap;
 }
 
+// ------------------------------------------------------------- vault sweeps
+
+/**
+ * Delay between consecutive swaps in ProdMafia's one-shot vault sweeps
+ * (`MapUserInput`, deposit and withdraw keys). The server drops swaps that
+ * arrive faster than this while it is still settling the previous one.
+ */
+export const VAULT_SWEEP_STAGGER_MS = 550;
+
+/** One leg of a staggered vault sweep. */
+export interface VaultSweepStep {
+  from: SlotRef;
+  to: SlotRef;
+  /** Offset from the start of the sweep, in milliseconds. */
+  delayMs: number;
+}
+
+/**
+ * Plans ProdMafia's "deposit everything" sweep: every occupied carried slot,
+ * in slot order, paired with the vault's empty slots in slot order. Equipment
+ * (slots 0-3) is never touched. The plan stops when either side runs out.
+ */
+export function planVaultDepositAll(
+  carried: readonly SlotRef[],
+  vault: readonly SlotRef[],
+): VaultSweepStep[] {
+  const occupied = carried.filter((slot) => slot.slotId >= 4 && slot.itemType !== -1);
+  const empty = vault.filter((slot) => slot.itemType === -1);
+  return occupied.slice(0, empty.length).map((from, index) => ({
+    from,
+    to: empty[index],
+    delayMs: index * VAULT_SWEEP_STAGGER_MS,
+  }));
+}
+
 // -------------------------------------------------------- INVRESULT semantics
 
 /**

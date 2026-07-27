@@ -6,7 +6,14 @@ import { Account, ServerInfo } from './account-service';
 import { Client, type SlotRef } from './client';
 import { config, setConfig } from './config';
 import { GameId } from './constants';
+import { parseDungeonWhitelist } from './portal-automation';
 import { ItemCatalog, loadItemCatalog } from './item-metadata';
+import { AntiSpam } from './plugins/anti-spam';
+import { AutoResponder } from './plugins/auto-responder';
+import { BossPhaseTimer } from './plugins/boss-phase-timer';
+import { O3GuardCapture, parseAltTextureIds } from './plugins/o3-guard-capture';
+import { FollowTeleport } from './plugins/follow-teleport';
+import { PortalAutomation } from './plugins/portal-automation';
 import { PetBagRoundTrip } from './plugins/pet-bag-round-trip';
 import { PetToVault } from './plugins/pet-to-vault';
 import { RealmHostMapper } from './plugins/realm-host-mapper';
@@ -351,6 +358,8 @@ function snapshot(ctx: WebPanelContext, itemCatalog: ItemCatalog): Record<string
           }
         : undefined,
       debug,
+      autoLoot: client.getAutoLootState(),
+      autoConsumables: client.getAutoConsumablesState(),
       portals: buildPortalRows(client, visibleObjects, itemCatalog),
       visibleObjects: visibleObjectRows,
       loadedPlugins: ctx.plugins.loaded(client),
@@ -434,6 +443,12 @@ function pluginData(plugins: PluginManager, client: Client): Record<string, unkn
   return {
     realmHosts: plugins.get<RealmHostMapper>(client, 'RealmHostMapper')?.portals() ?? [],
     petToVault: plugins.get<PetToVault>(client, 'PetToVault')?.status(),
+    autoResponder: plugins.get<AutoResponder>(client, 'AutoResponder')?.status(),
+    bossPhase: plugins.get<BossPhaseTimer>(client, 'BossPhaseTimer')?.status(),
+    antiSpam: plugins.get<AntiSpam>(client, 'AntiSpam')?.status(),
+    o3Guard: plugins.get<O3GuardCapture>(client, 'O3Guard')?.status(),
+    portalAutomation: plugins.get<PortalAutomation>(client, 'PortalAutomation')?.status(),
+    followTeleport: plugins.get<FollowTeleport>(client, 'FollowTeleport')?.status(),
   };
 }
 
@@ -571,6 +586,62 @@ async function runAction(ctx: WebPanelContext, raw: Record<string, unknown>): Pr
         return fail(`invalid slot swap: ${(err as Error).message}`);
       }
     }
+    case 'autoLoot': {
+      const c = requireClient();
+      if (!c) return fail(`no client: ${alias}`);
+      const options = raw.options && typeof raw.options === 'object'
+        ? raw.options as Record<string, unknown>
+        : undefined;
+      if (raw.enabled === false) {
+        c.disableAutoLoot();
+        return ok(`[${c.alias}] auto loot disabled`);
+      }
+      if (raw.enabled === undefined && options) {
+        return c.configureAutoLoot(options)
+          ? ok(`[${c.alias}] auto loot configured`)
+          : fail(`[${c.alias}] auto loot unavailable - no object metadata loaded`);
+      }
+      return c.enableAutoLoot(options)
+        ? ok(`[${c.alias}] auto loot enabled`)
+        : fail(`[${c.alias}] auto loot unavailable - no object metadata loaded`);
+    }
+    case 'autoConsumables': {
+      const c = requireClient();
+      if (!c) return fail(`no client: ${alias}`);
+      const options = raw.options && typeof raw.options === 'object'
+        ? raw.options as Record<string, unknown>
+        : undefined;
+      if (raw.enabled === false) {
+        c.disableAutoConsumables();
+        return ok(`[${c.alias}] auto potions disabled`);
+      }
+      if (raw.enabled === undefined && options) {
+        c.configureAutoConsumables(options);
+        return ok(`[${c.alias}] auto potions configured`);
+      }
+      c.enableAutoConsumables(options);
+      return ok(`[${c.alias}] auto potions enabled`);
+    }
+    case 'tombCycle': {
+      const c = requireClient();
+      if (!c) return fail(`no client: ${alias}`);
+      if (raw.clear) {
+        c.clearTombBossCycle();
+        return ok(`[${c.alias}] every Tomb boss is attackable again`);
+      }
+      const boss = c.cycleTombBoss();
+      return boss
+        ? ok(`[${c.alias}] Tomb boss cycle: ${boss}`)
+        : fail(`[${c.alias}] auto combat unavailable - no object metadata loaded`);
+    }
+    case 'depositAll': {
+      const c = requireClient();
+      if (!c) return fail(`no client: ${alias}`);
+      const scheduled = c.depositAllToVault();
+      return scheduled > 0
+        ? ok(`[${c.alias}] depositing ${scheduled} item(s) to the vault`)
+        : fail(`[${c.alias}] nothing to deposit (in the vault, with free vault slots?)`);
+    }
     case 'connectServer': {
       const c = requireClient();
       if (!c) return fail(`no client: ${alias}`);
@@ -682,7 +753,7 @@ async function runConsoleCommand(ctx: WebPanelContext, selectedAlias: string, co
   const rest = parts.join(' ');
   switch (verb) {
     case 'help':
-      return ok('commands: show, set, pos, say, sayall, tick, debug, vault, escape, stall, unstall, resume, disconnect, start, connect, gameid, portal, invswap, move, shoot, realms, hosts, plugins, plugin, load, unload, invtest, pettovault, stalltest, clear');
+      return ok('commands: show, set, pos, say, sayall, tick, debug, vault, escape, stall, unstall, resume, disconnect, start, connect, gameid, portal, invswap, move, shoot, autoloot, autopot, tomb, depositall, autoresponder, phase, antispam, o3guard, autoportals, follow, unfollow, anchor, questtp, realms, hosts, plugins, plugin, load, unload, invtest, pettovault, stalltest, clear');
     case 'clear':
       return runAction(ctx, { action: 'clearLogs' });
     case 'show':
@@ -721,6 +792,133 @@ async function runConsoleCommand(ctx: WebPanelContext, selectedAlias: string, co
       return runAction(ctx, { action: 'shootAt', alias, x: parts[0], y: parts[1] });
     case 'set':
       return runAction(ctx, { action: 'setConfig', key: parts[0], value: parts.slice(1).join(' ') });
+    case 'autoloot':
+    case 'autopot': {
+      const action = verb === 'autoloot' ? 'autoLoot' : 'autoConsumables';
+      // `autoloot` / `autoloot on` / `autoloot off` / `autoloot {"marks":true}`
+      if (parts.length === 0) return runAction(ctx, { action, alias, enabled: true });
+      const word = parts[0].toLowerCase();
+      if (word === 'off' || word === 'false' || word === '0') {
+        return runAction(ctx, { action, alias, enabled: false });
+      }
+      if (word === 'on' || word === 'true' || word === '1') {
+        return runAction(ctx, { action, alias, enabled: true });
+      }
+      try {
+        return runAction(ctx, { action, alias, options: JSON.parse(rest) });
+      } catch {
+        return fail(`${verb} expects on, off, or a JSON options object`);
+      }
+    }
+    case 'tomb':
+      // `tomb` advances the rotation, `tomb clear` releases every Tomb boss.
+      return runAction(ctx, {
+        action: 'tombCycle',
+        alias,
+        clear: (parts[0] ?? '').toLowerCase() === 'clear',
+      });
+    case 'depositall':
+      return runAction(ctx, { action: 'depositAll', alias });
+    case 'autoresponder': {
+      const client = ctx.clients.get(alias);
+      if (!client) return fail(`no client: ${alias}`);
+      const responder = ctx.plugins.get<AutoResponder>(client, 'AutoResponder');
+      if (!responder) return fail(`[${client.alias}] AutoResponder is not loaded`);
+      const word = (parts[0] ?? '').toLowerCase();
+      if (word === 'off' || word === 'false' || word === '0') responder.setEnabled(false);
+      else if (word === 'on' || word === 'true' || word === '1') responder.setEnabled(true);
+      return ok(JSON.stringify(responder.status(), null, 2));
+    }
+    case 'phase': {
+      const client = ctx.clients.get(alias);
+      if (!client) return fail(`no client: ${alias}`);
+      const timer = ctx.plugins.get<BossPhaseTimer>(client, 'BossPhaseTimer');
+      if (!timer) return fail(`[${client.alias}] BossPhaseTimer is not loaded`);
+      return ok(JSON.stringify(timer.status(), null, 2));
+    }
+    case 'antispam': {
+      const client = ctx.clients.get(alias);
+      if (!client) return fail(`no client: ${alias}`);
+      const filter = ctx.plugins.get<AntiSpam>(client, 'AntiSpam');
+      if (!filter) return fail(`[${client.alias}] AntiSpam is not loaded`);
+      const word = (parts[0] ?? '').toLowerCase();
+      if (word === 'off' || word === 'false' || word === '0') config.chatSpamFilter = false;
+      else if (word === 'on' || word === 'true' || word === '1') config.chatSpamFilter = true;
+      return ok(JSON.stringify(filter.status(), null, 2));
+    }
+    case 'o3guard': {
+      // `o3guard` reports the capture, `o3guard ids 7,9` tells Auto Aim which
+      // alt textures are the guard, `o3guard apply` accepts what it learned and
+      // `o3guard learn on|off` gates the stall inference.
+      const client = ctx.clients.get(alias);
+      if (!client) return fail(`no client: ${alias}`);
+      const capture = ctx.plugins.get<O3GuardCapture>(client, 'O3Guard');
+      if (!capture) return fail(`[${client.alias}] O3Guard is not loaded`);
+      const word = (parts[0] ?? '').toLowerCase();
+      if (word === 'ids') {
+        const ids = parseAltTextureIds(parts.slice(1).join(' '));
+        if (ids.length === 0) return fail('usage: o3guard ids <altTextureId,...>');
+        config.o3GuardAltTextureIds = ids.join(',');
+        return ok(`[${client.alias}] O3 guard alt textures: [${capture.applyIds(client, ids).join(', ')}]`);
+      }
+      if (word === 'apply') {
+        const applied = capture.applyCandidates(client);
+        if (applied.length === 0) return fail(`[${client.alias}] nothing captured to apply yet`);
+        config.o3GuardAltTextureIds = applied.join(',');
+        return ok(`[${client.alias}] O3 guard alt textures: [${applied.join(', ')}]`);
+      }
+      if (word === 'learn') {
+        const value = (parts[1] ?? '').toLowerCase();
+        if (value === 'off' || value === 'false' || value === '0') config.o3GuardLearnFromStalls = false;
+        else if (value === 'on' || value === 'true' || value === '1') config.o3GuardLearnFromStalls = true;
+        else return fail('usage: o3guard learn on|off');
+      }
+      return ok(JSON.stringify(capture.status(), null, 2));
+    }
+    case 'autoportals': {
+      // `autoportals` / `autoportals on|off` / `autoportals only <dungeon,...>`
+      const client = ctx.clients.get(alias);
+      if (!client) return fail(`no client: ${alias}`);
+      const automation = ctx.plugins.get<PortalAutomation>(client, 'PortalAutomation');
+      if (!automation) return fail(`[${client.alias}] PortalAutomation is not loaded`);
+      const word = (parts[0] ?? '').toLowerCase();
+      if (word === 'off' || word === 'false' || word === '0') automation.setEnabled(false);
+      else if (word === 'on' || word === 'true' || word === '1') automation.setEnabled(true);
+      else if (word === 'only' || word === 'whitelist') {
+        automation.setWhitelist(parseDungeonWhitelist(parts.slice(1).join(' ')));
+      } else if (word === 'portals') {
+        return ok(JSON.stringify(automation.visibleCandidates(client), null, 2));
+      }
+      return ok(JSON.stringify(automation.status(), null, 2));
+    }
+    case 'follow':
+    case 'unfollow':
+    case 'anchor':
+    case 'questtp': {
+      const client = ctx.clients.get(alias);
+      if (!client) return fail(`no client: ${alias}`);
+      const follow = ctx.plugins.get<FollowTeleport>(client, 'FollowTeleport');
+      if (!follow) return fail(`[${client.alias}] FollowTeleport is not loaded`);
+      if (verb === 'unfollow') {
+        follow.stopFollowing(client);
+      } else if (verb === 'follow') {
+        if (!rest) return fail('usage: follow <player name>');
+        follow.follow(client, rest);
+      } else if (verb === 'anchor') {
+        const word = (parts[0] ?? '').toLowerCase();
+        if (word === 'tp' || word === 'teleport') {
+          if (!follow.anchorTeleport(client)) return fail(`[${client.alias}] no anchor set`);
+        } else if (rest) {
+          follow.setAnchor(rest);
+        }
+      } else {
+        const selection = follow.questTeleport(client);
+        if (selection.kind !== 'teleport') {
+          return fail(`[${client.alias}] quest teleport: ${selection.kind}`);
+        }
+      }
+      return ok(JSON.stringify(follow.status(), null, 2));
+    }
     case 'pos': {
       const client = ctx.clients.get(alias);
       if (!client) return fail(`no client: ${alias}`);

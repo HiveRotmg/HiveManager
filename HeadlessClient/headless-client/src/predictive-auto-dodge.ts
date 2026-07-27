@@ -28,6 +28,31 @@ export type {
 export interface AutoDodgeOptions {
   /** Penalize positive XML floor damage while selecting local trajectories. */
   safeWalk?: boolean;
+  /**
+   * Validated planner tunables for the ProdMafia controller. Unset fields keep
+   * ProdMafia's defaults; out-of-range values are clamped, not rejected. Typed
+   * loosely here so `predictive-auto-dodge` does not depend on the ProdMafia
+   * port's module.
+   */
+  config?: {
+    projectileClearance?: number;
+    aoeClearance?: number;
+    lookAheadMs?: number;
+    aoeLookAheadMs?: number;
+    playerHitbox?: number;
+    cornerLookAheadTiles?: number;
+    cornerStrength?: number;
+    shooterBackoffTiles?: number;
+    reactionLeadMs?: number;
+    manualInfluence?: number;
+    hysteresisMs?: number;
+  };
+}
+
+export interface AutoDodgePointBlankEmitter {
+  objectId: number;
+  x: number;
+  y: number;
 }
 
 // `AutoDodgeAoeThreat` and `AutoDodgeEnvironment` used to exist here as empty
@@ -57,6 +82,14 @@ export interface AutoDodgeSnapshot {
   time: number;
   playerId: number;
   position: { x: number; y: number };
+  /**
+   * Time-aligned acknowledged position. ProdMafia scores this as a second
+   * anchor that converges to the local position over 350 ms; it never fills
+   * the space between the two positions.
+   */
+  serverPosition?: { x: number; y: number };
+  /** True when Auto Play, rather than keyboard input, supplied the intent. */
+  autonomousIntent?: boolean;
   /** Current bounded waypoint supplied by direct walking or global pathfinding. */
   goal?: { x: number; y: number; threshold?: number };
   /** Stable global/script intent; `goal` remains the current local route point. */
@@ -70,6 +103,8 @@ export interface AutoDodgeSnapshot {
   movementLocked?: boolean;
   projectiles: Iterable<CombatProjectileSnapshot>;
   aoes: readonly DodgePlanningAoe[];
+  /** Projectile-capable quest bosses guarded by ProdMafia's 0.9-tile core. */
+  pointBlankEmitters?: readonly AutoDodgePointBlankEmitter[];
   environment: DodgePlanningEnvironment;
 }
 
@@ -126,6 +161,35 @@ export interface AutoDodgeState {
    * instead, which still returns the full DodgePlannerMetrics.
    */
   plannerMetrics: DeterministicDodgePlannerMetrics;
+  /**
+   * The WINNING route's own evaluation, not an aggregate over all candidates.
+   * `null` for planners that do not evaluate discrete routes.
+   *
+   * `earliestImpactMs` above is a minimum across every candidate, which describes
+   * a route that was not taken; `route.impactMs` is the one actually commanded.
+   */
+  route: AutoDodgeRoute | null;
+}
+
+/** Per-route evaluation surfaced for diagnostics and tier-ordering tests. */
+export interface AutoDodgeRoute {
+  /** Milliseconds until a wall stops this route, or `null` if it never does. */
+  blockMs: number | null;
+  /** Furthest position the route actually reaches. */
+  reachableX: number;
+  reachableY: number;
+  safe: boolean;
+  /** Why the route was rejected, or `null` while it is still viable. */
+  reason: string | null;
+  expectedDamage: number;
+  impactMs: number | null;
+  groundExposureMs: number;
+  /** Soft (planning) clearance: negative means a margin breach, not a hit. */
+  minimumClearance: number;
+  /** Accumulated soft risk across every threat channel. */
+  risk: number;
+  lethal: boolean;
+  escapeOptions: number;
 }
 
 interface CommittedPlan {
@@ -682,6 +746,7 @@ export class PredictiveAutoDodgeController {
       lookaheadChanged,
       decision: result.decision,
       plannerMetrics: this.planner.getDeterministicMetrics(),
+      route: null,
     };
     return this.state;
   }
@@ -946,6 +1011,7 @@ function emptyState(
     lookaheadChanged: false,
     decision: 'none',
     plannerMetrics: cloneMetrics(metrics),
+    route: null,
   };
 }
 
