@@ -127,6 +127,12 @@ export {
   NAVIGATION_PATH_SEARCH_BUDGET,
   SYNC_PATH_SEARCH_BUDGET,
 } from './explorative-pathfinder';
+export { ProdMafiaAutoDodgeController } from './prodmafia-auto-dodge';
+export {
+  ProdMafiaPathfinder,
+  PROD_MAFIA_MAX_LOCAL_GOAL_DISTANCE,
+  PROD_MAFIA_PATH_SEARCH_BUDGET,
+} from './prodmafia-pathfinder';
 export { runIncrementalPathSearch, runSyncPathSearch } from './path-search-adapters';
 export {
   pathSearchStatusToNavigationStatus,
