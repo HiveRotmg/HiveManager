@@ -30,6 +30,28 @@ export interface AppConfig {
   /** Default for auto HP/MP potions and auto heal (per-client `autoConsumables` overrides). */
   autoConsumables: boolean;
   /**
+   * Buddha Mode — ignore only lethal projectile hits. Per-client override via
+   * `configureHitSuppression` / `setBuddhaModeEnabled`.
+   */
+  buddhaMode: boolean;
+  /**
+   * Strategic Ack Suppression — drop large/lethal unavoidable projectile hits
+   * when Auto Dodge is enabled. ProdMafia default true.
+   */
+  strategicAckSuppression: boolean;
+  /**
+   * Strategic AoE Suppression — withhold AOEACK for large/lethal unavoidable
+   * bombs. ProdMafia default false.
+   */
+  strategicAoeSuppression: boolean;
+  /** Big-hit threshold (% of max HP) for strategic suppression. Default 10. */
+  suppressThresholdPercent: number;
+  /**
+   * AutoSync ClientHP — force predicted HP onto server HP after sustained
+   * divergence (>60 HP). WARNING: can die with this on. Default false.
+   */
+  autoSyncClientHp: boolean;
+  /**
    * Answer dungeon dialogue gates (Thessal, Skuld, Craig, the Computer, Master
    * Rat). Read live by the `AutoResponder` plugin, which must also be loaded.
    */
@@ -57,16 +79,11 @@ export interface AppConfig {
   chatSpamFilter: boolean;
   /**
    * Write Oryx 3 guard-state capture lines to `logs/debug-<date>.ndjson`. Read
-   * live by the `O3Guard` plugin, which must also be loaded.
+   * live by the `O3Guard` plugin, which must also be loaded. After a fight,
+   * correlate `o3_silence` / the counter `o3_text` with nearby `altTexture`
+   * values and paste them into `o3GuardAltTextureIds`.
    */
   o3GuardCapture: boolean;
-  /**
-   * Let `O3Guard` add an alt-texture id to Auto Aim's `o3GuardAltTextureIds`
-   * when our own hit claims land on Oryx 3 with his HP flat — the guard tell the
-   * reference never captured. Off leaves the plugin purely diagnostic; run
-   * `o3guard` to see what it would have learned.
-   */
-  o3GuardLearnFromStalls: boolean;
   /**
    * Known Oryx 3 guard alt-texture ids, comma separated (e.g. `"7, 9"`). Applied
    * to Auto Aim by `O3Guard` whenever Oryx 3 comes into view, so a captured id
@@ -91,6 +108,11 @@ export const config: AppConfig = {
   autoEnterVault: false,
   autoLoot: false,
   autoConsumables: false,
+  buddhaMode: false,
+  strategicAckSuppression: true,
+  strategicAoeSuppression: false,
+  suppressThresholdPercent: 10,
+  autoSyncClientHp: false,
   autoResponder: true,
   autoEnterPortals: false,
   autoEnterPortalWhitelist: '',
@@ -98,7 +120,6 @@ export const config: AppConfig = {
   anchorName: '',
   chatSpamFilter: true,
   o3GuardCapture: true,
-  o3GuardLearnFromStalls: true,
   o3GuardAltTextureIds: '',
   arriveThreshold: 0.5,
   maxEventListeners: 100,

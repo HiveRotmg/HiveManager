@@ -10,7 +10,7 @@ import type {
   PathSearchStepBudget,
   PathTarget,
 } from './explorative-pathfinder';
-import type { StaticPassabilityStore } from './static-passability-model';
+import type { HazardTraversalPolicy, StaticPassabilityStore } from './static-passability-model';
 import { createStaticPassabilityStore } from './static-passability-store';
 
 export const PROD_MAFIA_MAX_LOCAL_GOAL_DISTANCE = 5;
@@ -22,6 +22,8 @@ export const PROD_MAFIA_PATH_SEARCH_BUDGET: PathSearchStepBudget = {
 const DIR_X = [1, -1, 0, 0, 1, 1, -1, -1] as const;
 const DIR_Y = [0, 0, 1, -1, 1, -1, 1, -1] as const;
 const EXPANSION_LIMIT = 2500;
+/** Cardinal/diagonal step weight for the hazard `cost` Dijkstra tier. */
+const STEP_COST = 1;
 // Flash passes 0.35 into apMoveToward as a stopDist, but waypoint consumption
 // at ~0.45 always wins first — so intermediates never actually stop. Feeding
 // MovementController a positive arrive radius clears intent mid-tile and causes
@@ -53,6 +55,17 @@ interface FailedRouteRegion {
   radius: number;
 }
 
+interface ProdMafiaPathBuildResult {
+  path: GridPoint[];
+  reachedGoal: boolean;
+  bestDistance: number;
+  lastBuildWasWallEscape: boolean;
+  wallEscapeDirectionX: number;
+  wallEscapeDirectionY: number;
+  /** Oryx castle oscillated escape — caller must clear blocked/stuck. */
+  clearBlockedState: boolean;
+}
+
 export type ProdMafiaFinalApproach = 'none' | 'guarded' | 'portal';
 
 /**
@@ -61,6 +74,12 @@ export type ProdMafiaFinalApproach = 'none' | 'guarded' | 'portal';
  * It deliberately keeps ProdMafia's bounded breadth-first search, direction
  * order, cardinal-neighbor goal rule, no-corner-cutting rule, 0.2-tile segment
  * validation, closest-frontier fallback, and learned route-cell rejection.
+ *
+ * Hazardous ground is a two-tier addition on top of that port. ProdMafia itself
+ * never paths onto damaging ground (`canOccupyForDodge(..., true)`), so there is
+ * no Flash cost model to copy. Tier one mirrors that safeWalk BFS. Tier two only
+ * runs when tier one cannot reach a cardinal neighbor of the goal, and prices
+ * damaging / sink / slow tiles via {@link StaticPassabilityStore.getTileTraversalPenalty}.
  */
 export class ProdMafiaPathfinder {
   private readonly staticPassability: StaticPassabilityStore;
@@ -95,6 +114,11 @@ export class ProdMafiaPathfinder {
   private lastWallEscapeTo = -1;
   private wallEscapeReverseCount = 0;
   private readonly failedRouteRegions: FailedRouteRegion[] = [];
+  /** Active during a single {@link searchPath} call; see class comment. */
+  private hazardTraversal: HazardTraversalPolicy = 'block';
+  private hazardEscalationEnabled = true;
+  /** True while the active route was planned under the hazard `cost` tier. */
+  private routeAllowsHazard = false;
 
   constructor(
     private readonly data?: PathfindingDataProvider,
@@ -436,7 +460,13 @@ export class ProdMafiaPathfinder {
       return this.finalApproachStep(position) ?? { replanned: false };
     }
     const waypoint = this.path[0]!;
-    if (!this.canTraverse(position.x, position.y, waypoint.x, waypoint.y)) {
+    if (!this.canTraverse(
+      position.x,
+      position.y,
+      waypoint.x,
+      waypoint.y,
+      this.routeAllowsHazard,
+    )) {
       if (this.allowWallEscape) {
         const tileX = Math.trunc(waypoint.x);
         const tileY = Math.trunc(waypoint.y);
@@ -499,15 +529,56 @@ export class ProdMafiaPathfinder {
     gy: number,
     allowWallEscape = true,
   ): GridPoint[] {
+    const dry = this.searchPath(sx, sy, gx, gy, allowWallEscape, 'block');
+    let chosen = dry;
+    let choseHazardRoute = false;
+    if (!dry.reachedGoal && this.hazardEscalationEnabled) {
+      const wet = this.searchPath(sx, sy, gx, gy, allowWallEscape, 'cost');
+      if (wet.reachedGoal || wet.bestDistance < dry.bestDistance - 1e-9) {
+        chosen = wet;
+        choseHazardRoute = true;
+      }
+    }
+    if (chosen.clearBlockedState) {
+      this.blocked.clear();
+      this.stuckCount = 0;
+      this.wallEscapeReverseCount = 0;
+    }
+    this.lastBuildWasWallEscape = chosen.lastBuildWasWallEscape;
+    if (chosen.lastBuildWasWallEscape) {
+      this.wallEscapeDirectionX = chosen.wallEscapeDirectionX;
+      this.wallEscapeDirectionY = chosen.wallEscapeDirectionY;
+    } else {
+      this.wallEscapeDirectionX = 0;
+      this.wallEscapeDirectionY = 0;
+    }
+    this.hazardTraversal = 'block';
+    this.routeAllowsHazard = choseHazardRoute;
+    return chosen.path;
+  }
+
+  private searchPath(
+    sx: number,
+    sy: number,
+    gx: number,
+    gy: number,
+    allowWallEscape: boolean,
+    hazard: HazardTraversalPolicy,
+  ): ProdMafiaPathBuildResult {
     const width = this.staticPassability.getWidth();
     const height = this.staticPassability.getHeight();
-    this.lastBuildWasWallEscape = false;
-    if (sx < 0 || sx >= width || sy < 0 || sy >= height) return [];
+    this.hazardTraversal = hazard;
+    if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+      return emptyPathBuildResult(squaredDistance(sx, sy, gx, gy));
+    }
 
     const startKey = sx + sy * width;
-    const queue: number[] = [startKey];
-    const seen = new Set<number>([startKey]);
     const parent = new Map<number, number>();
+    const bestG = new Map<number, number>([[startKey, 0]]);
+    // Tier one keeps ProdMafia's FIFO BFS. Tier two is Dijkstra so lava damage
+    // and sink/slow penalties order hazardous crossings.
+    const useCosts = hazard === 'cost';
+    const queue: number[] = [startKey];
     let head = 0;
     let expanded = 0;
     let found = -1;
@@ -525,9 +596,34 @@ export class ProdMafiaPathfinder {
     const maxEscapeGoalRadius = Math.sqrt(startingGoalDistance) + 8;
     const maxEscapeGoalDistance = maxEscapeGoalRadius * maxEscapeGoalRadius;
     const startInFailedRegion = this.isFailedRouteRegion(sx + 0.5, sy + 0.5);
+    // Linear-scan min heap of {g, key} for the cost tier. Maps are small
+    // (≤2500 expansions); a binary heap would be overkill for that budget.
+    const heap: Array<{ g: number; key: number }> = useCosts ? [{ g: 0, key: startKey }] : [];
 
-    while (head < queue.length && expanded < EXPANSION_LIMIT) {
-      const currentKey = queue[head++]!;
+    const popNext = (): { key: number; g: number } | undefined => {
+      if (!useCosts) {
+        if (head >= queue.length) return undefined;
+        const key = queue[head++]!;
+        return { key, g: bestG.get(key) ?? 0 };
+      }
+      while (heap.length > 0) {
+        let bestIndex = 0;
+        for (let i = 1; i < heap.length; i++) {
+          if (heap[i]!.g < heap[bestIndex]!.g) bestIndex = i;
+        }
+        const next = heap[bestIndex]!;
+        const last = heap.pop()!;
+        if (bestIndex < heap.length) heap[bestIndex] = last;
+        if (next.g === bestG.get(next.key)) return next;
+      }
+      return undefined;
+    };
+
+    while (expanded < EXPANSION_LIMIT) {
+      const current = popNext();
+      if (current === undefined) break;
+      const currentKey = current.key;
+      const currentG = current.g;
       const x = currentKey % width;
       const y = Math.trunc(currentKey / width);
       expanded++;
@@ -568,20 +664,31 @@ export class ProdMafiaPathfinder {
         const ny = y + dy;
         if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
         const key = nx + ny * width;
-        if (seen.has(key)
-          || this.blocked.has(key)
+        if (this.blocked.has(key)
           || !startInFailedRegion && this.isFailedRouteRegion(nx + 0.5, ny + 0.5)
           || !this.tileOccupable(nx, ny)) continue;
         if (dx !== 0 && dy !== 0
           && (!this.tileWalkable(x + dx, y) || !this.tileWalkable(x, y + dy))) {
           continue;
         }
-        if (!this.canTraverse(x + 0.5, y + 0.5, nx + 0.5, ny + 0.5)) continue;
-        seen.add(key);
+        if (!this.canTraverse(x + 0.5, y + 0.5, nx + 0.5, ny + 0.5, hazard === 'cost')) {
+          continue;
+        }
+        const stepG = currentG + STEP_COST
+          + (useCosts ? this.staticPassability.getTileTraversalPenalty(nx, ny) : 0);
+        const prior = bestG.get(key);
+        if (prior !== undefined && prior <= stepG) continue;
+        bestG.set(key, stepG);
         parent.set(key, currentKey);
-        queue.push(key);
+        if (useCosts) heap.push({ g: stepG, key });
+        else queue.push(key);
       }
     }
+
+    let lastBuildWasWallEscape = false;
+    let wallEscapeDirectionX = 0;
+    let wallEscapeDirectionY = 0;
+    const reachedGoal = found >= 0;
 
     if (found < 0) {
       if (allowWallEscape && this.stuckCount > 0 && wallEscapeKey !== startKey) {
@@ -597,22 +704,27 @@ export class ProdMafiaPathfinder {
           this.lastWallEscapeFrom = startKey;
           this.lastWallEscapeTo = wallEscapeKey;
           if (this.wallEscapeReverseCount >= 2) {
-            this.blocked.clear();
-            this.stuckCount = 0;
-            this.wallEscapeReverseCount = 0;
-            return [];
+            return {
+              path: [],
+              reachedGoal: false,
+              bestDistance,
+              lastBuildWasWallEscape: false,
+              wallEscapeDirectionX: 0,
+              wallEscapeDirectionY: 0,
+              clearBlockedState: true,
+            };
           }
         }
         found = wallEscapeKey;
-        this.lastBuildWasWallEscape = true;
+        lastBuildWasWallEscape = true;
         const escapeX = wallEscapeKey % width;
         const escapeY = Math.trunc(wallEscapeKey / width);
         const selectedEscapeDx = escapeX - sx;
         const selectedEscapeDy = escapeY - sy;
         const selectedEscapeLength = Math.hypot(selectedEscapeDx, selectedEscapeDy);
         if (selectedEscapeLength > 0.001) {
-          this.wallEscapeDirectionX = selectedEscapeDx / selectedEscapeLength;
-          this.wallEscapeDirectionY = selectedEscapeDy / selectedEscapeLength;
+          wallEscapeDirectionX = selectedEscapeDx / selectedEscapeLength;
+          wallEscapeDirectionY = selectedEscapeDy / selectedEscapeLength;
         }
       } else {
         found = bestKey !== startKey
@@ -620,7 +732,9 @@ export class ProdMafiaPathfinder {
           : allowWallEscape && fallbackKey !== startKey ? fallbackKey : -1;
       }
     }
-    if (found < 0) return [];
+    if (found < 0) {
+      return emptyPathBuildResult(bestDistance);
+    }
 
     const result: GridPoint[] = [];
     let cursor = found;
@@ -630,31 +744,47 @@ export class ProdMafiaPathfinder {
       cursor = parent.get(cursor) ?? -1;
     }
     result.reverse();
-    if (!this.lastBuildWasWallEscape) {
-      this.wallEscapeDirectionX = 0;
-      this.wallEscapeDirectionY = 0;
-    }
-    return result;
+    return {
+      path: result,
+      reachedGoal,
+      bestDistance,
+      lastBuildWasWallEscape,
+      wallEscapeDirectionX,
+      wallEscapeDirectionY,
+      clearBlockedState: false,
+    };
   }
 
   private tileWalkable(x: number, y: number): boolean {
+    // Pathfinding consumer: sink water is walkable; damaging ground follows
+    // hazardTraversal. Dodge safeWalk is intentionally not used here — it also
+    // rejects pure Sink, which would wall off Abyssal Sanctuary's dry floor.
     return this.staticPassability.getObservedTileType(x, y) !== undefined
       && !this.staticPassability.isTileStaticallyBlocked(x, y, {
-        consumer: 'dodge',
-        safeWalk: true,
+        consumer: 'pathfinding',
+        hazardTraversal: this.hazardTraversal,
       });
   }
 
   private tileOccupable(x: number, y: number): boolean {
+    if (!this.tileWalkable(x, y)) return false;
+    // Physical footprint only. Damaging/sink policy is owned by tileWalkable so
+    // dodge safeWalk (which also avoids water) cannot wall Abyss again.
     return this.staticPassability.canOccupyAt(x + 0.5, y + 0.5, {
       consumer: 'dodge',
-      safeWalk: true,
+      safeWalk: false,
       checkFullOccupyNeighbors: true,
       allowUnknown: false,
     });
   }
 
-  private canTraverse(fromX: number, fromY: number, toX: number, toY: number): boolean {
+  private canTraverse(
+    fromX: number,
+    fromY: number,
+    toX: number,
+    toY: number,
+    allowHazardReentry = false,
+  ): boolean {
     const dx = toX - fromX;
     const dy = toY - fromY;
     const steps = Math.max(1, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)) / 0.2));
@@ -665,7 +795,8 @@ export class ProdMafiaPathfinder {
       const sampleX = fromX + dx * ratio;
       const sampleY = fromY + dy * ratio;
       const damagingGround = this.isDamagingGround(sampleX, sampleY);
-      if (damagingGround && reachedSafeGround) return false;
+      // ProdMafia leave-but-not-reenter, unless the cost tier is pricing a crossing.
+      if (damagingGround && reachedSafeGround && !allowHazardReentry) return false;
       if (!damagingGround) reachedSafeGround = true;
       const occupiable = this.canPhysicallyOccupy(sampleX, sampleY);
       if (!occupiable && reachedOccupable) return false;
@@ -688,6 +819,7 @@ export class ProdMafiaPathfinder {
     this.plannedTiles = [];
     this.plannedMapRevision = -1;
     this.plannedTargetKey = '';
+    this.routeAllowsHazard = false;
     this.routeRevision++;
   }
 
@@ -718,6 +850,18 @@ export class ProdMafiaPathfinder {
   private isOryxCastle(): boolean {
     return this.mapName.toLowerCase().includes("oryx's castle");
   }
+}
+
+function emptyPathBuildResult(bestDistance: number): ProdMafiaPathBuildResult {
+  return {
+    path: [],
+    reachedGoal: false,
+    bestDistance,
+    lastBuildWasWallEscape: false,
+    wallEscapeDirectionX: 0,
+    wallEscapeDirectionY: 0,
+    clearBlockedState: false,
+  };
 }
 
 function squaredDistance(ax: number, ay: number, bx: number, by: number): number {

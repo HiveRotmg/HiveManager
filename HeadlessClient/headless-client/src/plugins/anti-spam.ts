@@ -29,8 +29,8 @@ const SPAM_MARKERS = [
  * Drops spam from incoming TEXT packets two ways: the keyword list above, and
  * ProdMafia's repeat-payload filter, which drops a normalized payload once three
  * distinct senders have used it inside five minutes (`TextHandler.isRepeatSpam`).
- * Server, guild, party and other `#`/`*` channel messages, plus our own lines,
- * are never touched by either.
+ * Server, guild, party and other `#`/`*` channel messages, tells addressed to us,
+ * plus our own lines, are never touched by either.
  */
 @Plugin({
   name: 'AntiSpam',

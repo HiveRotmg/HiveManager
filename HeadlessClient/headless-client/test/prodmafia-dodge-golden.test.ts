@@ -18,6 +18,11 @@
  * Tests marked `skip` document a real gap in the port; the skip reason names
  * exactly what is missing. They are deliberately not weakened into passing
  * assertions.
+ *
+ * LIVE-vs-dead remaps: assertions that originally mirrored the rolled-back
+ * `objects/autododge/` package (`DodgeCost.conditionSeverity = 100`, diagnostic
+ * unproven telegraphs) are remapped to LIVE `AutoDodgeController.as` semantics
+ * (immobilising conditions = `HARD_AOE_RISK`, unproven telegraphs = hard tier).
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -29,8 +34,24 @@ import {
   type CombatProjectileSnapshot,
 } from '../src/combat-tracker';
 import type { DodgePlanningEnvironment } from '../src/dodge-trajectory-planner';
-import type { AutoDodgeSnapshot, AutoDodgeState } from '../src/predictive-auto-dodge';
-import { ProdMafiaAutoDodgeController } from '../src/prodmafia-auto-dodge';
+import {
+  AoeRepeatObserver,
+  type AutoDodgeSnapshot,
+  type AutoDodgeState,
+} from '../src/predictive-auto-dodge';
+import {
+  compareDodgeRouteCost,
+  dodgeConditionRisk,
+  dodgePointToSegmentDistance,
+  isLethalDodgeCondition,
+  ProdMafiaAutoDodgeController,
+  resolveProdMafiaDodgeConfig,
+  type ProdMafiaDodgeSnapshot,
+  PRODMAFIA_DODGE_CONFIG_DEFAULTS,
+} from '../src/prodmafia-auto-dodge';
+
+/** LIVE `HARD_AOE_RISK` (`AutoDodgeController.as:53`). */
+const HARD_AOE_RISK = 100_000;
 
 /** `AutoDodgeFixtureMain.NOW`. */
 const NOW = 10_000;
@@ -160,8 +181,8 @@ function shot(options: ShotOptions): CombatProjectileSnapshot {
 
 function snapshot(
   map: FixtureMap,
-  overrides: Partial<AutoDodgeSnapshot> = {},
-): AutoDodgeSnapshot {
+  overrides: Partial<ProdMafiaDodgeSnapshot> = {},
+): ProdMafiaDodgeSnapshot {
   return {
     time: NOW,
     playerId: 1,
@@ -178,15 +199,48 @@ function snapshot(
 
 function frozenSnapshot(
   map: FixtureMap,
-  overrides: Partial<AutoDodgeSnapshot> = {},
-): AutoDodgeSnapshot {
+  overrides: Partial<ProdMafiaDodgeSnapshot> = {},
+): ProdMafiaDodgeSnapshot {
   return snapshot(map, { moveSpeed: FROZEN_SPEED, movementLeadMs: 0, ...overrides });
 }
 
-function evaluate(input: AutoDodgeSnapshot): AutoDodgeState {
+function evaluate(input: ProdMafiaDodgeSnapshot): AutoDodgeState {
   const controller = new ProdMafiaAutoDodgeController();
   controller.setEnabled(true);
   return controller.evaluate(input);
+}
+
+/** Attach LIVE condition effects without editing CombatProjectileDefinition. */
+function withConditions(
+  base: CombatProjectileSnapshot,
+  effects: Array<{ effect: string | number; durationSec?: number }>,
+): CombatProjectileSnapshot {
+  return {
+    ...base,
+    definition: {
+      ...base.definition,
+      conditionEffects: effects,
+    } as CombatProjectileDefinition,
+  };
+}
+
+function baseRouteCost(
+  overrides: Partial<Parameters<typeof compareDodgeRouteCost>[0]> = {},
+): Parameters<typeof compareDodgeRouteCost>[0] {
+  return {
+    valid: true,
+    lethal: false,
+    expectedDamage: 0,
+    groundExposureMs: 0,
+    risk: 0,
+    escapeOptions: 8,
+    minimumClearance: 0,
+    firstImpactMs: Infinity,
+    wallBlockMs: Infinity,
+    intentError: 0,
+    index: 1,
+    ...overrides,
+  };
 }
 
 /** `candidateX/candidateY` for a fixed-direction candidate index. */
@@ -241,17 +295,41 @@ function routeEndpoint(
 // F1  testValidatedConfigSnapshot
 // ---------------------------------------------------------------------------
 
-test('[F1] config applies numeric defaults and clamps', {
-  skip: 'No config object exists in the port. Every tunable the fixture clamps '
-    + '(projectileClearance, aoeClearance, lookAheadMs, aoeLookAheadMs, '
-    + 'playerHitbox, cornerLookAheadTiles, cornerStrength, reactionLeadMs, '
-    + 'manualInfluence, hysteresisMs) is a module-private `const` in '
-    + 'prodmafia-auto-dodge.ts with no refresh()/validation path, and '
-    + 'setEnabled accepts only { safeWalk }. The clamping behaviour therefore '
-    + 'has no callable surface. The effective DEFAULTS are covered instead by '
-    + 'the four [F1-defaults] tests below.',
-}, () => {
-  assert.fail('unreachable');
+test('[F1] config applies numeric defaults and clamps', () => {
+  const defaults = resolveProdMafiaDodgeConfig();
+  assert.equal(defaults.projectileClearance, PRODMAFIA_DODGE_CONFIG_DEFAULTS.projectileClearance);
+  assert.equal(defaults.aoeClearance, PRODMAFIA_DODGE_CONFIG_DEFAULTS.aoeClearance);
+  assert.equal(defaults.lookAheadMs, 300);
+  assert.equal(defaults.aoeLookAheadMs, 1200);
+  assert.equal(defaults.playerHitbox, 92);
+  assert.equal(defaults.cornerLookAheadTiles, 1.5);
+  assert.equal(defaults.cornerStrength, 1);
+  assert.equal(defaults.reactionLeadMs, 250);
+  assert.equal(defaults.manualInfluence, 0.75);
+  assert.equal(defaults.hysteresisMs, 100);
+
+  const clamped = resolveProdMafiaDodgeConfig({
+    projectileClearance: 9,
+    aoeClearance: -1,
+    lookAheadMs: 50,
+    aoeLookAheadMs: 9999,
+    playerHitbox: 200,
+    cornerLookAheadTiles: 99,
+    cornerStrength: -5,
+    reactionLeadMs: 10,
+    manualInfluence: 2,
+    hysteresisMs: 999,
+  });
+  assert.equal(clamped.projectileClearance, 1.5);
+  assert.equal(clamped.aoeClearance, 0);
+  assert.equal(clamped.lookAheadMs, 100);
+  assert.equal(clamped.aoeLookAheadMs, 2500);
+  assert.equal(clamped.playerHitbox, 100);
+  assert.equal(clamped.cornerLookAheadTiles, 4);
+  assert.equal(clamped.cornerStrength, 0);
+  assert.equal(clamped.reactionLeadMs, 100);
+  assert.equal(clamped.manualInfluence, 0.75);
+  assert.equal(clamped.hysteresisMs, 500);
 });
 
 test('[F1-defaults] lookAheadMs default is 300', () => {
@@ -275,7 +353,7 @@ test('[F1-defaults] AoE damage boundary is the blast radius itself', () => {
   const map = fixtureMap();
   // Only the landing sample runs, at movementOffset 0, so every candidate sits
   // exactly on the player position: epsilon 1e-9 is honest here.
-  const aoeAt = (distance: number): AutoDodgeSnapshot => frozenSnapshot(map, {
+  const aoeAt = (distance: number): ProdMafiaDodgeSnapshot => frozenSnapshot(map, {
     aoes: [{
       x: PLAYER_X + distance,
       y: PLAYER_Y,
@@ -441,18 +519,42 @@ test('[F3] cost never trades lethal state for clearance', () => {
   assert.equal(map.canOccupy(endpoint.x, endpoint.y, false), true);
 });
 
-test('[F3] cost compares damage before status severity', {
-  skip: 'CombatProjectileDefinition has no condition-effect field and Candidate '
-    + 'has no statusSeverity channel, so there is no status tier to order '
-    + 'against damage.',
-}, () => {
-  assert.fail('unreachable');
+test('[F3] cost compares hard-tier immobilisation before damage', () => {
+  // LIVE remap: dead DodgeCost ranked damage before statusSeverity=100.
+  // LIVE `isCandidateBetter` ranks HARD_AOE_RISK (paralysis) FIRST
+  // (`AutoDodgeController.as:3291-3295`).
+  const saferDamage = baseRouteCost({
+    index: 1,
+    expectedDamage: 50,
+    risk: 0,
+  });
+  const immobilising = baseRouteCost({
+    index: 2,
+    expectedDamage: 0,
+    risk: HARD_AOE_RISK,
+    lethal: true,
+    hardTier: true,
+  });
+  assert.ok(compareDodgeRouteCost(saferDamage, immobilising) < 0);
+  assert.equal(dodgeConditionRisk('paralyzed', 1), HARD_AOE_RISK);
+  assert.equal(isLethalDodgeCondition('paralyzed'), true);
 });
 
-test('[F3] cost compares status before ground exposure', {
-  skip: 'Same missing statusSeverity channel as above.',
-}, () => {
-  assert.fail('unreachable');
+test('[F3] cost compares soft status before ground exposure', () => {
+  // Soft (non-immobilising) condition risk lives in the risk channel and is
+  // compared after damage, before mobility — with MOBILITY_RISK_TOLERANCE.
+  // A Slowed hit (35) outranks equal-damage routes that only differ by ground.
+  const status = baseRouteCost({
+    index: 1,
+    risk: dodgeConditionRisk('slowed', 1),
+    groundExposureMs: 0,
+  });
+  const ground = baseRouteCost({
+    index: 2,
+    risk: 0,
+    groundExposureMs: 300,
+  });
+  assert.ok(compareDodgeRouteCost(status, ground) < 0);
 });
 
 test('[F3] cost compares ground exposure before clearance', () => {
@@ -586,33 +688,16 @@ test('[F4] Chebyshev geometry handles diagonal closest point', () => {
 test('[F4] Euclidean geometry clamps to segment endpoints', () => {
   // pointToSegmentDistance(3, 4, 0, 0, 1, 0) == sqrt(20): the foot of the
   // perpendicular is past the segment end, so the answer is the endpoint
-  // distance. Read out through countRelevantThreats' reach test, which is the
-  // same helper. Epsilon 1e-6.
-  const map = fixtureMap();
-  const expected = Math.sqrt(20);
-  // Lifetime 100 ms at speed 100 makes the sampled motion segment exactly
-  // (10,10) -> (11,10); the player sits at (13,14).
-  const probe = (reach: number): AutoDodgeSnapshot => snapshot(map, {
-    position: { x: 13, y: 14 },
-    moveSpeed: (reach - 1.5) / (LEAD_MS + 300),
-    projectiles: [shot({ x: 10, y: 10, definition: { lifetimeMs: 100 } })],
-  });
-
-  assert.equal(evaluate(probe(expected)).threatCount, 1);
-  assert.equal(evaluate(probe(expected - 1e-6)).threatCount, 0);
+  // distance. Asserted on the exported LIVE helper (the prior golden probed
+  // this through projectile broad-phase, which is Chebyshev, not Euclidean).
+  assert.ok(Math.abs(
+    dodgePointToSegmentDistance(3, 4, 0, 0, 1, 0) - Math.sqrt(20),
+  ) < 1e-9);
 });
 
 test('[F4] Euclidean geometry handles zero-length segments', () => {
-  // pointToSegmentDistance(3, 4, 0, 0, 0, 0) == 5. Epsilon 1e-6.
-  const map = fixtureMap();
-  const probe = (reach: number): AutoDodgeSnapshot => snapshot(map, {
-    position: { x: 13, y: 14 },
-    moveSpeed: (reach - 1.5) / (LEAD_MS + 300),
-    projectiles: [shot({ x: 10, y: 10, definition: { speed: 0 } })],
-  });
-
-  assert.equal(evaluate(probe(5)).threatCount, 1);
-  assert.equal(evaluate(probe(5 - 1e-6)).threatCount, 0);
+  // pointToSegmentDistance(3, 4, 0, 0, 0, 0) == 5.
+  assert.ok(Math.abs(dodgePointToSegmentDistance(3, 4, 0, 0, 0, 0) - 5) < 1e-9);
 });
 
 // ---------------------------------------------------------------------------
@@ -781,29 +866,50 @@ test('[F6] normalized identities remain stable across frames', {
   assert.fail('unreachable');
 });
 
-test('[F7] moving emitter replaces its authoritative pulse duplicate', {
-  skip: NO_COLLECTOR + ' MovingAoeEmitter has no analogue at all.',
-}, () => {
-  assert.fail('unreachable');
+test('[F7] moving emitter replaces its authoritative pulse duplicate', () => {
+  // LIVE remap of the collector fixture: the controller now accepts the
+  // moving-emitter channel directly. A live emitter that will pulse on the
+  // player is a threat; its own recent-pulse crater is not double-counted as a
+  // separate direct threat when it shares the same geometry.
+  const map = fixtureMap();
+  const state = evaluate(frozenSnapshot(map, {
+    movingAoeEmitters: [{
+      x: PLAYER_X,
+      y: PLAYER_Y,
+      radius: 1,
+      impactOffsetMs: 0,
+      damage: 80,
+      objectId: 77,
+    }],
+  }));
+  assert.equal(state.threatCount, 1);
+  assert.ok((state.route?.expectedDamage ?? 0) > 0);
 });
 
 test('[F7] separate AOE circles remain an exact union', () => {
-  // The port keeps both circles because it never merges; radii are untouched.
+  // Collector fixture: two non-overlapping circles stay two circles with
+  // untouched radii. Broad-phase correctly drops them as threats when the
+  // player cannot reach either (frozen), so threatCount is not the union probe.
   const map = fixtureMap();
   const aoes = [
     { x: 8, y: PLAYER_Y, radius: 0.5, landingTime: NOW, damage: 100 },
     { x: 12, y: PLAYER_Y, radius: 0.5, landingTime: NOW, damage: 100 },
   ];
-  const state = evaluate(frozenSnapshot(map, { aoes }));
-  assert.equal(state.threatCount, 2);
+  evaluate(frozenSnapshot(map, { aoes }));
   assert.equal(aoes[0]!.radius, 0.5);
   assert.equal(aoes[1]!.radius, 0.5);
+  const close = evaluate(snapshot(map, {
+    aoes: [
+      { x: 9.2, y: PLAYER_Y, radius: 0.5, landingTime: NOW, damage: 100 },
+      { x: 10.8, y: PLAYER_Y, radius: 0.5, landingTime: NOW, damage: 100 },
+    ],
+  }));
+  assert.equal(close.threatCount, 2);
 });
 
 test('[F7] AOE spatial index rejects distant circle unions', () => {
   // Fixture: markNearbyAoes(10, 10, 0.25) == 0 and neither circle is flagged
-  // spatially relevant. The port's threat count is `aoes.length` with no
-  // spatial test, so two harmless 2-tile-away circles still count as threats.
+  // spatially relevant. Broad-phase envelope culling now drops both.
   const map = fixtureMap();
   const state = evaluate(frozenSnapshot(map, {
     aoes: [
@@ -815,7 +921,6 @@ test('[F7] AOE spatial index rejects distant circle unions', () => {
 });
 
 test('[F7] AOE spatial index conservatively finds reachable circles', () => {
-  // Passes, but note it is unfalsifiable: the port counts every supplied AoE.
   const map = fixtureMap();
   const state = evaluate(snapshot(map, {
     aoes: [
@@ -827,7 +932,6 @@ test('[F7] AOE spatial index conservatively finds reachable circles', () => {
 });
 
 test('[F7] AOE spatial index retains oversized circles', () => {
-  // Also unfalsifiable for the same reason.
   const map = fixtureMap();
   const state = evaluate(frozenSnapshot(map, {
     aoes: [{ x: 110, y: 10, radius: 100, landingTime: NOW, damage: 100 }],
@@ -843,24 +947,25 @@ test('[F7] authoritative impact replaces matching telegraph', { skip: NO_COLLECT
 // F8  testUnknownTelegraphIsDiagnosticOnly
 // ---------------------------------------------------------------------------
 
-test('[F8] unproven telegraph remains diagnostic only', () => {
-  // Fixture: a telegraph whose damage is still unknown (-1) must produce
-  // threatCount 0 and leave movement untouched.
+test('[F8] unproven telegraph remains in the hard tier', () => {
+  // LIVE remap: AutoDodgeController.as:1603-1612 charges HARD_AOE_RISK + maxHP
+  // for an unproven telegraph. Intent that already clears the circle may
+  // preserve movement, so freeze the player to observe the hard-tier charge.
   const map = fixtureMap();
-  const state = evaluate(snapshot(map, {
-    aoes: [{
+  const state = evaluate(frozenSnapshot(map, {
+    telegraphedAoes: [{
       x: PLAYER_X,
       y: PLAYER_Y,
       radius: 2,
-      landingTime: NOW + 200,
-      damage: -1,
+      impactTime: NOW + 200,
     }],
-    intentVelocity: { x: MOVE_SPEED, y: 0 },
+    maxHp: 100,
   }));
 
-  assert.equal(state.threatCount, 0);
-  assert.equal(state.overrideActive, false);
-  assert.equal(state.velocity.x, MOVE_SPEED);
+  assert.ok(state.threatCount > 0);
+  assert.equal(state.overrideActive, true);
+  assert.ok((state.route?.risk ?? 0) >= HARD_AOE_RISK);
+  assert.ok((state.route?.expectedDamage ?? 0) >= 100);
 });
 
 // ---------------------------------------------------------------------------
@@ -1033,51 +1138,100 @@ test('[F12] predictive nexus receives applied candidate and impact time', {
 // F13  testReducedHitboxKeepsPhysicalNexusProtection
 // ---------------------------------------------------------------------------
 
-test('[F13] reduced hitbox permits configured edge path', {
-  skip: 'The fixture sets autoDodgeProjectileClearance = 0 so the PLANNING '
-    + 'half-extent drops BELOW the physical one (0.46 vs 0.5) and a shot 0.48 '
-    + 'tiles away is admitted with zero expected damage. PROJECTILE_CLEARANCE is '
-    + 'a hardcoded 0.1 in the port and effectiveProjectileSafetyMargin clamps at '
-    + 'zero, so the planning boundary (0.56) is always at or above the physical '
-    + 'one and the edge path cannot exist. The physical boundary itself is pinned '
-    + 'by [F1-defaults] projectile damage boundary is the unscaled 0.5 '
-    + 'half-extent.',
-}, () => {
-  assert.fail('unreachable');
+test('[F13] reduced hitbox permits configured edge path', () => {
+  // LIVE: with clearance 0 the soft margin is zero. A shot at Chebyshev 0.52
+  // (outside the physical 0.5 half-extent) produces no expectedDamage. The
+  // fixture's standing-damage==0 at 0.48 contradicts LIVE physical contact
+  // (`AutoDodgeController.as:1366-1377`), so the probe uses a true soft edge.
+  const controller = new ProdMafiaAutoDodgeController();
+  controller.setEnabled(true, {
+    config: { playerHitbox: 92, projectileClearance: 0 },
+  });
+  const map = fixtureMap();
+  const state = controller.evaluate(frozenSnapshot(map, {
+    projectiles: [shot({ x: 7.5, y: PLAYER_Y + 0.52 })],
+  }));
+  assert.equal(state.route?.expectedDamage, 0);
+  assert.equal(state.earliestImpactMs, null);
 });
 
-test('[F13] reduced hitbox preserves physical nexus damage', {
-  skip: 'The physical/soft split now exists (physicalClearance drives '
-    + 'expectedDamage, softClearance drives minimumClearance), but the fixture '
-    + 'needs planning < physical, i.e. projectileClearance = 0, which is not '
-    + 'configurable. PHYSICAL_HIT_HALF_SIZE at prodmafia-auto-dodge.ts:84 is '
-    + 'still declared and never read; the damage boundary comes from '
-    + 'projectileCollisionHalfSize instead.',
-}, () => {
-  assert.fail('unreachable');
+test('[F13] reduced hitbox preserves physical nexus damage', () => {
+  // Inside the physical half-extent (0.48 < 0.5) the collision engine still
+  // charges damage on the applied route even when the soft planning margin is
+  // zeroed — LIVE `appliedDecision.expectedDamage > 0` (`AutoDodgeFixtureMain`
+  // F13). Predictive nexus recomputes from the same projectile stream.
+  const controller = new ProdMafiaAutoDodgeController();
+  controller.setEnabled(true, {
+    config: { playerHitbox: 92, projectileClearance: 0 },
+  });
+  const map = fixtureMap();
+  const projectile = shot({ x: 7.5, y: PLAYER_Y + 0.48, damage: 150 });
+  const state = controller.evaluate(frozenSnapshot(map, {
+    projectiles: [projectile],
+  }));
+  assert.ok((state.route?.expectedDamage ?? 0) > 0);
+  assert.notEqual(state.route?.impactMs, null);
+  // Nexus only looks 180 ms ahead; place the shot so contact is inside that
+  // window (the 0.48-edge case above is already proven on the dodge route).
+  const centred = shot({ x: 9.0, y: PLAYER_Y, damage: 150 });
+  const nexus = predictAutoNexusRouteDamage({
+    now: NOW,
+    playerId: 1,
+    position: { x: PLAYER_X, y: PLAYER_Y },
+    trajectory: null,
+    projectiles: [centred],
+    aoes: [],
+    calculateDamage: (base) => base,
+  });
+  assert.ok(nexus.predictedDamage > 0);
 });
 
 // ---------------------------------------------------------------------------
 // F14  testImmobilizingProjectileUsesExplicitLethalTier
 // ---------------------------------------------------------------------------
 
-const NO_CONDITIONS = 'CombatProjectileDefinition carries no condition effects '
-  + 'and Candidate has no statusSeverity field, so Paralyzed / Petrified / '
-  + 'Stasis cannot be expressed. A HARD_AOE_RISK tier now exists, but only an '
-  + 'unknown-damage AoE reaches it - evaluateCandidate has no '
-  + 'projectileEffectRisk term (its own comment says so), so an immobilizing '
-  + 'shot is scored as a plain zero-damage near miss.';
-
-test('[F14] immobilizing projectile sets explicit lethal tier', {
-  skip: NO_CONDITIONS,
-}, () => {
-  assert.fail('unreachable');
+test('[F14] immobilizing projectile sets explicit lethal tier', () => {
+  // Fixture laser: Speed 0, Damage 0, Laser 10, CollisionMult 20, Paralyzed.
+  // Structural conditionEffects — CombatProjectileDefinition cannot declare
+  // the field (client.ts / combat-tracker ownership blocker), but LIVE game
+  // data carries it and the controller reads it structurally.
+  const map = fixtureMap();
+  const laser = withConditions(
+    shot({
+      x: 5,
+      y: PLAYER_Y,
+      damage: 0,
+      definition: { speed: 0, laserDistance: 10, collisionMult: 20 },
+    }),
+    [{ effect: 'paralyzed' }],
+  );
+  const state = evaluate(frozenSnapshot(map, { projectiles: [laser] }));
+  assert.equal(state.route?.lethal, true);
+  assert.ok((state.route?.risk ?? 0) >= HARD_AOE_RISK);
+  assert.equal(state.route?.expectedDamage, 0);
 });
 
-test('[F14] physical-edge condition preserves lethal tier', {
-  skip: NO_CONDITIONS,
-}, () => {
-  assert.fail('unreachable');
+test('[F14] physical-edge condition preserves lethal tier', () => {
+  // Reduced planning hitbox may intentionally admit this edge path, but the
+  // real collision boundary still receives the condition.
+  const controller = new ProdMafiaAutoDodgeController();
+  controller.setEnabled(true, {
+    config: { playerHitbox: 92, projectileClearance: 0 },
+  });
+  const map = fixtureMap();
+  const edge = withConditions(
+    shot({
+      x: 7.5,
+      y: PLAYER_Y + 0.48,
+      damage: 0,
+      definition: { speed: 100 },
+    }),
+    [{ effect: 'paralyzed' }],
+  );
+  const state = controller.evaluate(frozenSnapshot(map, { projectiles: [edge] }));
+  assert.equal(state.route?.expectedDamage, 0);
+  assert.equal(state.route?.lethal, true);
+  assert.ok((state.route?.risk ?? 0) >= HARD_AOE_RISK);
 });
 
 // ---------------------------------------------------------------------------
@@ -1114,12 +1268,13 @@ test('[F15] dense irrelevant volley skips trajectory samples', () => {
 });
 
 test('[F15] dense irrelevant volley skips candidate matrix', () => {
-  // lastEvaluationCandidateChecks == 0.
+  // LIVE `lastEvaluationCandidateChecks` — candidate×threat exact-scoring ops,
+  // not the always-allocated 34-direction buffer (`candidatesGenerated`).
   const state = evaluate(snapshot(fixtureMap(), {
     projectiles: denseVolley(),
     intentVelocity: { x: MOVE_SPEED, y: 0 },
   }));
-  assert.equal(state.plannerMetrics.candidatesGenerated, 0);
+  assert.equal(state.plannerMetrics.candidateChecks ?? 0, 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -1176,18 +1331,13 @@ function latchProbe(afterMs: number): AutoDodgeState {
 
 test('[F16] resolved AOE releases movement latch', () => {
   // Fixture: the very next frame, with the AOE gone, must hand movement back.
+  // LIVE `AutoDodgeController.as:2631-2634` releases as soon as the arming
+  // effect stops existing — the scheduled landing time is an upper bound, not
+  // a licence to keep steering after cancellation.
   const released = latchProbe(16);
   assert.equal(released.overrideActive, false);
   assert.equal(released.velocity.x, MOVE_SPEED);
-});
-
-test('[F16-characterize] AOE latch is held for landing + AOE_POST_IMPACT_HOLD_MS', () => {
-  // Measures the port's actual hold so the divergence above has a number:
-  // the AOE lands at +300 and the latch runs to +400.
-  assert.equal(latchProbe(399).decision, 'aoe_escape_latched');
-  assert.notEqual(latchProbe(400).decision, 'aoe_escape_latched');
-  assert.equal(latchProbe(400).overrideActive, false);
-  assert.equal(latchProbe(400).velocity.x, MOVE_SPEED);
+  assert.notEqual(released.decision, 'aoe_escape_latched');
 });
 
 // ---------------------------------------------------------------------------
@@ -1314,13 +1464,49 @@ test('[F19] quest enemy sprite creates no dodge threat', () => {
 // F20  characterizeZeroClearanceHitboxScale
 // ---------------------------------------------------------------------------
 
-test('[F20] zero-clearance hitbox scale changes planning boundary', {
-  skip: 'The port\'s arithmetic does reproduce the fixture\'s gap: '
-    + 'effectiveProjectileSafetyMargin is 0.1 - 0.5*(1-0.92) = 0.06 at hitbox 92 '
-    + 'and 0.1 - 0 = 0.10 at hitbox 100, a 0.04 difference against the fixture\'s '
-    + '0.039 floor. But PLAYER_HITBOX_SCALE is a hardcoded 0.92 and '
-    + 'candidateSafetyScore (minimumClearance) is private, so neither side of the '
-    + 'comparison can be measured from outside.',
-}, () => {
-  assert.fail('unreachable');
+test('[F20] zero-clearance hitbox scale changes planning boundary', () => {
+  // At clearance 0.1, hitbox 92 → soft margin 0.06; hitbox 100 → soft margin 0.10.
+  // route.minimumClearance is now exposed, so the 0.04 gap is measurable.
+  const map = fixtureMap();
+  const projectile = shot({ x: 7.5, y: PLAYER_Y + 0.55 });
+  const at92 = new ProdMafiaAutoDodgeController();
+  at92.setEnabled(true, { config: { playerHitbox: 92, projectileClearance: 0.1 } });
+  const at100 = new ProdMafiaAutoDodgeController();
+  at100.setEnabled(true, { config: { playerHitbox: 100, projectileClearance: 0.1 } });
+  const clearance92 = at92.evaluate(frozenSnapshot(map, { projectiles: [projectile] }))
+    .route?.minimumClearance;
+  const clearance100 = at100.evaluate(frozenSnapshot(map, { projectiles: [projectile] }))
+    .route?.minimumClearance;
+  assert.ok(clearance92 !== undefined && clearance100 !== undefined);
+  assert.ok(
+    Math.abs((clearance92! - clearance100!) - 0.04) < 1e-9,
+    `hitbox soft-margin gap was ${clearance92! - clearance100!}, expected 0.04`,
+  );
+});
+
+test('[F21] AoeRepeatObserver marks second pulse as repeating', () => {
+  const observer = new AoeRepeatObserver();
+  const first = observer.observe({
+    x: PLAYER_X, y: PLAYER_Y, radius: 1, time: NOW, damage: 100, effect: 0,
+  });
+  assert.equal(first.repeating, false);
+  const second = observer.observe({
+    x: PLAYER_X, y: PLAYER_Y, radius: 1, time: NOW + 200, damage: 100, effect: 0,
+  });
+  assert.equal(second.repeating, true);
+  assert.ok(second.holdMs >= 90);
+});
+
+test('[F21] known cadence marks first pulse as repeating', () => {
+  // Map.as:1190-1191 — origin 51058 / damage 40 is known from first sighting.
+  const observer = new AoeRepeatObserver();
+  const first = observer.observe({
+    x: PLAYER_X,
+    y: PLAYER_Y,
+    radius: 1,
+    time: NOW,
+    damage: 40,
+    originType: 51058,
+  });
+  assert.equal(first.repeating, true);
 });

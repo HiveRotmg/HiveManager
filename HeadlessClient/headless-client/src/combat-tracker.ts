@@ -56,6 +56,20 @@ export interface CombatProjectileDefinition {
   circleTurnDelay: number;
   /** Projectile collision half-extent multiplier; 1 when the XML omits it. */
   collisionMult: number;
+  /**
+   * `<ConditionEffect>` entries from objects.xml. Optional on the shared
+   * interface because older fixtures omit it; live `GameDataLoader.ProjectileDef`
+   * always carries the array (possibly empty).
+   */
+  conditionEffects?: readonly {
+    effect?: number | string;
+    durationSec?: number;
+    targetPet?: boolean;
+  }[];
+  /** XML max damage — used by telegraph-laser twin selection. */
+  maxDamage?: number;
+  /** XML min damage. */
+  minDamage?: number;
 }
 
 /**

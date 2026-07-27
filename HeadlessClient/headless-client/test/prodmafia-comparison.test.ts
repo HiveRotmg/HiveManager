@@ -56,6 +56,61 @@ test('ProdMafia path traversal can leave damaging ground but cannot re-enter it'
   assert.equal(pathfinder.canTraverseForAutoPlay(1.5, 0.5, 2.5, 0.5), false);
 });
 
+test('ProdMafia pathfinding walks Sink water and only walls damaging Sink (Abyss lava)', () => {
+  const SINK = 40;
+  const ABYSS_LAVA = 41;
+  const pathfinder = new ProdMafiaPathfinder({
+    getObject: () => undefined,
+    tileIsBlockingWalk: () => false,
+    tileIsSink: (type) => type === SINK || type === ABYSS_LAVA,
+    getTileDamage: (type) => type === ABYSS_LAVA ? 60 : 0,
+  });
+  pathfinder.setMapBounds(6, 3);
+  for (let y = 0; y < 3; y++) {
+    for (let x = 0; x < 6; x++) pathfinder.observeTile(x, y, SINK);
+  }
+  // Dry sink corridor around a lava column.
+  pathfinder.observeTile(2, 0, ABYSS_LAVA);
+  pathfinder.observeTile(2, 1, ABYSS_LAVA);
+  pathfinder.observeTile(2, 2, ABYSS_LAVA);
+  // Open a dry sink lane on y=0 by clearing lava there.
+  pathfinder.observeTile(2, 0, SINK);
+
+  pathfinder.setTarget({ x: 4.5, y: 1.5 }, 0.2);
+  const step = pathfinder.next({ x: 0.5, y: 1.5 });
+  assert.ok(step.waypoint, 'pure Sink floor must be routable');
+  assert.equal(
+    pathfinder.getPlannedTiles().some((tile) => tile.x === 2 && tile.y === 1),
+    false,
+    'must prefer the dry Sink lane over Abyss lava',
+  );
+});
+
+test('ProdMafia pathfinding crosses Abyss lava when it is the only option', () => {
+  const ABYSS_LAVA = 41;
+  const pathfinder = new ProdMafiaPathfinder({
+    getObject: () => undefined,
+    tileIsBlockingWalk: () => false,
+    tileIsSink: (type) => type === ABYSS_LAVA,
+    getTileDamage: (type) => type === ABYSS_LAVA ? 60 : 0,
+  });
+  pathfinder.setMapBounds(5, 1);
+  pathfinder.observeTile(0, 0, 0);
+  pathfinder.observeTile(1, 0, ABYSS_LAVA);
+  pathfinder.observeTile(2, 0, ABYSS_LAVA);
+  pathfinder.observeTile(3, 0, 0);
+  pathfinder.observeTile(4, 0, 0);
+  pathfinder.setTarget({ x: 3.5, y: 0.5 }, 0.2);
+
+  assert.equal(pathfinder.hasExactPathTo(0.5, 0.5, 3.5, 0.5), true);
+  const step = pathfinder.next({ x: 0.5, y: 0.5 });
+  assert.ok(step.waypoint);
+  assert.ok(
+    pathfinder.getPlannedTiles().some((tile) => Math.trunc(tile.x) === 1 || Math.trunc(tile.x) === 2),
+    'the only corridor is lava, so the cost tier must accept it',
+  );
+});
+
 test('ProdMafia pathfinding does not early-stop while the player remains on damaging ground', () => {
   const pathfinder = new ProdMafiaPathfinder({
     getObject: () => undefined,
@@ -219,10 +274,36 @@ test('ProdMafia dodge escapes the 0.9-tile core of a projectile quest boss', () 
   assert.ok(Math.hypot(state.velocity.x * 90 - 0.5, state.velocity.y * 90) >= 0.9);
 });
 
-test('ProdMafia dodge latches an AOE escape through the post-impact hold', () => {
+test('ProdMafia dodge releases an AOE escape latch once the source is gone', () => {
+  // LIVE AutoDodgeController.as:2631-2634 — the hold is released as soon as the
+  // effect that armed it stops existing. AOE_POST_IMPACT_HOLD_MS is an upper
+  // bound while the source remains, not a licence to steer after cancellation.
   const controller = new ProdMafiaAutoDodgeController();
   controller.setEnabled(true);
   const aoe = { x: 0, y: 0, radius: 1, landingTime: 200, damage: 100 };
+  const initial = controller.evaluate({
+    ...snapshot(),
+    goal: undefined,
+    intentVelocity: { x: 0, y: 0 },
+    aoes: [aoe],
+  });
+  assert.equal(initial.overrideActive, true);
+
+  const released = controller.evaluate({
+    ...snapshot(),
+    time: 250,
+    goal: undefined,
+    intentVelocity: { x: 0.01, y: 0 },
+    aoes: [],
+  });
+  assert.notEqual(released.decision, 'aoe_escape_latched');
+  assert.equal(released.overrideActive, false);
+});
+
+test('ProdMafia dodge holds an AOE escape while the source remains live', () => {
+  const controller = new ProdMafiaAutoDodgeController();
+  controller.setEnabled(true);
+  const aoe = { x: 0, y: 0, radius: 1, landingTime: 200, blastDurationMs: 300, damage: 100 };
   const initial = controller.evaluate({
     ...snapshot(),
     goal: undefined,
@@ -236,7 +317,7 @@ test('ProdMafia dodge latches an AOE escape through the post-impact hold', () =>
     time: 250,
     goal: undefined,
     intentVelocity: { x: 0, y: 0 },
-    aoes: [],
+    aoes: [aoe],
   });
   assert.equal(held.decision, 'aoe_escape_latched');
   assert.equal(held.overrideActive, true);

@@ -360,6 +360,7 @@ function snapshot(ctx: WebPanelContext, itemCatalog: ItemCatalog): Record<string
       debug,
       autoLoot: client.getAutoLootState(),
       autoConsumables: client.getAutoConsumablesState(),
+      combatProtection: client.getCombatProtectionState(),
       portals: buildPortalRows(client, visibleObjects, itemCatalog),
       visibleObjects: visibleObjectRows,
       loadedPlugins: ctx.plugins.loaded(client),
@@ -622,6 +623,27 @@ async function runAction(ctx: WebPanelContext, raw: Record<string, unknown>): Pr
       c.enableAutoConsumables(options);
       return ok(`[${c.alias}] auto potions enabled`);
     }
+    case 'combatProtection':
+    case 'hitSuppression': {
+      const c = requireClient();
+      if (!c) return fail(`no client: ${alias}`);
+      const options = raw.options && typeof raw.options === 'object'
+        ? raw.options as Record<string, unknown>
+        : undefined;
+      if (raw.partialGodMode !== undefined) {
+        c.setPartialGodModeEnabled(raw.partialGodMode === true);
+      }
+      if (raw.aoeSpoof !== undefined) {
+        c.setAoeSpoofEnabled(raw.aoeSpoof === true);
+      }
+      if (raw.buddhaMode !== undefined) {
+        c.setBuddhaModeEnabled(raw.buddhaMode === true);
+      }
+      if (options) {
+        c.configureHitSuppression(options as Parameters<Client['configureHitSuppression']>[0]);
+      }
+      return ok(`[${c.alias}] combat protection: ${JSON.stringify(c.getCombatProtectionState())}`);
+    }
     case 'tombCycle': {
       const c = requireClient();
       if (!c) return fail(`no client: ${alias}`);
@@ -753,7 +775,7 @@ async function runConsoleCommand(ctx: WebPanelContext, selectedAlias: string, co
   const rest = parts.join(' ');
   switch (verb) {
     case 'help':
-      return ok('commands: show, set, pos, say, sayall, tick, debug, vault, escape, stall, unstall, resume, disconnect, start, connect, gameid, portal, invswap, move, shoot, autoloot, autopot, tomb, depositall, autoresponder, phase, antispam, o3guard, autoportals, follow, unfollow, anchor, questtp, realms, hosts, plugins, plugin, load, unload, invtest, pettovault, stalltest, clear');
+      return ok('commands: show, set, pos, say, sayall, tick, debug, vault, escape, stall, unstall, resume, disconnect, start, connect, gameid, portal, invswap, move, shoot, autoloot, autopot, hitsuppress, tomb, depositall, autoresponder, phase, antispam, o3guard, autoportals, follow, unfollow, anchor, questtp, realms, hosts, plugins, plugin, load, unload, invtest, pettovault, stalltest, clear');
     case 'clear':
       return runAction(ctx, { action: 'clearLogs' });
     case 'show':
@@ -810,6 +832,28 @@ async function runConsoleCommand(ctx: WebPanelContext, selectedAlias: string, co
         return fail(`${verb} expects on, off, or a JSON options object`);
       }
     }
+    case 'hitsuppress':
+    case 'combatprotection': {
+      // `hitsuppress` dumps state; `hitsuppress {"buddhaMode":true}` configures.
+      if (parts.length === 0) {
+        const client = ctx.clients.get(alias);
+        if (!client) return fail(`no client: ${alias}`);
+        return ok(JSON.stringify(client.getCombatProtectionState(), null, 2));
+      }
+      try {
+        const parsed = JSON.parse(rest) as Record<string, unknown>;
+        return runAction(ctx, {
+          action: 'combatProtection',
+          alias,
+          partialGodMode: parsed.partialGodMode,
+          aoeSpoof: parsed.aoeSpoof,
+          buddhaMode: parsed.buddhaMode,
+          options: parsed,
+        });
+      } catch {
+        return fail('hitsuppress expects a JSON options object');
+      }
+    }
     case 'tomb':
       // `tomb` advances the rotation, `tomb clear` releases every Tomb boss.
       return runAction(ctx, {
@@ -847,9 +891,8 @@ async function runConsoleCommand(ctx: WebPanelContext, selectedAlias: string, co
       return ok(JSON.stringify(filter.status(), null, 2));
     }
     case 'o3guard': {
-      // `o3guard` reports the capture, `o3guard ids 7,9` tells Auto Aim which
-      // alt textures are the guard, `o3guard apply` accepts what it learned and
-      // `o3guard learn on|off` gates the stall inference.
+      // `o3guard` reports the capture; `o3guard ids 7,9` tells Auto Aim which
+      // alt textures are the guard (paste from the NDJSON after a fight).
       const client = ctx.clients.get(alias);
       if (!client) return fail(`no client: ${alias}`);
       const capture = ctx.plugins.get<O3GuardCapture>(client, 'O3Guard');
@@ -861,17 +904,11 @@ async function runConsoleCommand(ctx: WebPanelContext, selectedAlias: string, co
         config.o3GuardAltTextureIds = ids.join(',');
         return ok(`[${client.alias}] O3 guard alt textures: [${capture.applyIds(client, ids).join(', ')}]`);
       }
-      if (word === 'apply') {
-        const applied = capture.applyCandidates(client);
-        if (applied.length === 0) return fail(`[${client.alias}] nothing captured to apply yet`);
-        config.o3GuardAltTextureIds = applied.join(',');
-        return ok(`[${client.alias}] O3 guard alt textures: [${applied.join(', ')}]`);
-      }
-      if (word === 'learn') {
+      if (word === 'capture') {
         const value = (parts[1] ?? '').toLowerCase();
-        if (value === 'off' || value === 'false' || value === '0') config.o3GuardLearnFromStalls = false;
-        else if (value === 'on' || value === 'true' || value === '1') config.o3GuardLearnFromStalls = true;
-        else return fail('usage: o3guard learn on|off');
+        if (value === 'off' || value === 'false' || value === '0') config.o3GuardCapture = false;
+        else if (value === 'on' || value === 'true' || value === '1') config.o3GuardCapture = true;
+        else return fail('usage: o3guard capture on|off');
       }
       return ok(JSON.stringify(capture.status(), null, 2));
     }

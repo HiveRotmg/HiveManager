@@ -625,9 +625,9 @@ export interface DodgeRecentAoe {
   /** Damage the AOE packet reported. */
   damage: number;
   /**
-   * Set by {@link AoeRepeatObserver}. A one-off packet describes damage that
-   * ALREADY happened and charges none; only an observed repeating location
-   * predicts future damage (`:1860-1870`).
+   * Set by {@link AoeRepeatObserver} (in `predictive-auto-dodge.ts`). A one-off
+   * packet describes damage that ALREADY happened and charges none; only an
+   * observed repeating location predicts future damage (`:1860-1870`).
    */
   repeating?: boolean;
   conditionEffects?: readonly DodgeConditionEffectSpec[];
@@ -1398,14 +1398,14 @@ export class ProdMafiaAutoDodgeController {
     this.metrics.activeProjectilesConsidered += projectiles.length;
     // AutoDodgeController.as:1370/1494/1582/1673/1754 — `candidateChecks` counts
     // candidate x threat exact-scoring operations, which is zero when the broad
-    // phase rejected everything.
-    this.metrics.candidateChecks = (this.metrics.candidateChecks ?? 0)
-      + CANDIDATE_COUNT * (projectiles.length
-        + activeAoes.length
-        + threats.telegraphedAoes.length
-        + threats.telegraphLasers.length
-        + threats.movingEmitters.length
-        + threats.recentAoes.length);
+    // phase rejected everything. Per-frame (not cumulative), matching LIVE
+    // `lastEvaluationCandidateChecks`.
+    this.metrics.candidateChecks = CANDIDATE_COUNT * (projectiles.length
+      + activeAoes.length
+      + threats.telegraphedAoes.length
+      + threats.telegraphLasers.length
+      + threats.movingEmitters.length
+      + threats.recentAoes.length);
     this.metrics.coalescedProjectileUpdates += this.pendingProjectileUpdates;
     this.pendingProjectileUpdates = 0;
     this.pendingDangerUpdates = 0;
@@ -1713,7 +1713,11 @@ export class ProdMafiaAutoDodgeController {
         // still keeps the route rejected, but charging it as future damage is the
         // phantom damage that fires Auto Nexus on a finished explosion. A
         // repeating pulse, or one that has not landed yet, always charges.
-        const alreadyResolved = aoe.repeating !== true && aoe.landingTime < snapshot.time;
+        // `persistentWarning` is the LIVE collector's first-sighting repeating
+        // producer for Sanctuary barrage rings (`DodgeThreatCollector.as:112`).
+        const alreadyResolved = aoe.repeating !== true
+          && aoe.persistentWarning !== true
+          && aoe.landingTime < snapshot.time;
         const learnedDamage = aoe.damage;
         if (alreadyResolved) {
           candidate.risk += 1;
@@ -2103,8 +2107,7 @@ export class ProdMafiaAutoDodgeController {
   private refineSpeed(
     selected: Candidate,
     snapshot: AutoDodgeSnapshot,
-    projectiles: readonly CombatProjectileSnapshot[],
-    aoes: readonly DodgePlanningAoe[],
+    threats: FrameThreats,
     sampling: ProjectileSampling,
     probes: readonly number[],
   ): Candidate {
@@ -2116,8 +2119,7 @@ export class ProdMafiaAutoDodgeController {
         selected.y,
         scale,
         snapshot,
-        projectiles,
-        aoes,
+        threats,
         sampling,
       );
       applyWallTopology([candidate], snapshot, this.safeWalk, this.config);
@@ -2824,7 +2826,12 @@ function buildRecentBurstFootprint(
     snapshot.movementLeadMs, snapshot,
   ) - footprint.radius;
   if (currentClearance > aoeRelevanceClearance(config)) return null;
-  return { ...footprint, remainingMs };
+  return {
+    ...footprint,
+    remainingMs,
+    // `:1895-1897` / `:1939-1942` — measured once from the standing position.
+    playerInside: currentClearance <= 0,
+  };
 }
 
 /**
@@ -2850,7 +2857,11 @@ function buildPersistentClusterFootprint(
     snapshot.position.y - footprint.y,
   );
   if (distance > footprint.radius + aoeRelevanceClearance(config)) return null;
-  return { ...footprint, remainingMs: config.aoeLookAheadMs };
+  return {
+    ...footprint,
+    remainingMs: config.aoeLookAheadMs,
+    playerInside: distance <= footprint.radius,
+  };
 }
 
 /**
@@ -3348,6 +3359,18 @@ function laserClearance(
   );
 }
 
+/** Euclidean point-to-segment distance (`DodgeGeometry.pointToSegmentDistance`). */
+export function dodgePointToSegmentDistance(
+  pointX: number,
+  pointY: number,
+  startX: number,
+  startY: number,
+  endX: number,
+  endY: number,
+): number {
+  return pointToSegmentDistance(pointX, pointY, startX, startY, endX, endY);
+}
+
 function pointToSegmentDistance(
   pointX: number,
   pointY: number,
@@ -3457,4 +3480,96 @@ function cloneState(state: AutoDodgeState): AutoDodgeState {
       statesEnteringLayers: [...state.plannerMetrics.statesEnteringLayers],
     },
   };
+}
+
+/**
+ * Collect telegraph-laser threats from the live projectile stream
+ * (`isTelegraphLaser` + `telegraphLaserTwin`, `AutoDodgeController.as:3158-3199`).
+ *
+ * A telegraph laser is a hostile zero-damage laser with no player condition
+ * effects whose container also owns a damaging laser sibling. Cosmetic beams
+ * with no twin are skipped.
+ */
+export function collectTelegraphLasers(
+  projectiles: Iterable<CombatProjectileSnapshot>,
+  getProjectile: (
+    containerType: number,
+    projectileId: number,
+  ) => CombatProjectileSnapshot['definition'] | undefined,
+  now: number,
+): DodgeTelegraphLaser[] {
+  const twinCache = new Map<number, {
+    maxDamage: number;
+    collisionMult: number;
+  } | null>();
+  const lasers: DodgeTelegraphLaser[] = [];
+
+  for (const projectile of projectiles) {
+    if (projectile.side !== 'enemy') continue;
+    if (!isTelegraphLaserProjectile(projectile)) continue;
+    const twin = resolveTelegraphLaserTwin(
+      projectile.containerType,
+      getProjectile,
+      twinCache,
+    );
+    if (twin === null) continue;
+    lasers.push({
+      x: projectile.startX,
+      y: projectile.startY,
+      angle: projectile.angle,
+      length: projectile.definition.laserDistance ?? 0,
+      impactTime: projectile.startTime + projectile.definition.lifetimeMs,
+      dangerRadius: PHYSICAL_HIT_HALF_SIZE * twin.collisionMult,
+      twinDamage: twin.maxDamage,
+    });
+  }
+
+  // Drop expired telegraphs — the damaging twin has already spawned.
+  return lasers.filter((laser) => laser.impactTime >= now);
+}
+
+function isTelegraphLaserProjectile(projectile: CombatProjectileSnapshot): boolean {
+  const definition = projectile.definition;
+  if (!(definition.laserDistance && definition.laserDistance > 0)) return false;
+  if (projectile.damage > 0) return false;
+  const effects = (definition as ProjectileConditionSource).conditionEffects;
+  if (effects) {
+    for (const entry of effects) {
+      if (entry?.effect === undefined || entry.targetPet) continue;
+      return false;
+    }
+  }
+  return true;
+}
+
+function resolveTelegraphLaserTwin(
+  containerType: number,
+  getProjectile: (
+    containerType: number,
+    projectileId: number,
+  ) => CombatProjectileSnapshot['definition'] | undefined,
+  cache: Map<number, { maxDamage: number; collisionMult: number } | null>,
+): { maxDamage: number; collisionMult: number } | null {
+  if (cache.has(containerType)) return cache.get(containerType)!;
+  let twin: { maxDamage: number; collisionMult: number } | null = null;
+  // Projectile ids in objects.xml are dense small integers; probe a bounded
+  // range because CombatDataProvider has no projectile iterator.
+  for (let projectileId = 0; projectileId < 32; projectileId++) {
+    const sibling = getProjectile(containerType, projectileId);
+    if (!sibling) continue;
+    const laserDistance = sibling.laserDistance ?? 0;
+    const maxDamage = Math.max(
+      0,
+      Math.trunc(sibling.maxDamage ?? sibling.minDamage ?? 0),
+    );
+    if (laserDistance <= 0 || maxDamage <= 0) continue;
+    if (twin === null || maxDamage > twin.maxDamage) {
+      twin = {
+        maxDamage,
+        collisionMult: sibling.collisionMult > 0 ? sibling.collisionMult : 1,
+      };
+    }
+  }
+  cache.set(containerType, twin);
+  return twin;
 }

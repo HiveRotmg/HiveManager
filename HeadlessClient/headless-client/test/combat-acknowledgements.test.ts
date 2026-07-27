@@ -151,11 +151,16 @@ test('AOE spoof moves AOEACK 500 tiles away and skips local damage and condition
   assert.deepEqual({ x: sent[0].position.x, y: sent[0].position.y }, { x: 504, y: 506 });
   assert.deepEqual(damage, []);
   assert.equal(player.condition2 & ConditionEffectBits2.CURSE, 0);
-  assert.deepEqual(client.getCombatProtectionState(), {
-    partialGodModeEnabled: false,
-    aoeSpoofEnabled: true,
-    aoeSpoofOffsetTiles: 500,
-  });
+  const protection = client.getCombatProtectionState();
+  assert.equal(protection.partialGodModeEnabled, false);
+  assert.equal(protection.aoeSpoofEnabled, true);
+  assert.equal(protection.aoeSpoofOffsetTiles, 500);
+  assert.equal(protection.buddhaMode, false);
+  assert.equal(protection.strategicAckSuppression, true);
+  assert.equal(protection.strategicAoeSuppression, false);
+  assert.equal(protection.suppressThresholdPercent, 10);
+  assert.equal(protection.autoSyncClientHp, false);
+  assert.equal(protection.lastSuppressionReason, null);
 });
 
 test('Partial Godmode consumes an enemy projectile before local HP loss and PLAYERHIT', () => {

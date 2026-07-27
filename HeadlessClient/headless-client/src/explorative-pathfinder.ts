@@ -729,6 +729,7 @@ export class ExplorativePathfinder {
       targetBlocked,
       combat,
       revision: this.revision,
+      hazardTraversal: this.hazardTraversal,
     };
   }
 
@@ -861,7 +862,7 @@ export class ExplorativePathfinder {
     maxNodesPerStep: number | readonly number[],
   ): GridPoint[] | undefined {
     if (this.combatRange) {
-      const goals = this.combatGoals(target, start, this.combatRange);
+      const goals = this.combatGoals(target, start, this.combatRange, this.hazardTraversal);
       if (goals.length > 0) return this.runPathSearch(start, goals, maxNodesPerStep);
       return undefined;
     }
@@ -1131,6 +1132,12 @@ interface PathSearchParams {
   goals: ReadonlyArray<GridPoint>;
   isPathBlocked: (x: number, y: number, start: GridPoint) => boolean;
   mapVersion: number;
+  /**
+   * Extra g-cost paid when entering a tile, beyond the cardinal/diagonal step.
+   * Used by the hazard `cost` tier so lava is worse than water and both are
+   * worse than dry ground. Omitted (treated as 0) for the default `block` tier.
+   */
+  tileEntryPenalty?: (x: number, y: number) => number;
 }
 
 class PathSearch {
@@ -1139,6 +1146,7 @@ class PathSearch {
   private readonly goals: ReadonlyArray<GridPoint>;
   private readonly goalKeys: Set<string>;
   private readonly isPathBlocked: (x: number, y: number, start: GridPoint) => boolean;
+  private readonly tileEntryPenalty: ((x: number, y: number) => number) | undefined;
   private readonly mapVersion: number;
   private readonly open = new MinHeap();
   private readonly bestG = new Map<string, number>();
@@ -1155,6 +1163,7 @@ class PathSearch {
     this.goals = params.goals;
     this.goalKeys = new Set(params.goals.map((goal) => tileKey(goal.x, goal.y)));
     this.isPathBlocked = params.isPathBlocked;
+    this.tileEntryPenalty = params.tileEntryPenalty;
     this.mapVersion = params.mapVersion;
 
     this.bestG.set(this.startKey, 0);
@@ -1213,7 +1222,8 @@ class PathSearch {
           continue;
         }
         const key = tileKey(x, y);
-        const g = current.g + moveCost;
+        const entryPenalty = this.tileEntryPenalty?.(x, y) ?? 0;
+        const g = current.g + moveCost + entryPenalty;
         if (g >= (this.bestG.get(key) ?? Infinity)) continue;
         const point = { x, y };
         const h = heuristic(point, this.goals);

@@ -84,6 +84,57 @@ test('a learned damage/count/spread signature resolves an owner that never strea
   assert.equal(recovery.stats().bySignature, 1);
 });
 
+test('a queued shot is replayed via signature when a later live shot trains the pattern', () => {
+  const { recovery, world } = harness();
+
+  assert.equal(world.handle(enemyShot({ ownerId: 991 }), 0), 'deferred');
+  assert.equal(recovery.pendingCount, 1);
+
+  // A different owner of the same type fires while the first shot is still queued.
+  recovery.observeLiveShot(WATCHER, enemyShootObservation(enemyShot({ ownerId: 20 })));
+  world.resolve(80);
+
+  assert.equal(recovery.pendingCount, 0);
+  assert.equal(world.replays.length, 1);
+  assert.equal(world.replays[0]!.ownerType, WATCHER);
+  assert.equal(world.replays[0]!.mode, 'deferred_signature');
+  assert.equal(recovery.stats().bySignature, 1);
+});
+
+test('Neo Forax built-in owner ids resolve as verified_map_source without streaming', () => {
+  const recovery = new EnemyShootRecovery(neoForaxData());
+  recovery.setMap('Neo Forax');
+  const tracked: number[] = [];
+  const ctx = (now: number): EnemyShootResolveContext => ({
+    now,
+    ownerType: () => -1,
+    cacheObjectType: () => undefined,
+    playerDistanceTo: () => 1,
+    replay: () => undefined,
+  });
+
+  for (const [ownerId, ownerType] of [
+    [4, 0xdcd0],
+    [5, 0xdcd1],
+    [15, 0xdcd1],
+    [7, 0xdcd2],
+    [10, 0xdcd3],
+  ] as const) {
+    const shot = enemyShootObservation(enemyShot({ ownerId }));
+    const resolved = recovery.resolveOwnerType(shot, ctx(0));
+    assert.equal(resolved.ownerType, ownerType, `owner ${ownerId}`);
+    assert.equal(resolved.mode, 'verified_map_source', `owner ${ownerId}`);
+    tracked.push(ownerId);
+  }
+  assert.equal(tracked.length, 5);
+  assert.equal(recovery.stats().byMapSource, 5);
+
+  // Wrong map name must not use the Neo Forax table.
+  recovery.setMap('Wine Cellar');
+  const elsewhere = recovery.resolveOwnerType(enemyShootObservation(enemyShot({ ownerId: 7 })), ctx(0));
+  assert.equal(elsewhere.ownerType, -1);
+});
+
 test('a signature claimed by two object types is poisoned rather than guessed', () => {
   const { recovery, world } = harness();
   recovery.observeLiveShot(WATCHER, enemyShootObservation(enemyShot({ ownerId: 20 })));
@@ -350,6 +401,16 @@ function data(): CombatDataProvider {
     getObject: (type) => objects.get(type),
     getProjectile: (type, id) =>
       (type === WATCHER || type === WATCHLING) && id === 0 ? projectile : undefined,
+  };
+}
+
+/** Projectile defs for the five Neo Forax perimeter source object types. */
+function neoForaxData(): CombatDataProvider {
+  const types = new Set([0xdcd0, 0xdcd1, 0xdcd2, 0xdcd3]);
+  return {
+    getObject: (type) =>
+      types.has(type) ? { isEnemy: true, occupySquare: false } : undefined,
+    getProjectile: (type, id) => (types.has(type) && id === 0 ? projectile : undefined),
   };
 }
 

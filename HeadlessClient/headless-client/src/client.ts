@@ -150,17 +150,39 @@ import {
 } from './movement-controller';
 import {
   DodgeAoeThreatTracker,
+  MovingAoeEmitterTracker,
+  beamAoeArmorPiercing,
+  beamAoeDamage,
+  beamAoeRadius,
+  beamAoeWarningMs,
   type AutoDodgeOptions,
   type AutoDodgeState,
   type TrackedThrownAoe,
 } from './predictive-auto-dodge';
-import { ProdMafiaAutoDodgeController } from './prodmafia-auto-dodge';
+import {
+  ProdMafiaAutoDodgeController,
+  collectTelegraphLasers,
+} from './prodmafia-auto-dodge';
 import {
   ProdMafiaAutoPlayController,
   type ProdMafiaAutoPlayDecision,
   type ProdMafiaAutoPlayOptions,
 } from './prodmafia-autoplay';
 import { RealmPortal, ClientOptions, ClientServer, TrackedObject, TrackedTile } from './models';
+import {
+  AutoSyncClientHpTracker,
+  calculateIgnoreBitmasks,
+  clampSuppressThreshold,
+  DEFAULT_HIT_SUPPRESSION_OPTIONS,
+  DEFAULT_IGNORE_DEBUFF_OPTIONS,
+  playerHitSuppressionReason,
+  projectileConditionEffectIds,
+  projectileMatchesIgnoredDebuff,
+  type HitSuppressionOptions,
+  type IgnoreDebuffBitmasks,
+  type IgnoreDebuffOptions,
+  type PlayerHitSuppressionReason,
+} from './hit-suppression';
 import { PortalTracker } from './portal-tracker';
 import { connectThroughProxy, proxyConfigToUrl } from './proxy';
 import { TimerBag, TimerHandle } from './timer-bag';
@@ -487,6 +509,7 @@ export class Client extends EventEmitter {
   private navigationMapVersion = 0;
   private navigationDodgeDecision: string | null = null;
   private readonly aoeThreats: DodgeAoeThreatTracker | undefined;
+  private readonly movingAoeEmitters: MovingAoeEmitterTracker | undefined;
   private readonly portalTracker = new PortalTracker();
   private readonly autoNexus: AutoNexusMonitor;
   private readonly combat: CombatTracker | undefined;
@@ -498,6 +521,17 @@ export class Client extends EventEmitter {
   private partialGodModeEnabled = false;
   /** Spoofs AOEACK positions away from the local player. Defaults off. */
   private aoeSpoofEnabled = false;
+  /**
+   * Buddha / strategic ack / AutoSync / debuff-ignore. Defaults match
+   * ProdMafia `Parameters.setDefault` (see `hit-suppression.ts`).
+   */
+  private hitSuppression: HitSuppressionOptions = {
+    ...DEFAULT_HIT_SUPPRESSION_OPTIONS,
+    ignoreDebuffs: { ...DEFAULT_IGNORE_DEBUFF_OPTIONS },
+  };
+  private ignoreDebuffBitmasks: IgnoreDebuffBitmasks = calculateIgnoreBitmasks();
+  private readonly autoSyncClientHp = new AutoSyncClientHpTracker();
+  private lastHitSuppressionReason: PlayerHitSuppressionReason | 'debuff_ignore' | null = null;
   private viewerOtherProjectilesEnabled = false;
   private readonly viewerOtherProjectiles = new Map<string, ViewerProjectileSnapshot>();
   private readonly viewerAoes: ViewerAoeSnapshot[] = [];
@@ -714,6 +748,7 @@ export class Client extends EventEmitter {
       : undefined;
     this.autoDodge = opts.combatData ? new ProdMafiaAutoDodgeController() : undefined;
     this.aoeThreats = opts.combatData ? new DodgeAoeThreatTracker() : undefined;
+    this.movingAoeEmitters = opts.combatData ? new MovingAoeEmitterTracker() : undefined;
     this.autoNexus = new AutoNexusMonitor((trigger) => {
       console.warn(
         `${this.tag} autonexus at ${trigger.hp}/${trigger.maxHp} HP ` +
@@ -733,10 +768,22 @@ export class Client extends EventEmitter {
               !!hit.projectile.armorPiercing,
               'projectile',
               { ownerId: hit.ownerId, bulletId: hit.bulletId },
+              hit.projectile,
             );
           },
         )
       : undefined;
+    if (opts.hitSuppression) this.configureHitSuppression(opts.hitSuppression);
+    else {
+      this.configureHitSuppression({
+        buddhaMode: config.buddhaMode,
+        strategicAckSuppression: config.strategicAckSuppression,
+        strategicAoeSuppression: config.strategicAoeSuppression,
+        suppressThresholdPercent: config.suppressThresholdPercent,
+        autoSyncClientHp: config.autoSyncClientHp,
+      });
+    }
+    if (opts.partialGodMode === true) this.setPartialGodModeEnabled(true);
     this.enemyShootRecovery = opts.combatData
       ? new EnemyShootRecovery(opts.combatData)
       : undefined;
@@ -1211,15 +1258,88 @@ export class Client extends EventEmitter {
     return this.aoeSpoofEnabled;
   }
 
+  /** Buddha Mode — drop only lethal projectile hits (symmetric, no AoE/ground). */
+  setBuddhaModeEnabled(enabled: boolean): boolean {
+    this.hitSuppression.buddhaMode = enabled === true;
+    return this.hitSuppression.buddhaMode;
+  }
+
+  isBuddhaModeEnabled(): boolean {
+    return this.hitSuppression.buddhaMode;
+  }
+
+  /**
+   * Applies ProdMafia hit-suppression tunables. Partial options merge onto the
+   * current state; ignore-debuff fields merge individually.
+   */
+  configureHitSuppression(options: Partial<HitSuppressionOptions> & {
+    ignoreDebuffs?: Partial<IgnoreDebuffOptions>;
+  }): HitSuppressionOptions {
+    if (options.buddhaMode !== undefined) {
+      this.hitSuppression.buddhaMode = options.buddhaMode === true;
+    }
+    if (options.strategicAckSuppression !== undefined) {
+      this.hitSuppression.strategicAckSuppression = options.strategicAckSuppression === true;
+    }
+    if (options.strategicAoeSuppression !== undefined) {
+      this.hitSuppression.strategicAoeSuppression = options.strategicAoeSuppression === true;
+    }
+    if (options.suppressThresholdPercent !== undefined) {
+      this.hitSuppression.suppressThresholdPercent = clampSuppressThreshold(
+        options.suppressThresholdPercent,
+      );
+    }
+    if (options.autoSyncClientHp !== undefined) {
+      this.hitSuppression.autoSyncClientHp = options.autoSyncClientHp === true;
+      if (!this.hitSuppression.autoSyncClientHp) this.autoSyncClientHp.reset();
+    }
+    if (options.ignoreDebuffs) {
+      this.hitSuppression.ignoreDebuffs = {
+        ...this.hitSuppression.ignoreDebuffs,
+        ...options.ignoreDebuffs,
+      };
+      this.ignoreDebuffBitmasks = calculateIgnoreBitmasks(this.hitSuppression.ignoreDebuffs);
+    }
+    return this.getHitSuppressionState();
+  }
+
+  getHitSuppressionState(): HitSuppressionOptions & { bitmasks: IgnoreDebuffBitmasks } {
+    return {
+      buddhaMode: this.hitSuppression.buddhaMode,
+      strategicAckSuppression: this.hitSuppression.strategicAckSuppression,
+      strategicAoeSuppression: this.hitSuppression.strategicAoeSuppression,
+      suppressThresholdPercent: this.hitSuppression.suppressThresholdPercent,
+      autoSyncClientHp: this.hitSuppression.autoSyncClientHp,
+      ignoreDebuffs: { ...this.hitSuppression.ignoreDebuffs },
+      bitmasks: { ...this.ignoreDebuffBitmasks },
+    };
+  }
+
   getCombatProtectionState(): {
     partialGodModeEnabled: boolean;
     aoeSpoofEnabled: boolean;
     aoeSpoofOffsetTiles: number;
+    buddhaMode: boolean;
+    strategicAckSuppression: boolean;
+    strategicAoeSuppression: boolean;
+    suppressThresholdPercent: number;
+    autoSyncClientHp: boolean;
+    ignoreDebuffs: IgnoreDebuffOptions;
+    bitmasks: IgnoreDebuffBitmasks;
+    lastSuppressionReason: PlayerHitSuppressionReason | 'debuff_ignore' | null;
   } {
     return {
       partialGodModeEnabled: this.partialGodModeEnabled,
       aoeSpoofEnabled: this.aoeSpoofEnabled,
       aoeSpoofOffsetTiles: AOE_SPOOF_OFFSET_TILES,
+      buddhaMode: this.hitSuppression.buddhaMode,
+      strategicAckSuppression: this.hitSuppression.strategicAckSuppression,
+      strategicAoeSuppression: this.hitSuppression.strategicAoeSuppression,
+      suppressThresholdPercent: this.hitSuppression.suppressThresholdPercent,
+      autoSyncClientHp: this.hitSuppression.autoSyncClientHp,
+      ignoreDebuffs: { ...this.hitSuppression.ignoreDebuffs },
+      bitmasks: { ...this.ignoreDebuffBitmasks },
+      lastSuppressionReason: this.lastHitSuppressionReason,
     };
   }
 
@@ -3143,6 +3263,7 @@ export class Client extends EventEmitter {
     this.dodgeWorld?.reset();
     this.autoDodge?.reset();
     this.aoeThreats?.clear();
+    this.movingAoeEmitters?.clear();
     this.recentObjectTypes.clear();
     this.predictedPlayerDamage.clear();
     this.nextBulletId = 1;
@@ -3754,6 +3875,13 @@ export class Client extends EventEmitter {
           obj.status.pos.x,
           obj.status.pos.y,
         );
+        this.movingAoeEmitters?.register(
+          obj.status.objectId,
+          obj.objectType,
+          obj.status.pos.x,
+          obj.status.pos.y,
+          now,
+        );
         this.recentObjectTypes.set(obj.status.objectId, obj.objectType);
         if (obj.objectType === PortalType.RealmPortal) {
           this.trackRealmPortal(obj.status);
@@ -3770,6 +3898,7 @@ export class Client extends EventEmitter {
       this.autoCombat?.removeObject(id);
       this.pathfinder.removeObject(id);
       this.dodgeWorld?.removeObject(id);
+      this.movingAoeEmitters?.remove(id, now);
       this.portalTracker.delete(id);
       if (removed) {
         this.emit(ClientEvent.ObjectRemoved, {
@@ -4216,6 +4345,37 @@ export class Client extends EventEmitter {
       ? [...this.combat.getActiveProjectiles()]
       : [];
     const activeAoes = dodgeEnabled ? this.aoeThreats!.getActive(now) : [];
+    const telegraphedAoes = dodgeEnabled
+      ? this.aoeThreats!.getTelegraphedAoes(now).map((telegraph) => ({
+          x: telegraph.x,
+          y: telegraph.y,
+          radius: telegraph.radius,
+          impactTime: telegraph.impactTime,
+          damage: telegraph.damage,
+        }))
+      : [];
+    const telegraphLasers = dodgeEnabled && this.opts.combatData
+      ? collectTelegraphLasers(
+          activeProjectiles,
+          (containerType, projectileId) =>
+            this.opts.combatData?.getProjectile(containerType, projectileId),
+          now,
+        )
+      : [];
+    const movingAoeEmitters = dodgeEnabled
+      ? this.movingAoeEmitters!.getActive(now)
+      : [];
+    const recentAoes = dodgeEnabled
+      ? this.aoeThreats!.getRecentAoes(now).map((recent) => ({
+          x: recent.x,
+          y: recent.y,
+          radius: recent.radius,
+          until: recent.until,
+          damage: recent.damage,
+          repeating: recent.repeating,
+          conditionEffects: recent.conditionEffects,
+        }))
+      : [];
     const dodgeState = dodgeEnabled
       ? this.autoDodge!.evaluate({
           time: now,
@@ -4242,6 +4402,11 @@ export class Client extends EventEmitter {
           movementLocked,
           projectiles: activeProjectiles,
           aoes: activeAoes,
+          telegraphedAoes,
+          telegraphLasers,
+          movingAoeEmitters,
+          recentAoes,
+          maxHp: this.player?.maxHP,
           pointBlankEmitters: this.visibleObjects().filter((object) => {
             const definition = this.opts.combatData?.getObject(object.type);
             return !!definition?.quest && !!definition.hasProjectiles
@@ -4748,6 +4913,7 @@ export class Client extends EventEmitter {
           tracked.y = status.pos.y;
           this.pathfinder.upsertObject(status.objectId, tracked.type, tracked.x, tracked.y);
           this.dodgeWorld?.upsertObject(status.objectId, tracked.type, tracked.x, tracked.y);
+          this.movingAoeEmitters?.update(status.objectId, tracked.x, tracked.y, this.time());
           tracked.player = processObjectStatus(status, tracked.player);
           Object.assign(tracked.rawStats ??= {}, this.rawStats(status.stats));
         }
@@ -4783,7 +4949,23 @@ export class Client extends EventEmitter {
         }
       }
     }
-    return this.autoNexus.reconcileServerHp(player.hp, player.maxHP, full);
+    const triggered = this.autoNexus.reconcileServerHp(player.hp, player.maxHP, full);
+    // AutoSync ClientHP (GSCC after self stats): when predicted and server HP
+    // diverge by more than 60 across consecutive NEWTICK samples, force the
+    // prediction back onto the server figure.
+    if (!full && this.hitSuppression.autoSyncClientHp) {
+      const after = this.autoNexus.getState();
+      if (this.autoSyncClientHp.noteSample(
+        after.predictedHp,
+        after.serverHp,
+        true,
+      )) {
+        this.autoNexus.reset(player.hp, player.maxHP);
+      }
+    } else if (!this.hitSuppression.autoSyncClientHp) {
+      this.autoSyncClientHp.reset();
+    }
+    return triggered;
   }
 
   /** Mirrors ProdMafia's per-frame VIT/healing/bleeding client-HP integration. */
@@ -5148,9 +5330,42 @@ export class Client extends EventEmitter {
 
   /** Tracks announced thrown-projectile endpoints before their AOE packet arrives. */
   private handleShowEffect(p: ShowEffectPacket): void {
-    if (p.effectType !== VisualEffect.THROW_PROJECTILE) return;
-    this.aoeThreats?.track(p.color, p.pos1, p.duration, this.time());
-    this.autoDodge?.noteDangerUpdate();
+    const now = this.time();
+    if (
+      p.effectType === VisualEffect.THROW_PROJECTILE
+      || p.effectType === VisualEffect.THROW
+    ) {
+      // THROW_PROJECTILE: pos1 is the landing. Legacy THROW: pos1 is also the
+      // landing (start is the target / pos2). Color keys the learned profile.
+      this.aoeThreats?.track(p.color, p.pos1, p.duration, now, undefined, {
+        sourceType: this.objects.get(p.targetObjectId)?.type,
+      });
+      this.autoDodge?.noteDangerUpdate();
+      return;
+    }
+    if (
+      p.effectType === VisualEffect.HOLY_BEAM
+      || p.effectType === VisualEffect.CHAOS_BEAM
+    ) {
+      // CIRCLE_TELEGRAPH (23) is render-only in ProdMafia — no recordTelegraphedAoe.
+      const target = this.objects.get(p.targetObjectId);
+      if (!target) return;
+      const radius = beamAoeRadius(target.type);
+      if (radius <= 0) return;
+      this.aoeThreats?.recordTelegraphedAoe({
+        x: target.x,
+        y: target.y,
+        radius,
+        now,
+        impactTime: now + beamAoeWarningMs(target.type),
+        targetId: target.objectId,
+        effectType: p.effectType,
+        sourceType: target.type,
+        damage: beamAoeDamage(target.type),
+        armorPiercing: beamAoeArmorPiercing(target.type),
+      });
+      this.autoDodge?.noteDangerUpdate();
+    }
   }
 
   /** Processes and acknowledges an area attack using the current local frame state. */
@@ -5160,7 +5375,7 @@ export class Client extends EventEmitter {
     // tracker can learn per-effectType dwell durations and surface during-
     // dwell throws to the dodge planner. Without this the P3 windowed
     // sampling never fires from real packet traffic.
-    const aoeThreatsChanged = this.aoeThreats?.recordAoe(
+    this.aoeThreats?.recordAoe(
       p.pos,
       p.radius,
       ackTime,
@@ -5168,8 +5383,21 @@ export class Client extends EventEmitter {
       p.damage,
       p.armorPiercing,
       p.origType,
+      p.effect,
+      p.color,
     );
-    if (aoeThreatsChanged) this.autoDodge?.noteDangerUpdate();
+    this.movingAoeEmitters?.recordImpact(
+      p.pos.x,
+      p.pos.y,
+      p.radius,
+      ackTime,
+      p.damage,
+      p.armorPiercing,
+      p.effect,
+      p.duration,
+      p.origType,
+    );
+    this.autoDodge?.noteDangerUpdate();
     this.viewerAoes.push({
       id: this.nextViewerAoeId++,
       x: p.pos.x,
@@ -5211,6 +5439,19 @@ export class Client extends EventEmitter {
     }
 
     if (Math.hypot(this.pos.x - p.pos.x, this.pos.y - p.pos.y) < p.radius) {
+      const aoeDamage = this.previewPredictedDamage(p.damage, p.armorPiercing);
+      // Strategic AoE Suppression: withhold AOEACK + local damage when Auto
+      // Dodge is active and the connecting bomb is large/lethal
+      // (GSCC.onAoe + Player.strategicAckSuppresses).
+      if (
+        this.hitSuppression.strategicAoeSuppression
+        && this.autoDodge?.isEnabled()
+        && aoeDamage > 0
+        && this.strategicHitWouldSuppress(aoeDamage)
+      ) {
+        this.lastHitSuppressionReason = 'strategic_ack';
+        return;
+      }
       if (this.applyPredictedDamage(p.damage, p.armorPiercing, 'aoe')) {
         return;
       }
@@ -5252,16 +5493,65 @@ export class Client extends EventEmitter {
     armorPiercing: boolean,
     source: Exclude<AutoNexusTriggerSource, 'server'>,
     projectile?: { ownerId: number; bulletId: number },
+    projectileDefinition?: CombatProjectileDefinition,
   ): boolean {
     const player = this.player;
     if (!player) return false;
-    // ProdMafia's Partial Godmode fix makes one decision at the collision
-    // boundary. Returning true here tells CombatTracker to consume the shot
-    // without sending PLAYERHIT, before any predicted HP is charged.
-    if (source === 'projectile' && this.partialGodModeEnabled) return true;
+    const damage = this.previewPredictedDamage(baseDamage, armorPiercing);
+    if (source === 'projectile') {
+      const nexus = this.autoNexus.getState();
+      const reason = playerHitSuppressionReason({
+        effectiveDamage: damage,
+        partialGodMode: this.partialGodModeEnabled,
+        buddhaMode: this.hitSuppression.buddhaMode,
+        strategicAckSuppression: this.hitSuppression.strategicAckSuppression,
+        // ProdMafia requires autoDodge && autoDodgePredictive; this port's
+        // only dodge controller is the predictive one.
+        autoDodgeActive: this.autoDodge?.isEnabled() === true,
+        suppressThresholdPercent: this.hitSuppression.suppressThresholdPercent,
+        maxHp: nexus.maxHp ?? player.maxHP ?? 1,
+        predictedHp: nexus.predictedHp,
+        serverHp: nexus.serverHp ?? player.hp,
+        syncedHp: nexus.syncedHp,
+      });
+      if (reason) {
+        // Symmetric drop: no local HP charge and no PLAYERHIT.
+        this.lastHitSuppressionReason = reason;
+        return true;
+      }
+      // Debuff-ignore: asymmetric — charge local HP, withhold PLAYERHIT only
+      // (Projectile.update hasClientDebuff path).
+      if (
+        projectileMatchesIgnoredDebuff(
+          projectileConditionEffectIds(
+            projectileDefinition as {
+              conditionEffects?: readonly { effect?: number | string; targetPet?: boolean }[];
+            } | undefined,
+          ),
+          this.ignoreDebuffBitmasks,
+        )
+      ) {
+        this.lastHitSuppressionReason = 'debuff_ignore';
+        if (this.autoDodge?.isEnabled()) {
+          this.autoDodge.noteProjectileHit(this.pos, this.time(), damage);
+        }
+        this.recordDamageTaken(damage, source, projectile);
+        return true;
+      }
+    }
+    if (source === 'projectile' && this.autoDodge?.isEnabled()) {
+      this.autoDodge.noteProjectileHit(this.pos, this.time(), damage);
+    }
+    return this.recordDamageTaken(damage, source, projectile);
+  }
+
+  /** Defense-adjusted damage matching the value fed into suppression gates. */
+  private previewPredictedDamage(baseDamage: number, armorPiercing: boolean): number {
+    const player = this.player;
+    if (!player) return 0;
     const condition = player.condition >>> 0;
     const condition2 = player.condition2 >>> 0;
-    const damage = calculateAutoNexusDamage({
+    return calculateAutoNexusDamage({
       baseDamage,
       defense: player.def,
       armorPiercing,
@@ -5273,10 +5563,25 @@ export class Client extends EventEmitter {
       petrified: (condition2 & ConditionEffectBits2.PETRIFIED) !== 0,
       cursed: (condition2 & ConditionEffectBits2.CURSE) !== 0,
     });
-    if (source === 'projectile' && this.autoDodge?.isEnabled()) {
-      this.autoDodge.noteProjectileHit(this.pos, this.time(), damage);
-    }
-    return this.recordDamageTaken(damage, source, projectile);
+  }
+
+  /** Shared magnitude gate for strategic projectile and AoE suppression. */
+  private strategicHitWouldSuppress(effectiveDamage: number): boolean {
+    const player = this.player;
+    if (!player) return false;
+    const nexus = this.autoNexus.getState();
+    return playerHitSuppressionReason({
+      effectiveDamage,
+      partialGodMode: false,
+      buddhaMode: false,
+      strategicAckSuppression: true,
+      autoDodgeActive: true,
+      suppressThresholdPercent: this.hitSuppression.suppressThresholdPercent,
+      maxHp: nexus.maxHp ?? player.maxHP ?? 1,
+      predictedHp: nexus.predictedHp,
+      serverHp: nexus.serverHp ?? player.hp,
+      syncedHp: nexus.syncedHp,
+    }) === 'strategic_ack';
   }
 
   private recordDamageTaken(

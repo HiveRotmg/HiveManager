@@ -807,23 +807,220 @@ export interface TrackedThrownAoe extends DodgePlanningAoe {
   id: number;
   effectType: number;
   source: 'predicted_throw' | 'authoritative_aoe';
+  /**
+   * Optional origin object type from the AOE packet. Used only by
+   * {@link AoeRepeatObserver} known-cadence lookup (`Map.as:1179-1199`).
+   */
+  originType?: number;
+  /** Condition effect id from the AOE packet, when present. */
+  effect?: number;
+  /**
+   * `ThrownProjectile.persistentAoeWarning_` — dense legacy THROW barrage rings
+   * (`Map.promoteDenseLegacyThrowCluster`). First-sighting repeating producer.
+   */
+  persistentWarning?: boolean;
+  /** Condition set for ProdMafia condition-risk scoring. */
+  conditionEffects?: readonly { effect: number; durationSec?: number }[];
+}
+
+/** `map.getRecentAoe*` retention record (`Map.as:1151-1159`). */
+export interface TrackedRecentAoe {
+  x: number;
+  y: number;
+  radius: number;
+  until: number;
+  damage: number;
+  repeating: boolean;
+  armorPiercing?: boolean;
+  effect?: number;
+  effectDurationSec?: number;
+  originType?: number;
+  conditionEffects?: readonly { effect: number; durationSec?: number }[];
+}
+
+/** `map.getTelegraphedAoe*` circle telegraph (`Map.as:1324-1355`). */
+export interface TrackedTelegraphedAoe {
+  x: number;
+  y: number;
+  radius: number;
+  impactTime: number;
+  until: number;
+  targetId: number;
+  effectType: number;
+  sourceType: number;
+  damage: number;
+  armorPiercing: boolean;
+}
+
+/**
+ * `Map.as:1080-1157` — observes authoritative AOE packets and decides whether a
+ * location is an expected FUTURE pulse (`repeating`) rather than a finished
+ * one-off. Without this, Auto Nexus under-charges repeating ground pulses and
+ * over-charges finished explosions.
+ *
+ * Cadence rules, copied from LIVE `Map.as`:
+ * - Same quarter-tile + radius + origin + damage + effect + color key
+ * - `repeatCount >= 2` within [80, 1500] ms, OR a known first-pulse cadence
+ * - `persistentWarning` / Barrage rings are repeating from the first sighting
+ */
+export class AoeRepeatObserver {
+  static readonly IMPACT_GRACE_MS = 90;
+  private static readonly REPEAT_MIN_INTERVAL_MS = 80;
+  private static readonly REPEAT_MAX_INTERVAL_MS = 1500;
+  private static readonly REPEAT_MAX_HOLD_MS = 750;
+  private static readonly HARMLESS_DAMAGE_MAX = 15;
+
+  private readonly lastImpact = new Map<string, number>();
+  private readonly repeatCount = new Map<string, number>();
+
+  clear(): void {
+    this.lastImpact.clear();
+    this.repeatCount.clear();
+  }
+
+  /**
+   * Record one authoritative pulse. Returns whether the location is now
+   * expected to pulse again (`Map.as:1108`) and the hold window for recent
+   * retention (`Map.as:1117-1120`).
+   */
+  observe(input: {
+    x: number;
+    y: number;
+    radius: number;
+    time: number;
+    damage?: number;
+    effect?: number;
+    originType?: number;
+    color?: number;
+    /** Legacy SHOW_EFFECT type-4 barrage warning (`ThrownProjectile.as:49`). */
+    persistentWarning?: boolean;
+  }): { repeating: boolean; holdMs: number; repeatCount: number } {
+    if (input.persistentWarning === true) {
+      return {
+        repeating: true,
+        holdMs: AoeRepeatObserver.REPEAT_MAX_HOLD_MS,
+        repeatCount: 2,
+      };
+    }
+
+    const damage = Math.trunc(input.damage ?? 0);
+    const effect = Math.trunc(input.effect ?? 0);
+    const originType = Math.trunc(input.originType ?? 0);
+    const color = Math.trunc(input.color ?? 0);
+    const key = [
+      Math.floor(input.x * 4 + 0.5),
+      Math.floor(input.y * 4 + 0.5),
+      Math.floor(input.radius * 10 + 0.5),
+      originType,
+      damage,
+      effect,
+      color,
+    ].join(':');
+
+    const previousTime = this.lastImpact.get(key);
+    let interval = 0;
+    let repeatCount = 1;
+    if (previousTime !== undefined) {
+      interval = input.time - previousTime;
+      repeatCount = this.repeatCount.get(key) ?? 1;
+      if (
+        interval >= AoeRepeatObserver.REPEAT_MIN_INTERVAL_MS
+        && interval <= AoeRepeatObserver.REPEAT_MAX_INTERVAL_MS
+      ) {
+        repeatCount++;
+      } else if (interval > AoeRepeatObserver.REPEAT_MAX_INTERVAL_MS) {
+        repeatCount = 1;
+      }
+    }
+    if (
+      previousTime === undefined
+      || interval >= AoeRepeatObserver.REPEAT_MIN_INTERVAL_MS
+    ) {
+      this.lastImpact.set(key, input.time);
+    }
+    this.repeatCount.set(key, repeatCount);
+
+    let repeating = repeatCount >= 2;
+    const knownInterval = knownAoeRepeatInterval(originType, effect, damage);
+    if (knownInterval > 0) {
+      repeating = true;
+      if (interval < AoeRepeatObserver.REPEAT_MIN_INTERVAL_MS) {
+        interval = knownInterval;
+      }
+    }
+
+    let holdMs = AoeRepeatObserver.IMPACT_GRACE_MS;
+    if (repeating && interval >= AoeRepeatObserver.REPEAT_MIN_INTERVAL_MS) {
+      holdMs = Math.min(
+        AoeRepeatObserver.REPEAT_MAX_HOLD_MS,
+        Math.max(
+          AoeRepeatObserver.IMPACT_GRACE_MS,
+          interval + AoeRepeatObserver.IMPACT_GRACE_MS,
+        ),
+      );
+    }
+    return { repeating, holdMs, repeatCount };
+  }
+
+  /** `Map.isHarmlessAoeDamage` — scenery pulses never become danger circles. */
+  static isHarmless(damage: number, effect: number): boolean {
+    return damage >= 0
+      && damage <= AoeRepeatObserver.HARMLESS_DAMAGE_MAX
+      && effect === 0;
+  }
+}
+
+/**
+ * Packet-confirmed cadences from `Map.as:1179-1199`. A known interval marks
+ * the first pulse as repeating so the player evacuates before taking two hits.
+ */
+function knownAoeRepeatInterval(
+  originType: number,
+  effect: number,
+  damage: number,
+): number {
+  if (originType === 9827 && effect === 4 && damage === 100) return 610;
+  if (originType === 51058 && damage === 40) return 1030;
+  if (originType === 44924 && damage === 120) return 210;
+  if (originType === 49436 && damage === 80) return 205;
+  return 0;
+}
+
+const TELEGRAPH_AOE_GRACE_MS = 650;
+const TELEGRAPH_AOE_MATCH_DISTANCE_SQ = 0.25;
+
+function aoeConditionEffects(
+  effect: number | undefined,
+  durationSec: number | undefined,
+): { effect: number; durationSec?: number }[] | undefined {
+  const effectId = Math.trunc(effect ?? 0);
+  if (effectId <= 0) return undefined;
+  return [{ effect: effectId, durationSec: durationSec ?? 0 }];
 }
 
 /** Unified stream of predicted throws and authoritative dwelling AOE packets. */
 export class DodgeAoeThreatTracker {
   private readonly threats: TrackedThrownAoe[] = [];
+  private readonly recent: TrackedRecentAoe[] = [];
+  private readonly telegraphs: TrackedTelegraphedAoe[] = [];
   private readonly learnedRadius = new Map<number, number>();
   private readonly learnedBlastDuration = new Map<number, number>();
   private readonly learnedDamage = new Map<number, number>();
   private readonly learnedArmorPiercing = new Map<number, boolean>();
+  private readonly learnedEffect = new Map<number, number>();
+  private readonly repeatObserver = new AoeRepeatObserver();
   private nextId = 1;
 
   clear(): void {
     this.threats.length = 0;
+    this.recent.length = 0;
+    this.telegraphs.length = 0;
     this.learnedRadius.clear();
     this.learnedBlastDuration.clear();
     this.learnedDamage.clear();
     this.learnedArmorPiercing.clear();
+    this.learnedEffect.clear();
+    this.repeatObserver.clear();
     this.nextId = 1;
   }
 
@@ -833,6 +1030,7 @@ export class DodgeAoeThreatTracker {
     durationSeconds: number,
     now: number,
     blastDurationSeconds?: number,
+    options?: { persistentWarning?: boolean; sourceType?: number },
   ): void {
     const durationMs = Math.max(0, durationSeconds * 1000);
     const normalizedType = effectType >>> 0;
@@ -840,10 +1038,12 @@ export class DodgeAoeThreatTracker {
     const explicitBlastMs = blastDurationSeconds !== undefined
       ? Math.max(0, blastDurationSeconds * 1000)
       : undefined;
+    const persistentWarning = options?.persistentWarning === true;
     this.threats.push({
       id: this.nextId++,
       effectType: normalizedType,
       source: 'predicted_throw',
+      originType: options?.sourceType,
       x: end.x,
       y: end.y,
       radius: this.learnedRadius.get(normalizedType) ?? 1,
@@ -851,7 +1051,73 @@ export class DodgeAoeThreatTracker {
       blastDurationMs: explicitBlastMs ?? learnedBlastMs,
       damage: this.learnedDamage.get(normalizedType),
       armorPiercing: this.learnedArmorPiercing.get(normalizedType),
+      effect: this.learnedEffect.get(normalizedType),
+      persistentWarning: persistentWarning || undefined,
+      repeating: persistentWarning || undefined,
+      conditionEffects: aoeConditionEffects(
+        this.learnedEffect.get(normalizedType),
+        undefined,
+      ),
     });
+  }
+
+  /**
+   * Holy/Chaos beam SHOW_EFFECT telegraphs (`Map.recordTelegraphedAoe`,
+   * `GameServerConnectionConcrete.as:3514-3555`). Not THROW effects.
+   */
+  recordTelegraphedAoe(input: {
+    x: number;
+    y: number;
+    radius: number;
+    now: number;
+    impactTime: number;
+    targetId: number;
+    effectType: number;
+    sourceType: number;
+    damage?: number;
+    armorPiercing?: boolean;
+  }): void {
+    this.pruneTelegraphedAoes(input.now);
+    const damage = input.damage !== undefined && Number.isFinite(input.damage)
+      ? Math.trunc(input.damage)
+      : -1;
+    for (let index = this.telegraphs.length - 1; index >= 0; index--) {
+      const existing = this.telegraphs[index]!;
+      if (
+        existing.targetId !== input.targetId
+        || existing.effectType !== input.effectType
+        || existing.sourceType !== input.sourceType
+      ) {
+        continue;
+      }
+      existing.x = input.x;
+      existing.y = input.y;
+      existing.radius = Math.max(0, input.radius);
+      existing.impactTime = input.impactTime;
+      existing.until = input.impactTime + TELEGRAPH_AOE_GRACE_MS;
+      existing.damage = damage;
+      existing.armorPiercing = input.armorPiercing === true;
+      return;
+    }
+    this.telegraphs.push({
+      x: input.x,
+      y: input.y,
+      radius: Math.max(0, input.radius),
+      impactTime: input.impactTime,
+      until: input.impactTime + TELEGRAPH_AOE_GRACE_MS,
+      targetId: input.targetId,
+      effectType: input.effectType,
+      sourceType: input.sourceType,
+      damage,
+      armorPiercing: input.armorPiercing === true,
+    });
+    while (this.telegraphs.length > 256) {
+      let evict = 0;
+      for (let scan = 1; scan < this.telegraphs.length; scan++) {
+        if (this.telegraphs[scan]!.until < this.telegraphs[evict]!.until) evict = scan;
+      }
+      this.telegraphs.splice(evict, 1);
+    }
   }
 
   recordAoe(
@@ -861,8 +1127,12 @@ export class DodgeAoeThreatTracker {
     blastDurationSeconds?: number,
     damage?: number,
     armorPiercing?: boolean,
-    effectType = 0,
+    originType = 0,
+    effect = 0,
+    color = 0,
   ): boolean {
+    this.resolveTelegraphedAoe(position.x, position.y, now, originType);
+
     let best: TrackedThrownAoe | undefined;
     let bestDistance = 1;
     for (let index = 0; index < this.threats.length; index++) {
@@ -878,6 +1148,8 @@ export class DodgeAoeThreatTracker {
     const blastMs = blastDurationSeconds !== undefined
       ? Math.max(0, blastDurationSeconds * 1000)
       : 0;
+    const effectId = Math.trunc(effect);
+    const durationSec = blastDurationSeconds;
     if (!best) {
       best = this.threats.find((threat) => {
         return threat.source === 'authoritative_aoe'
@@ -885,11 +1157,28 @@ export class DodgeAoeThreatTracker {
           && Math.hypot(position.x - threat.x, position.y - threat.y) <= 0.05
           && Math.abs(threat.radius - radius) <= 0.05;
       });
-      if (!best && blastMs <= 0) return false;
+      if (!best && blastMs <= 0) {
+        // Still retain recent/repeating circles even when there is no dwell and
+        // no matching throw — Map.as always records recent AoEs.
+        this.retainRecentAoe({
+          x: position.x,
+          y: position.y,
+          radius,
+          now,
+          damage,
+          armorPiercing,
+          originType,
+          effect: effectId,
+          effectDurationSec: durationSec,
+          color,
+        });
+        return false;
+      }
       if (!best) {
         best = {
           id: this.nextId++,
-          effectType: effectType >>> 0,
+          effectType: originType >>> 0,
+          originType: originType >>> 0,
           source: 'authoritative_aoe',
           x: position.x,
           y: position.y,
@@ -900,6 +1189,8 @@ export class DodgeAoeThreatTracker {
             ? Math.max(0, Math.trunc(damage))
             : undefined,
           armorPiercing: armorPiercing === undefined ? undefined : !!armorPiercing,
+          effect: effectId > 0 ? effectId : undefined,
+          conditionEffects: aoeConditionEffects(effectId, durationSec),
         };
         this.threats.push(best);
       }
@@ -911,6 +1202,12 @@ export class DodgeAoeThreatTracker {
     best.x = position.x;
     best.y = position.y;
     best.radius = Math.max(0, radius);
+    best.originType = originType >>> 0;
+    if (effectId > 0) {
+      best.effect = effectId;
+      if (best.effectType !== 0) this.learnedEffect.set(best.effectType, effectId);
+    }
+    best.conditionEffects = aoeConditionEffects(best.effect, durationSec);
     if (damage !== undefined && Number.isFinite(damage) && damage > 0) {
       const learnedDamage = Math.trunc(damage);
       if (best.effectType !== 0) this.learnedDamage.set(best.effectType, learnedDamage);
@@ -926,6 +1223,39 @@ export class DodgeAoeThreatTracker {
       if (best.effectType !== 0) this.learnedBlastDuration.set(best.effectType, blastMs);
       best.blastDurationMs = blastMs;
     }
+    // Map.as:1080-1157 — only an observed repeating location predicts future
+    // damage. A one-off packet describes damage that already landed.
+    const observed = this.repeatObserver.observe({
+      x: best.x,
+      y: best.y,
+      radius: best.radius,
+      time: now,
+      damage: best.damage,
+      effect: best.effect ?? effectId,
+      originType: best.originType ?? best.effectType,
+      color: color || best.effectType,
+      persistentWarning: best.persistentWarning,
+    });
+    if (observed.repeating) best.repeating = true;
+    // Stretch the dwell to the Map hold window so getActive keeps a repeating
+    // crater visible long enough for the next pulse to be anticipated.
+    if (observed.repeating) {
+      best.blastDurationMs = Math.max(best.blastDurationMs ?? 0, observed.holdMs);
+    }
+    this.retainRecentAoe({
+      x: best.x,
+      y: best.y,
+      radius: best.radius,
+      now,
+      damage: best.damage,
+      armorPiercing: best.armorPiercing,
+      originType: best.originType ?? originType,
+      effect: best.effect ?? effectId,
+      effectDurationSec: durationSec,
+      color,
+      repeating: observed.repeating,
+      holdMs: observed.holdMs,
+    });
     // Do NOT splice the matched throw here — leaving it in place lets
     // getActive() surface it to the planner during the dwell window (see
     // spec docs/superpowers/specs/2026-07-19-aoe-blast-dwell-rewrite-design.md
@@ -955,6 +1285,9 @@ export class DodgeAoeThreatTracker {
         thrown.damage = this.learnedDamage.get(thrown.effectType) ?? thrown.damage;
         thrown.armorPiercing = this.learnedArmorPiercing.get(thrown.effectType)
           ?? thrown.armorPiercing;
+        thrown.effect = this.learnedEffect.get(thrown.effectType) ?? thrown.effect;
+        thrown.conditionEffects = aoeConditionEffects(thrown.effect, undefined)
+          ?? thrown.conditionEffects;
       }
       // Include pre-landing throws (existing behavior) AND during-dwell throws
       // (new for P3). Post-dwell throws are cleaned up above.
@@ -964,10 +1297,603 @@ export class DodgeAoeThreatTracker {
     }
     return active;
   }
+
+  /** Retained authoritative AOE circles (`map.getRecentAoe*`). */
+  getRecentAoes(now: number): readonly TrackedRecentAoe[] {
+    this.pruneRecentAoes(now);
+    return this.recent.map((entry) => ({ ...entry }));
+  }
+
+  /** Holy/Chaos beam telegraphs still awaiting impact (`map.getTelegraphedAoe*`). */
+  getTelegraphedAoes(now: number): readonly TrackedTelegraphedAoe[] {
+    this.pruneTelegraphedAoes(now);
+    return this.telegraphs.map((entry) => ({ ...entry }));
+  }
+
+  private retainRecentAoe(input: {
+    x: number;
+    y: number;
+    radius: number;
+    now: number;
+    damage?: number;
+    armorPiercing?: boolean;
+    originType?: number;
+    effect?: number;
+    effectDurationSec?: number;
+    color?: number;
+    repeating?: boolean;
+    holdMs?: number;
+  }): void {
+    const damage = Math.trunc(input.damage ?? 0);
+    const effect = Math.trunc(input.effect ?? 0);
+
+    let repeating = input.repeating;
+    let holdMs = input.holdMs;
+    if (repeating === undefined || holdMs === undefined) {
+      const observed = this.repeatObserver.observe({
+        x: input.x,
+        y: input.y,
+        radius: input.radius,
+        time: input.now,
+        damage,
+        effect,
+        originType: input.originType,
+        color: input.color,
+      });
+      repeating = observed.repeating;
+      holdMs = observed.holdMs;
+    }
+
+    // Harmless scenery still teaches cadence above, but never becomes a danger
+    // circle (`Map.as:1143-1149`).
+    if (AoeRepeatObserver.isHarmless(damage, effect)) return;
+
+    this.pruneRecentAoes(input.now);
+    this.recent.push({
+      x: input.x,
+      y: input.y,
+      radius: Math.max(0, input.radius),
+      until: input.now + (holdMs ?? AoeRepeatObserver.IMPACT_GRACE_MS),
+      damage,
+      repeating: repeating === true,
+      armorPiercing: input.armorPiercing,
+      effect: effect > 0 ? effect : undefined,
+      effectDurationSec: input.effectDurationSec,
+      originType: input.originType,
+      conditionEffects: aoeConditionEffects(effect, input.effectDurationSec),
+    });
+  }
+
+  private resolveTelegraphedAoe(
+    x: number,
+    y: number,
+    now: number,
+    originType: number,
+  ): void {
+    if (originType <= 0 || this.telegraphs.length === 0) return;
+    this.pruneTelegraphedAoes(now);
+    let bestIndex = -1;
+    let bestDistanceSq = TELEGRAPH_AOE_MATCH_DISTANCE_SQ;
+    for (let index = this.telegraphs.length - 1; index >= 0; index--) {
+      const telegraph = this.telegraphs[index]!;
+      if (telegraph.sourceType !== originType) continue;
+      const dx = x - telegraph.x;
+      const dy = y - telegraph.y;
+      const distanceSq = dx * dx + dy * dy;
+      if (distanceSq <= bestDistanceSq) {
+        bestDistanceSq = distanceSq;
+        bestIndex = index;
+      }
+    }
+    if (bestIndex >= 0) this.telegraphs.splice(bestIndex, 1);
+  }
+
+  private pruneTelegraphedAoes(now: number): void {
+    for (let index = this.telegraphs.length - 1; index >= 0; index--) {
+      if (now > this.telegraphs[index]!.until) this.telegraphs.splice(index, 1);
+    }
+  }
+
+  private pruneRecentAoes(now: number): void {
+    for (let index = this.recent.length - 1; index >= 0; index--) {
+      if (now >= this.recent[index]!.until) this.recent.splice(index, 1);
+    }
+  }
 }
 
 /** Backward-compatible name for callers that only use thrown telegraphs. */
 export class ThrownAoeTracker extends DodgeAoeThreatTracker {}
+
+// ---------------------------------------------------------------------------
+// Moving AoE emitters — source-specific live objects (`Map.as:3058-3278`).
+// ---------------------------------------------------------------------------
+
+const MOVING_AOE_MATCH_DISTANCE_SQ = 2.25;
+const MOVING_AOE_DEFAULT_INTERVAL_MS = 610;
+const MOVING_AOE_MIN_INTERVAL_MS = 80;
+const MOVING_AOE_MAX_INTERVAL_MS = 5000;
+const MOVING_AOE_PULSE_GRACE_MS = 90;
+const MOVING_AOE_RETIRED_GRACE_MS = 800;
+
+/** Object types whose live position is the pre-impact AoE geometry (`Map.as`). */
+const MOVING_AOE_EMITTER_TYPES = new Set<number>([
+  0xB01A, // O2_BOMB_ARTIFACT
+  0xB096, // O2_BOMB_ARTIFACT_2
+  0xB1DC, // O3_BOMB_ARTIFACT_H
+  0xB1DD, // O3_BOMB_ARTIFACT_1
+  0xB1DE, // O3_BOMB_ARTIFACT_2
+  0xB1E9, // O3_BOMB_ARTIFACT
+  0xB1DA, // O3_ORYX_PORTAL
+  0x25A5, // O3_PORTAL_OFFENSIVE
+  0x86AA, // BANESERPENT_IMPACT_TELEGRAPH
+  0x871C, // BONE_TOWER_2
+  0x871D, // BONE_TOWER_3
+  0x366C, // HUDL_CONSTRUCT_COLOSSUS
+  0x467C, // MAMMOTH_CITY_RAT_BOULDER
+  0xC11C, // SMALL_KOGBOLD_3
+  0xC092, // KSW_CRUSHER
+  0xC458, // KSW_STEMWALKER_HARD
+]);
+
+interface MovingEmitterProfile {
+  radius: number;
+  damage: number;
+  armorPiercing: boolean;
+  effect: number;
+  effectDurationSec: number;
+  intervalMs: number;
+  silenceTimeoutMs: number;
+}
+
+interface MovingEmitterState {
+  objectId: number;
+  objectType: number;
+  x: number;
+  y: number;
+  previousX: number;
+  previousY: number;
+  velocityX: number;
+  velocityY: number;
+  lastTime: number;
+  radius: number;
+  damage: number;
+  armorPiercing: boolean;
+  effect: number;
+  effectDurationSec: number;
+  intervalMs: number;
+  silenceTimeoutMs: number;
+  confirmed: boolean;
+  lastImpact: number;
+  nextImpact: number;
+  pulseCount: number;
+  firstSeen: number;
+  retiredAt: number;
+}
+
+function movingEmitterProfile(objectType: number): MovingEmitterProfile {
+  const profile: MovingEmitterProfile = {
+    radius: 0,
+    damage: -1,
+    armorPiercing: false,
+    effect: 0,
+    effectDurationSec: 0,
+    intervalMs: MOVING_AOE_DEFAULT_INTERVAL_MS,
+    silenceTimeoutMs: 1800,
+  };
+  switch (objectType) {
+    case 0xB01A:
+    case 0xB096:
+      profile.radius = 2.8;
+      profile.damage = 180;
+      profile.intervalMs = 410;
+      profile.silenceTimeoutMs = 1500;
+      break;
+    case 0xB1DD:
+    case 0xB1DE:
+      profile.radius = 2;
+      profile.damage = 200;
+      break;
+    case 0xB1E9:
+      profile.radius = 1.75;
+      profile.damage = 150;
+      break;
+    case 0xB1DC:
+      profile.radius = 1.75;
+      profile.damage = 210;
+      profile.intervalMs = 410;
+      profile.silenceTimeoutMs = 1200;
+      break;
+    case 0x86AA:
+      profile.radius = 1.75;
+      profile.damage = 170;
+      profile.intervalMs = 410;
+      profile.silenceTimeoutMs = 1200;
+      break;
+    case 0x467C:
+      profile.radius = 1.5;
+      profile.damage = 50;
+      profile.armorPiercing = true;
+      profile.effect = 16;
+      profile.effectDurationSec = 2;
+      profile.intervalMs = 410;
+      profile.silenceTimeoutMs = 1200;
+      break;
+    case 0xB1DA:
+    case 0x25A5:
+      profile.intervalMs = 200;
+      profile.silenceTimeoutMs = 1000;
+      break;
+    case 0x871C:
+    case 0x871D:
+      profile.intervalMs = 1220;
+      profile.silenceTimeoutMs = 3000;
+      break;
+    case 0x366C:
+      profile.intervalMs = 1010;
+      profile.silenceTimeoutMs = 2500;
+      break;
+    case 0xC11C:
+      profile.intervalMs = 200;
+      profile.silenceTimeoutMs = 800;
+      break;
+    case 0xC458:
+      profile.intervalMs = 200;
+      profile.silenceTimeoutMs = 2000;
+      break;
+    case 0xC092:
+      profile.intervalMs = 3000;
+      profile.silenceTimeoutMs = 5000;
+      break;
+    default:
+      break;
+  }
+  return profile;
+}
+
+function movingAoeNextInterval(originType: number, damage: number): number {
+  switch (originType) {
+    case 0xB01A:
+    case 0xB096:
+    case 0xB1DC:
+    case 0x86AA:
+    case 0x467C:
+      return 410;
+    case 0xB1DD:
+    case 0xB1DE:
+    case 0xB1E9:
+      return 610;
+    case 0xB1DA:
+    case 0x25A5:
+    case 0xC11C:
+      return 200;
+    case 0x871C:
+    case 0x871D:
+      return 1220;
+    case 0x366C:
+      return 1010;
+    case 0xC092:
+      return 3000;
+    case 0xC458:
+      if (damage === 120) return 400;
+      if (damage >= 150) return 800;
+      return 200;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Tracks source-specific moving bomb/portal objects whose next pulse is
+ * predicted from live position + learned cadence (`MovingAoeEmitter.as`).
+ *
+ * Gap vs ProdMafia: headless objects have no `moveVec_` / `tickPosition_`, so
+ * velocity is estimated from UPDATE/NEWTICK position deltas and projection is
+ * capped to the last observed step rather than the current server-tick endpoint.
+ */
+export class MovingAoeEmitterTracker {
+  private readonly emitters = new Map<number, MovingEmitterState>();
+
+  clear(): void {
+    this.emitters.clear();
+  }
+
+  static isEmitterType(objectType: number): boolean {
+    return MOVING_AOE_EMITTER_TYPES.has(objectType >>> 0);
+  }
+
+  register(objectId: number, objectType: number, x: number, y: number, now: number): void {
+    const type = objectType >>> 0;
+    if (!MovingAoeEmitterTracker.isEmitterType(type) || this.emitters.has(objectId)) return;
+    const profile = movingEmitterProfile(type);
+    this.emitters.set(objectId, {
+      objectId,
+      objectType: type,
+      x,
+      y,
+      previousX: x,
+      previousY: y,
+      velocityX: 0,
+      velocityY: 0,
+      lastTime: now,
+      radius: profile.radius,
+      damage: profile.damage,
+      armorPiercing: profile.armorPiercing,
+      effect: profile.effect,
+      effectDurationSec: profile.effectDurationSec,
+      intervalMs: profile.intervalMs,
+      silenceTimeoutMs: profile.silenceTimeoutMs,
+      confirmed: false,
+      lastImpact: 0,
+      nextImpact: 0,
+      pulseCount: 0,
+      firstSeen: now,
+      retiredAt: -1,
+    });
+  }
+
+  update(objectId: number, x: number, y: number, now: number): void {
+    const emitter = this.emitters.get(objectId);
+    if (!emitter || emitter.retiredAt >= 0) return;
+    if (now !== emitter.lastTime || x !== emitter.x || y !== emitter.y) {
+      const dt = Math.max(1, now - emitter.lastTime);
+      emitter.previousX = emitter.x;
+      emitter.previousY = emitter.y;
+      emitter.velocityX = (x - emitter.x) / dt;
+      emitter.velocityY = (y - emitter.y) / dt;
+      emitter.x = x;
+      emitter.y = y;
+      emitter.lastTime = now;
+    }
+  }
+
+  remove(objectId: number, now: number): void {
+    const emitter = this.emitters.get(objectId);
+    if (!emitter || emitter.retiredAt >= 0) return;
+    emitter.retiredAt = now;
+  }
+
+  recordImpact(
+    x: number,
+    y: number,
+    radius: number,
+    now: number,
+    damage: number,
+    armorPiercing: boolean,
+    effect: number,
+    effectDurationSec: number,
+    originType: number,
+  ): boolean {
+    if (!MovingAoeEmitterTracker.isEmitterType(originType)) return false;
+    this.refresh(now);
+    let best: MovingEmitterState | undefined;
+    let bestDistanceSq = MOVING_AOE_MATCH_DISTANCE_SQ;
+    for (const emitter of this.emitters.values()) {
+      if (emitter.objectType !== originType || !this.isRetained(emitter, now)) continue;
+      const distanceSq = this.distanceSqToTrajectory(emitter, x, y);
+      if (distanceSq <= bestDistanceSq) {
+        bestDistanceSq = distanceSq;
+        best = emitter;
+      }
+    }
+    if (!best) return false;
+
+    if (best.lastImpact > 0) {
+      const observedInterval = now - best.lastImpact;
+      if (
+        observedInterval >= MOVING_AOE_MIN_INTERVAL_MS
+        && observedInterval <= MOVING_AOE_MAX_INTERVAL_MS
+      ) {
+        best.intervalMs = best.pulseCount <= 1
+          ? observedInterval
+          : Math.round(best.intervalMs * 0.7 + observedInterval * 0.3);
+      }
+    }
+    best.radius = Math.max(0, radius);
+    best.damage = Math.trunc(damage);
+    best.armorPiercing = armorPiercing;
+    best.effect = Math.trunc(effect);
+    best.effectDurationSec = effectDurationSec;
+    const nextInterval = movingAoeNextInterval(originType, best.damage);
+    if (nextInterval > 0) {
+      best.intervalMs = Math.max(
+        MOVING_AOE_MIN_INTERVAL_MS,
+        Math.min(MOVING_AOE_MAX_INTERVAL_MS, nextInterval),
+      );
+    }
+    best.confirmed = true;
+    best.lastImpact = now;
+    best.pulseCount++;
+    best.nextImpact = now + best.intervalMs;
+    return true;
+  }
+
+  getActive(now: number): Array<{
+    x: number;
+    y: number;
+    radius: number;
+    impactOffsetMs: number;
+    damage?: number;
+    conditionEffects?: readonly { effect: number; durationSec?: number }[];
+    objectId: number;
+  }> {
+    this.refresh(now);
+    const active: Array<{
+      x: number;
+      y: number;
+      radius: number;
+      impactOffsetMs: number;
+      damage?: number;
+      conditionEffects?: readonly { effect: number; durationSec?: number }[];
+      objectId: number;
+    }> = [];
+    for (const emitter of this.emitters.values()) {
+      if (!this.isActive(emitter, now) || emitter.radius <= 0) continue;
+      const impactOffsetMs = this.impactOffset(emitter, now);
+      active.push({
+        x: emitter.x + emitter.velocityX * impactOffsetMs,
+        y: emitter.y + emitter.velocityY * impactOffsetMs,
+        radius: emitter.radius,
+        impactOffsetMs,
+        damage: emitter.damage,
+        conditionEffects: aoeConditionEffects(emitter.effect, emitter.effectDurationSec),
+        objectId: emitter.objectId,
+      });
+    }
+    return active;
+  }
+
+  private refresh(now: number): void {
+    for (const [objectId, emitter] of this.emitters) {
+      if (this.isRetained(emitter, now)) continue;
+      this.emitters.delete(objectId);
+    }
+  }
+
+  private isRetained(emitter: MovingEmitterState, now: number): boolean {
+    if (emitter.firstSeen === 0) emitter.firstSeen = now;
+    return emitter.retiredAt < 0
+      || now - emitter.retiredAt <= MOVING_AOE_RETIRED_GRACE_MS;
+  }
+
+  private isActive(emitter: MovingEmitterState, now: number): boolean {
+    if (!this.isRetained(emitter, now) || emitter.radius <= 0) return false;
+    if (!emitter.confirmed) {
+      let grace = emitter.intervalMs + MOVING_AOE_PULSE_GRACE_MS;
+      if (emitter.silenceTimeoutMs > 0 && emitter.silenceTimeoutMs < grace) {
+        grace = emitter.silenceTimeoutMs;
+      }
+      return now - emitter.firstSeen <= grace;
+    }
+    return emitter.silenceTimeoutMs <= 0
+      || now - emitter.lastImpact <= emitter.silenceTimeoutMs;
+  }
+
+  private impactOffset(emitter: MovingEmitterState, now: number): number {
+    if (!emitter.confirmed) return 0;
+    let next = emitter.nextImpact > 0 ? emitter.nextImpact : now;
+    if (next < now - MOVING_AOE_PULSE_GRACE_MS) {
+      const interval = Math.max(MOVING_AOE_MIN_INTERVAL_MS, emitter.intervalMs);
+      const missed = Math.trunc((now - MOVING_AOE_PULSE_GRACE_MS - next) / interval) + 1;
+      next += missed * interval;
+    }
+    return Math.max(0, next - now);
+  }
+
+  private distanceSqToTrajectory(
+    emitter: MovingEmitterState,
+    x: number,
+    y: number,
+  ): number {
+    return Math.min(
+      pointToSegmentDistanceSq(
+        x, y, emitter.previousX, emitter.previousY, emitter.x, emitter.y,
+      ),
+      pointToSegmentDistanceSq(
+        x, y,
+        emitter.x, emitter.y,
+        emitter.x + emitter.velocityX * 250,
+        emitter.y + emitter.velocityY * 250,
+      ),
+    );
+  }
+}
+
+function pointToSegmentDistanceSq(
+  pointX: number,
+  pointY: number,
+  startX: number,
+  startY: number,
+  endX: number,
+  endY: number,
+): number {
+  const segmentX = endX - startX;
+  const segmentY = endY - startY;
+  const lengthSq = segmentX * segmentX + segmentY * segmentY;
+  const scale = lengthSq > 1e-10
+    ? Math.max(0, Math.min(1, ((pointX - startX) * segmentX + (pointY - startY) * segmentY) / lengthSq))
+    : 0;
+  const dx = pointX - (startX + segmentX * scale);
+  const dy = pointY - (startY + segmentY * scale);
+  return dx * dx + dy * dy;
+}
+
+// ---------------------------------------------------------------------------
+// Holy/Chaos beam SHOW_EFFECT → telegraphed circle (`GSCC.as:3644-3717`).
+// ---------------------------------------------------------------------------
+
+const BEAM_AOE_WARNING_MS = 100;
+const O3_HOLY_BEAM_WARNING_MS = 200;
+const O3_CLERIC_BEAM_STRIKE = 0x1AF3;
+const O3_CARDINAL_BEAM_STRIKE = 0x1AF6;
+const O3_DEACON_BEAM_STRIKE = 0xB22F;
+const O3_BEAM_STRIKE = 0xB418;
+const O2_VISUAL_BEAM = 0x6E28;
+const CHAOTIC_SCRIPTURE_EFFECT = 0x70A4;
+const SANGUINE_FOREST_BEAM = 0xCF1B;
+const O3_CHAOS_RAY_STRIKE = 0x19DD;
+const O3_CHAOS_RAY_STRIKE_MINOR = 0x19DC;
+
+/** Source-specific beam radius; 0 means non-hostile visual reuse. */
+export function beamAoeRadius(sourceType: number): number {
+  switch (sourceType >>> 0) {
+    case O2_VISUAL_BEAM:
+    case CHAOTIC_SCRIPTURE_EFFECT:
+      return 0;
+    case O3_CARDINAL_BEAM_STRIKE:
+      return 2.5;
+    case SANGUINE_FOREST_BEAM:
+    case O3_CHAOS_RAY_STRIKE:
+    case O3_CHAOS_RAY_STRIKE_MINOR:
+      return 1;
+    default:
+      return 1.4;
+  }
+}
+
+export function beamAoeDamage(sourceType: number): number {
+  switch (sourceType >>> 0) {
+    case O3_CLERIC_BEAM_STRIKE:
+    case O3_CARDINAL_BEAM_STRIKE:
+    case O3_DEACON_BEAM_STRIKE:
+    case O3_BEAM_STRIKE:
+      return 200;
+    case O3_CHAOS_RAY_STRIKE:
+      return 325;
+    case O3_CHAOS_RAY_STRIKE_MINOR:
+      return 300;
+    case SANGUINE_FOREST_BEAM:
+      return 120;
+    default:
+      return -1;
+  }
+}
+
+export function beamAoeArmorPiercing(sourceType: number): boolean {
+  const type = sourceType >>> 0;
+  return type === O3_CLERIC_BEAM_STRIKE
+    || type === O3_CARDINAL_BEAM_STRIKE
+    || type === O3_DEACON_BEAM_STRIKE
+    || type === O3_BEAM_STRIKE
+    || type === O3_CHAOS_RAY_STRIKE
+    || type === O3_CHAOS_RAY_STRIKE_MINOR
+    || type === SANGUINE_FOREST_BEAM;
+}
+
+export function beamAoeWarningMs(sourceType: number): number {
+  switch (sourceType >>> 0) {
+    case SANGUINE_FOREST_BEAM:
+    case O3_CHAOS_RAY_STRIKE:
+    case O3_CHAOS_RAY_STRIKE_MINOR:
+      return 0;
+    case O3_CLERIC_BEAM_STRIKE:
+    case O3_CARDINAL_BEAM_STRIKE:
+    case O3_DEACON_BEAM_STRIKE:
+    case O3_BEAM_STRIKE:
+      return O3_HOLY_BEAM_WARNING_MS;
+    default:
+      return BEAM_AOE_WARNING_MS;
+  }
+}
 
 function emptyState(
   enabled: boolean,

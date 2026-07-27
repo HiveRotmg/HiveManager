@@ -199,7 +199,11 @@ test('no path is reported only after the bounded reachable graph is exhausted', 
   for (let y = 0; y < 5; y++) pathfinder.observeTile(3, y, BLOCKING_GROUND);
   pathfinder.setTarget({ x: 5.5, y: 2.5 }, 0.2);
 
-  const result = pathfinder.next({ x: 1.5, y: 2.5 });
+  // Dry tier exhausts then yields so the hazard tier can run on the next tick.
+  let result = pathfinder.next({ x: 1.5, y: 2.5 });
+  if (result.noPath !== true) {
+    result = pathfinder.next({ x: 1.5, y: 2.5 });
+  }
   assert.equal(result.noPath, true);
   assert.equal(result.replanned, true);
   assert.equal(pathfinder.hasTarget(), true);
@@ -281,6 +285,47 @@ test('observed damaging ground is treated as blocked pathfinding terrain', () =>
   assert.notDeepEqual(step.waypoint, { x: 8.5, y: 2.5 });
   assert.equal(hasTile(pathfinder, 4, 2), false);
   assert.ok(pathfinder.getPlannedTiles().some((tile) => tile.y !== 2));
+});
+
+test('a dry route is preferred over a shorter lava crossing', () => {
+  const pathfinder = createPathfinder(7, 5);
+  // Wall the straight corridor so the short path would need the lava tile at (3,2).
+  // A dry detour around y=0 remains open.
+  for (let x = 0; x < 7; x++) {
+    for (let y = 0; y < 5; y++) pathfinder.observeTile(x, y, 0);
+  }
+  pathfinder.observeTile(3, 1, BLOCKING_GROUND);
+  pathfinder.observeTile(3, 2, DAMAGING_GROUND);
+  pathfinder.observeTile(3, 3, BLOCKING_GROUND);
+  pathfinder.setTarget({ x: 5.5, y: 2.5 }, 0.2);
+
+  const step = pathfinder.next({ x: 1.5, y: 2.5 });
+  assert.equal(step.noPath, undefined);
+  assert.equal(hasTile(pathfinder, 3, 2), false, 'must not step on lava when dry exists');
+  assert.ok(pathfinder.getPlannedTiles().some((tile) => tile.y === 0 || tile.y === 4));
+});
+
+test('lava becomes traversable only after a dry search exhausts', () => {
+  const pathfinder = createPathfinder(7, 3);
+  for (let x = 0; x < 7; x++) {
+    for (let y = 0; y < 3; y++) pathfinder.observeTile(x, y, 0);
+  }
+  // Solid lava column — the only way east is through damaging ground.
+  pathfinder.observeTile(3, 0, DAMAGING_GROUND);
+  pathfinder.observeTile(3, 1, DAMAGING_GROUND);
+  pathfinder.observeTile(3, 2, DAMAGING_GROUND);
+  pathfinder.setTarget({ x: 5.5, y: 1.5 }, 0.2);
+
+  // Tier-one dry search exhausts and yields so the 16 ms frame is not double-charged.
+  const first = pathfinder.next({ x: 1.5, y: 1.5 });
+  assert.equal(first.noPath, undefined);
+  assert.equal(hasTile(pathfinder, 3, 1), false);
+
+  // Tier-two cost search is allowed to cross.
+  const second = pathfinder.next({ x: 1.5, y: 1.5 });
+  assert.equal(second.noPath, undefined);
+  assert.equal(hasTile(pathfinder, 3, 1), true, 'Abyss lava is the last-resort crossing');
+  assert.deepEqual(pathfinder.getRemainingPath().at(-1), { x: 5.5, y: 1.5 });
 });
 
 test('OccupySquare objects block one cell and removing them permits a shorter route', () => {

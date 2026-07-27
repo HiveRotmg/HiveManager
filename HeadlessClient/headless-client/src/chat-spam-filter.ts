@@ -7,7 +7,8 @@
  * arrives from a stream of throwaway accounts, which defeats muting by name and
  * (with leetspeak) a fair share of a keyword list. The reference therefore keys
  * on the normalized payload and drops it once it has been seen from
- * `SPAM_SENDER_LIMIT` distinct senders inside `SPAM_WINDOW_MS`.
+ * `SPAM_SENDER_LIMIT` distinct senders inside `SPAM_WINDOW_MS`. Server,
+ * guild/party (`#`/`*`), and tells addressed to us are never filtered.
  */
 
 /** Source `SPAM_WINDOW_MS` (TextHandler.as:91): five minutes. */
@@ -82,19 +83,19 @@ export function isSpecialRecipientChat(recipient: string): boolean {
 }
 
 /**
- * Source `isFilterableChat` (TextHandler.as:152): the spam filter only ever sees
- * player chat from someone else on a non-channel recipient. Server messages, our
- * own lines and every `#`/`*` channel are exempt.
+ * Source `isFilterableChat` (TextHandler.as:152) plus the Parameters /
+ * EXALT_PROXY docs contract: server messages, our own lines, every `#`/`*`
+ * channel (guild/party/NPC), and tells addressed to us are never filtered.
  *
- * Note that a whisper is NOT exempt in the reference: a tell carries the
- * recipient's plain player name, which is not a special recipient, so
- * `isFilterableChat` is true for tells and `isRepeatSpam` does examine them.
- * Only an identical 20+ character payload from three different senders inside
- * five minutes is dropped, which is the RMT tell pattern.
+ * The ActionScript `isFilterableChat` expression alone does not exempt
+ * `recipient_ == player.name_`, but Parameters.as and the 2026-07-27 finding
+ * both state that "tells to the player are never filtered", so incoming tells
+ * are skipped here.
  */
 export function isFilterableChat(message: ChatMessage, ownName: string | undefined): boolean {
   if (isServerMessage(message)) return false;
   if (ownName !== undefined && ownName !== '' && message.name === ownName) return false;
+  if (ownName !== undefined && ownName !== '' && message.recipient === ownName) return false;
   return !isSpecialRecipientChat(message.recipient);
 }
 

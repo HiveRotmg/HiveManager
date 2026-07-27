@@ -9,7 +9,6 @@ import {
   O3GuardObserver,
   ORYX3_TYPE,
   isSilenced,
-  type O3GuardSample,
   type O3GuardStatus,
 } from '../o3-guard';
 import { EventHook, PacketHook, Plugin } from './decorators';
@@ -18,32 +17,34 @@ import { EventHook, PacketHook, Plugin } from './decorators';
 const HEARTBEAT_MS = 1_000;
 
 /**
- * Captures Oryx the Mad God 3's guard state to the NDJSON debug log, and turns
- * blocked-damage episodes into the guard alt-texture ids that ProdMafia's
- * `avoidO3Shield` needs but never captured (`Player.as:2600-2628`).
+ * Captures Oryx the Mad God 3's guard state to the NDJSON debug log so one
+ * fight can populate Auto Aim's `o3GuardAltTextureIds`. ProdMafia's
+ * `avoidO3Shield` needs those ids but never captured them (`Player.as:2600-2628`).
  *
- * Every line lands in `logs/debug-YYYY-MM-DD.ndjson`:
+ * Every line lands in `logs/debug-YYYY-MM-DD.ndjson` via `debugLog.event`
+ * (same shape as ProdMafia `DebugLog`):
  *
  * - `o3_enter` / `o3_exit` — O3 came into or left view, with the map name.
  * - `o3_state` — his alt texture, either condition word or the damage-blocked
- *   verdict changed. This is the reference's `o3_state` event, widened.
+ *   diagnostic flag changed.
  * - `o3_sample` — a once-a-second heartbeat of the same record, so HP over time
  *   is in the file even while nothing else moves.
  * - `o3_text` — any TEXT received while he is in view, which is how the counter
  *   line ("You are unfit to speak in my presence!") gets timestamped next to the
  *   sprite that was showing when it fired.
  * - `o3_silence` — our own character gained or lost Silence while he is in view.
- * - `o3_guard_learned` — a stall met every learn rule and its alt-texture id was
- *   pushed into Auto Aim's `o3GuardAltTextureIds`.
  *
  * Each state/sample record carries the alt texture, both condition words with
  * their bit names, HP and HP fraction, the ENEMYHIT claims we have outstanding,
- * and `damageRegistering` — so "our shots stopped reducing his HP" and "the alt
- * texture changed to X" are correlatable within one line, not across a join.
+ * and `damageRegistering`. After a run, grep `o3_silence` / the counter
+ * `o3_text` and read the surrounding `altTexture` values into
+ * `config.o3GuardAltTextureIds` (or `o3guard ids …`).
+ *
+ * HP-stall auto-learning is deliberately not shipped — see `o3-guard.ts`.
  */
 @Plugin({
   name: 'O3Guard',
-  description: "Captures Oryx 3's guard state to NDJSON and learns his guard sprite ids.",
+  description: "Captures Oryx 3's guard state to NDJSON so a fight can pin the guard sprite ids.",
   author: 'headless-client',
   version: '1.0.0',
 })
@@ -54,11 +55,9 @@ export class O3GuardCapture {
   private lastStateKey = '';
   private silenced = false;
   private appliedConfigIds = '';
-  private learnedThisRun: number[] = [];
 
   @EventHook(ClientEvent.Tick)
   onTick(client: Client, player: PlayerData | undefined): void {
-    this.observer.configure({ learn: config.o3GuardLearnFromStalls });
     const oryx = client.visibleObjects().find((object) => object.type === ORYX3_TYPE);
     if (!oryx) {
       if (this.tracking) {
@@ -87,7 +86,6 @@ export class O3GuardCapture {
       y: oryx.y,
     });
 
-    if (sample.learnedAltTextureId !== null) this.applyLearnedId(client, sample);
     const key = `${sample.altTexture}|${sample.condition}|${sample.condition2}|${sample.damageBlocked}`;
     if (key !== this.lastStateKey) {
       this.lastStateKey = key;
@@ -139,13 +137,11 @@ export class O3GuardCapture {
     this.observer.clear();
   }
 
-  /** Capture and learning state for the console, the web panel and tests. */
-  status(): O3GuardStatus & { capturing: boolean; learning: boolean; learnedThisRun: number[] } {
+  /** Capture state for the console, the web panel and tests. */
+  status(): O3GuardStatus & { capturing: boolean } {
     return {
       ...this.observer.status(),
       capturing: config.o3GuardCapture,
-      learning: config.o3GuardLearnFromStalls,
-      learnedThisRun: [...this.learnedThisRun],
     };
   }
 
@@ -159,26 +155,6 @@ export class O3GuardCapture {
     const next = [...merged].sort((a, b) => a - b);
     client.configureAutoAim({ o3GuardAltTextureIds: next });
     return next;
-  }
-
-  /** Pushes everything the capture considers a guard sprite into Auto Aim. */
-  applyCandidates(client: Client): number[] {
-    return this.applyIds(client, [
-      ...this.observer.candidateAltTextureIds(),
-      ...this.observer.learnedAltTextureIds(),
-    ]);
-  }
-
-  private applyLearnedId(client: Client, sample: O3GuardSample): void {
-    const id = sample.learnedAltTextureId!;
-    this.learnedThisRun.push(id);
-    const ids = this.applyIds(client, [id]);
-    console.log(
-      `[${client.alias}] O3Guard: learned guard alt-texture ${id} — ${sample.settledHits} of our hits ` +
-        `landed with his HP flat at ${sample.hp}/${sample.maxHp} for ${Math.round(sample.msSinceHpChange)}ms. ` +
-        `Auto Aim now avoids [${ids.join(', ')}].`,
-    );
-    this.log('o3_guard_learned', { id, ids, ...sample });
   }
 
   /** Mirrors `config.o3GuardAltTextureIds` into Auto Aim when it changes. */

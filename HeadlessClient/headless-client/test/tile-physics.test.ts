@@ -64,6 +64,47 @@ test('damaging ground keeps its existing safeWalk semantics after the Sink chang
   assert.equal(store.isTileStaticallyBlocked(1, 1, { consumer: 'dodge', safeWalk: true }), false);
 });
 
+test('pathfinding can price Abyss lava instead of walling it under hazardTraversal cost', () => {
+  const ABYSS_LAVA = 44;
+  const store = createStaticPassabilityStore({
+    ...tileData,
+    tileIsSink: (type: number) => type === SINK_TILE || type === ABYSS_LAVA,
+    getTileDamage: (type: number) => {
+      if (type === DAMAGING_TILE) return 100;
+      if (type === ABYSS_LAVA) return 60;
+      return 0;
+    },
+  });
+  store.setMapBounds(8, 8);
+  store.observeTile(2, 2, ABYSS_LAVA);
+  store.observeTile(3, 3, SINK_TILE);
+
+  assert.equal(
+    store.isTileStaticallyBlocked(2, 2, { consumer: 'pathfinding' }),
+    true,
+    'default pathfinding still walls MaxDamage floors',
+  );
+  assert.equal(
+    store.isTileStaticallyBlocked(2, 2, { consumer: 'pathfinding', hazardTraversal: 'cost' }),
+    false,
+    'cost policy opens lava for a priced crossing',
+  );
+  assert.equal(
+    store.isTileStaticallyBlocked(3, 3, { consumer: 'pathfinding' }),
+    false,
+    'pure Sink stays walkable without opting into cost',
+  );
+  assert.ok(
+    store.getTileTraversalPenalty(2, 2) > store.getTileTraversalPenalty(3, 3),
+    'MaxDamage=60 lava costs more than undamaging Sink water',
+  );
+  assert.equal(
+    store.isTileStaticallyBlocked(2, 2, { consumer: 'dodge', safeWalk: true }),
+    true,
+    'dodge safeWalk is unchanged',
+  );
+});
+
 /**
  * ProdMafia Player.as:4215-4217 —
  * `moveMultiplier_ = 0.1 + (1 - sinkLevel / 18) * (speed_ - 0.1)`.

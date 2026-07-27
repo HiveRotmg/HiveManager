@@ -143,6 +143,12 @@ export class StaticPassabilityStoreImpl implements StaticPassabilityStore {
   isTileStaticallyBlocked(tileX: number, tileY: number, query: StaticTileQuery): boolean {
     if (this.isBaseTileStaticallyBlocked(tileX, tileY, query)) return true;
     if (!this.useInflatedPassability) return false;
+    // Cost-tier queries may step onto damaging tiles themselves; the dilated
+    // margin around them still applies to neighboring dry cells.
+    if (query.hazardTraversal === 'cost'
+      && this.damagingTerrain.has(tileKey(Math.trunc(tileX), Math.trunc(tileY)))) {
+      return false;
+    }
     return this.isInflatedBlockedAt(tileX + 0.5, tileY + 0.5);
   }
 

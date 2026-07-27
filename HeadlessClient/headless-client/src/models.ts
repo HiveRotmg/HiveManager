@@ -2,6 +2,7 @@ import type { PlayerData } from 'realmlib';
 import type { AutoConsumablesOptions } from './auto-consumables';
 import type { AutoLootOptions } from './auto-loot';
 import type { CombatDataProvider } from './combat-tracker';
+import type { HitSuppressionOptions, IgnoreDebuffOptions } from './hit-suppression';
 import type { ProxyConfig } from './proxy';
 
 /** A realm portal in the nexus, parsed from its NAME stat. */
@@ -73,6 +74,15 @@ export interface ClientOptions {
   autoConsumables?: boolean | Partial<AutoConsumablesOptions>;
   /** Projectile/object definitions used to resolve combat hit claims. */
   combatData?: CombatDataProvider;
+  /**
+   * Hit-suppression safety layer (Buddha, strategic ack/AoE, AutoSync ClientHP,
+   * debuff-ignore). Defaults match ProdMafia `Parameters` when omitted.
+   */
+  hitSuppression?: Partial<HitSuppressionOptions> & {
+    ignoreDebuffs?: Partial<IgnoreDebuffOptions>;
+  };
+  /** Enable Partial Godmode on construction (debug; default false). */
+  partialGodMode?: boolean;
   /**
    * Settings used when `needsNewChar` is true (or `createCharacter()` is
    * called). `createClassType` is a resolved numeric object type; defaults to

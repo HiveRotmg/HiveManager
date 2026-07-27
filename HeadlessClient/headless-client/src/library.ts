@@ -110,16 +110,26 @@ export type {
   TimedDodgeWaypoint,
 } from './dodge-trajectory-planner';
 export {
+  AoeRepeatObserver,
   DodgeAoeThreatTracker,
+  MovingAoeEmitterTracker,
   PredictiveAutoDodgeController,
   ThrownAoeTracker,
+  beamAoeArmorPiercing,
+  beamAoeDamage,
+  beamAoeRadius,
+  beamAoeWarningMs,
 } from './predictive-auto-dodge';
 export type {
   AutoDodgeOptions,
+  AutoDodgeRoute,
   AutoDodgeSnapshot,
   AutoDodgeState,
   DodgeReplanCause,
   DodgeSafetyState,
+  TrackedRecentAoe,
+  TrackedTelegraphedAoe,
+  TrackedThrownAoe,
 } from './predictive-auto-dodge';
 export {
   ExplorativePathfinder,
@@ -127,7 +137,28 @@ export {
   NAVIGATION_PATH_SEARCH_BUDGET,
   SYNC_PATH_SEARCH_BUDGET,
 } from './explorative-pathfinder';
-export { ProdMafiaAutoDodgeController } from './prodmafia-auto-dodge';
+export { ProdMafiaAutoDodgeController, collectTelegraphLasers } from './prodmafia-auto-dodge';
+export {
+  compareDodgeRouteCost,
+  dodgeConditionRisk,
+  isLethalDodgeCondition,
+  projectileConditionRisk,
+  resolveProdMafiaDodgeConfig,
+  PRODMAFIA_DODGE_CONFIG_DEFAULTS,
+  UNKNOWN_HARMFUL_CONDITION,
+} from './prodmafia-auto-dodge';
+export type {
+  DodgeConditionEffect,
+  DodgeConditionEffectSpec,
+  DodgeMovingAoeEmitter,
+  DodgeRecentAoe,
+  DodgeRouteCost,
+  DodgeTelegraphLaser,
+  DodgeTelegraphedAoe,
+  ProdMafiaDodgeAoe,
+  ProdMafiaDodgeConfig,
+  ProdMafiaDodgeSnapshot,
+} from './prodmafia-auto-dodge';
 export { ProdMafiaAutoPlayController } from './prodmafia-autoplay';
 export type {
   ProdMafiaAutoPlayDecision,
@@ -222,6 +253,27 @@ export type {
   AutoLootSnapshot,
   AutoLootState,
 } from './auto-loot';
+export {
+  AUTO_SYNC_CLIENT_HP_DELTA,
+  AUTO_SYNC_CLIENT_HP_TICKS,
+  AutoSyncClientHpTracker,
+  calculateIgnoreBitmasks,
+  clampSuppressThreshold,
+  damageIsLethal,
+  DEFAULT_HIT_SUPPRESSION_OPTIONS,
+  DEFAULT_IGNORE_DEBUFF_OPTIONS,
+  playerHitSuppressionReason,
+  projectileConditionEffectIds,
+  projectileMatchesIgnoredDebuff,
+  shouldSuppressStrategicHit,
+  strategicSurvivalHp,
+} from './hit-suppression';
+export type {
+  HitSuppressionOptions,
+  IgnoreDebuffBitmasks,
+  IgnoreDebuffOptions,
+  PlayerHitSuppressionReason,
+} from './hit-suppression';
 export {
   BossPhaseTracker,
   CLOTH_BAZAAR_MAP,
