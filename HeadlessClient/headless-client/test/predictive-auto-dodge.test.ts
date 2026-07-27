@@ -223,9 +223,9 @@ test('predictive auto-dodge uses an exact 0.5 projectile collision box', () => {
   assert.equal(outside.earliestImpactMs, null);
 });
 
-test('projectile jump remains unused while a legal continuous trajectory survives', () => {
+test('auto dodge uses a legal continuous trajectory when one survives', () => {
   const controller = new PredictiveAutoDodgeController();
-  controller.setEnabled(true, { projectileJump: true });
+  controller.setEnabled(true);
   const state = controller.evaluate({
     time: 300,
     playerId: 10,
@@ -234,8 +234,6 @@ test('projectile jump remains unused while a legal continuous trajectory survive
     moveSpeed: 0.004,
     intentVelocity: { x: 0.004, y: 0 },
     movementLeadMs: 16,
-    jumpAllowance: 0.73,
-    jumpStatus: 'ready',
     projectiles: [hostileProjectile()],
     aoes: [],
     environment: {
@@ -247,15 +245,13 @@ test('projectile jump remains unused while a legal continuous trajectory survive
   });
 
   assert.equal(state.decision, 'goal_path');
-  assert.equal(state.jumpTarget, null);
-  assert.equal(state.jumpDistance, 0);
   assert.ok(Math.hypot(state.velocity.x, state.velocity.y) > 0);
   assert.ok(state.trajectory?.waypoints.length);
 });
 
 test('predictive auto-dodge preserves a movement intent that already clears the shot', () => {
   const controller = new PredictiveAutoDodgeController();
-  controller.setEnabled(true, { projectileJump: true });
+  controller.setEnabled(true);
   const state = controller.evaluate({
     time: 300,
     playerId: 10,
@@ -263,15 +259,12 @@ test('predictive auto-dodge preserves a movement intent that already clears the 
     moveSpeed: 0.0096,
     intentVelocity: { x: 0.0096, y: 0 },
     movementLeadMs: 16,
-    jumpAllowance: 1,
-    jumpStatus: 'ready',
     projectiles: [hostileProjectile()],
     aoes: [],
     environment: openEnvironment,
   });
 
   assert.equal(state.overrideActive, false);
-  assert.equal(state.jumpTarget, null);
   assert.equal(state.decision, 'preserve_safe_intent');
   assert.deepEqual(state.velocity, { x: 0.0096, y: 0 });
 });

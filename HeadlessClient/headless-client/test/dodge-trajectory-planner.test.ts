@@ -10,7 +10,6 @@ import {
   DodgeCollisionWorld,
   ENEMY_AVOID_RADIUS,
 } from '../src/dodge-collision-world';
-import { DodgeJumpLimiter, type DodgeJumpStatus } from '../src/dodge-jump-limiter';
 import {
   SpaceTimeDodgePlanner,
   type DodgePlanningEnvironment,
@@ -618,60 +617,7 @@ test('18. an authoritative correction discards and rebases the trajectory', () =
   assert.ok(corrected.plannerMetrics.trajectoryInvalidations > 0);
 });
 
-test('19. jump candidates stay unavailable in recovering, pending, and backoff states', () => {
-  const input = emergencyJumpInput();
-  const statuses: DodgeJumpStatus[] = [
-    'recovering',
-    'awaiting_move',
-    'awaiting_confirmation',
-    'backoff',
-  ];
-
-  for (const jumpStatus of statuses) {
-    const controller = testController();
-    controller.setEnabled(true, { projectileJump: true, maxJumpDistance: 1 });
-    const state = controller.evaluate({
-      ...input,
-      jumpAllowance: 1,
-      jumpStatus,
-    });
-    assert.equal(state.jumpTarget, null, `generated a jump while ${jumpStatus}`);
-    assert.notEqual(state.decision, 'danger_jump');
-  }
-});
-
-test('20. an emergency jump is committed once and handles confirmation or rejection', () => {
-  const input = emergencyJumpInput();
-  const controller = testController();
-  controller.setEnabled(true, { projectileJump: true, maxJumpDistance: 1 });
-  const proposed = controller.evaluate({
-    ...input,
-    jumpAllowance: 1,
-    jumpStatus: 'ready',
-  });
-  assert.equal(proposed.decision, 'danger_jump');
-  assert.ok(proposed.jumpTarget);
-
-  const limiter = new DodgeJumpLimiter();
-  assert.equal(limiter.commit(1000, input.position, proposed.jumpTarget!), true);
-  assert.equal(limiter.commit(1000, input.position, proposed.jumpTarget!), false);
-  controller.resolveJumpAttempt(true, 1000);
-  limiter.markSent(1020, proposed.jumpTarget!);
-  limiter.observeAuthoritative(1200, proposed.jumpTarget!);
-  assert.equal(limiter.getState(1200).lastOutcome, 'confirmed');
-
-  const rejected = new DodgeJumpLimiter();
-  assert.equal(rejected.commit(2000, input.position, proposed.jumpTarget!), true);
-  rejected.markSent(2020, proposed.jumpTarget!);
-  rejected.observeAuthoritative(2400, input.position);
-  assert.equal(rejected.getState(2400).status, 'backoff');
-  assert.equal(rejected.consumeCorrectionRebase(), true);
-  controller.resolveJumpAttempt(false, 2400);
-  controller.rebase(input.position, 2400);
-  assert.equal(controller.getState().trajectory, null);
-});
-
-test('21. no valid trajectory produces a finite controlled stop', () => {
+test('19. no valid trajectory produces a finite controlled stop', () => {
   const result = plan(planningInput({
     environment: {
       canOccupy: () => false,
@@ -692,7 +638,7 @@ test('21. no valid trajectory produces a finite controlled stop', () => {
   }
 });
 
-test('22. identical world state and inputs produce deterministic search results', () => {
+test('20. identical world state and inputs produce deterministic search results', () => {
   const input = planningInput({ projectiles: [projectile()] });
   const first = plan(input);
   const second = plan(input);
@@ -879,48 +825,6 @@ test('accelerating projectile is classified as nonlinear and caught at its quadr
   assert.ok(
     Math.abs((result.earliestIntentCollisionMs ?? Infinity) - golden) < 30,
     `earliestIntentCollisionMs=${result.earliestIntentCollisionMs} within 30 ms of golden=${golden}`,
-  );
-});
-
-test('combat-range findEmergencyJump respects hardMinimumRange and retreatPenaltyScale', () => {
-  const planner = testPlanner();
-  // Combat target at (7.5, 5). Player at (5, 5) with combat_range intent.
-  // hardMinimumRange=1.3 defines the "must not enter" ring around the target.
-  const combatInput: DodgePlanningInput = {
-    ...emergencyJumpInput(),
-    intent: combatIntent({
-      targetId: 42,
-      targetX: 7.5,
-      targetY: 5,
-      hardMinimumRange: 1.3,
-      preferredMinimumRange: 2,
-      preferredMaximumRange: 3,
-    }),
-    // Open environment on the plane so many directions are landable.
-    environment: OPEN_ENVIRONMENT,
-    retreatPenaltyScale: 1,
-  };
-
-  const pressured = planner.findEmergencyJump(combatInput, 1.5);
-  assert.ok(pressured !== undefined,
-    'expected findEmergencyJump to return a landing under retreatPenaltyScale=1');
-  assert.ok(
-    Math.hypot(pressured.target.x - 7.5, pressured.target.y - 5) >= 1.3 - 1e-6,
-    `landing must respect hardMinimumRange (>=1.3), got distance ${Math.hypot(pressured.target.x - 7.5, pressured.target.y - 5)}`,
-  );
-
-  // Sub-case (b): retreatPenaltyScale=0 zeroes the terminalCombatTooFar
-  // contribution to the score. Regardless of that, hardMinimumRange must
-  // still hold — pinning the invariant against a regression that ties
-  // hardMinimumRange enforcement to the retreat-scale multiplier.
-  const relaxed = planner.findEmergencyJump({
-    ...combatInput,
-    retreatPenaltyScale: 0,
-  }, 1.5);
-  assert.ok(relaxed !== undefined);
-  assert.ok(
-    Math.hypot(relaxed.target.x - 7.5, relaxed.target.y - 5) >= 1.3 - 1e-6,
-    'hardMinimumRange must hold regardless of retreatPenaltyScale',
   );
 });
 
@@ -1166,28 +1070,6 @@ function retreatInput(): DodgePlanningInput {
       startY: 5,
       angle: Math.PI,
       definition: { lifetimeMs: 250 },
-    })],
-    environment: {
-      canOccupy: (x, y) => x >= 0 && x <= 12 && Math.abs(y - 5) < 0.03,
-      isProjectileSegmentOpen: () => true,
-      enemyClearance: () => Infinity,
-      getRevision: () => 0,
-    },
-  });
-}
-
-function emergencyJumpInput(): DodgePlanningInput & {
-  jumpAllowance?: number;
-  jumpStatus?: DodgeJumpStatus;
-} {
-  return planningInput({
-    moveSpeed: 0.004,
-    intentVelocity: { x: 0.004, y: 0 },
-    projectiles: [projectile({
-      startX: 4,
-      startY: 5,
-      angle: 0,
-      definition: { lifetimeMs: 120 },
     })],
     environment: {
       canOccupy: (x, y) => x >= 0 && x <= 12 && Math.abs(y - 5) < 0.03,

@@ -109,7 +109,6 @@ import {
   type DodgeMovementIntent,
   type DodgeMovementIntentId,
 } from './dodge-movement-intent';
-import { DodgeJumpLimiter } from './dodge-jump-limiter';
 import { MovementController, movementSpeed, type MovementSnapshot } from './movement-controller';
 import {
   PredictiveAutoDodgeController,
@@ -326,7 +325,6 @@ export class Client extends EventEmitter {
   private navigationRequestKey = '';
   private navigationMapVersion = 0;
   private navigationDodgeDecision: string | null = null;
-  private readonly dodgeJumpLimiter = new DodgeJumpLimiter();
   private readonly thrownAoes: ThrownAoeTracker | undefined;
   private readonly portalTracker = new PortalTracker();
   private readonly autoNexus: AutoNexusMonitor;
@@ -2699,7 +2697,6 @@ export class Client extends EventEmitter {
     this.navigationDodgeDecision = null;
     this.dodgeWorld?.reset();
     this.autoDodge?.reset();
-    this.dodgeJumpLimiter.resetMap(this.time());
     this.thrownAoes?.clear();
     this.recentObjectTypes.clear();
     this.predictedPlayerDamage.clear();
@@ -2902,9 +2899,6 @@ export class Client extends EventEmitter {
       const unexpected =
         state !== ClientLifecycleState.Stopped && state !== ClientLifecycleState.Reconnecting;
       if (unexpected) {
-        if (this.dodgeJumpLimiter.noteDisconnect(this.time())) {
-          console.warn(`${this.tag} reducing dodge-jump allowance after a suspicious disconnect`);
-        }
         this.lifecycle.transition(ClientLifecycleState.Disconnected);
       }
       this.stopWatchdog();
@@ -3534,7 +3528,6 @@ export class Client extends EventEmitter {
     const combatTarget = combatIntent?.targetId
       ? this.objects.get(combatIntent.targetId)
       : undefined;
-    const jumpLimiterState = this.dodgeJumpLimiter.getState(now);
     this.dodgeWorld?.setExplorativeUnknown(this.pathfinder.hasTarget());
     const dodgeEnabled = this.autoDodge?.isEnabled()
       && !!this.combat
@@ -3564,8 +3557,6 @@ export class Client extends EventEmitter {
           intentVelocity,
           movementLeadMs: dt,
           movementLocked,
-          jumpAllowance: jumpLimiterState.allowance,
-          jumpStatus: jumpLimiterState.status,
           projectiles: activeProjectiles,
           aoes: activeAoes,
           environment: this.dodgeWorld!,
@@ -3609,24 +3600,14 @@ export class Client extends EventEmitter {
         ? 'dodge_blocked'
         : this.movement.hasTarget() ? 'moving' : 'planning';
     }
-    const jumpTarget = dodgeState?.jumpTarget ?? undefined;
-    const jumpCommitted = jumpTarget
-      ? this.dodgeJumpLimiter.commit(now, this.pos, jumpTarget)
-      : false;
-    if (jumpTarget) this.autoDodge?.resolveJumpAttempt(jumpCommitted, now);
-    const positionOverride = jumpCommitted ? jumpTarget : undefined;
-    const velocityOverride = dodgeState?.overrideActive && !positionOverride
+    const velocityOverride = dodgeState?.overrideActive
       ? dodgeState.velocity
       : undefined;
     if (movementLocked) return;
-    if ((jumpLimiterState.status === 'awaiting_move'
-      || jumpLimiterState.status === 'awaiting_confirmation')
-      && !positionOverride) return;
-    if (!this.movement.hasTarget() && !velocityOverride && !positionOverride) return;
+    if (!this.movement.hasTarget() && !velocityOverride) return;
 
     const update = this.movement.update(snapshot, dt, {
       integrateFromLocal,
-      positionOverride,
       velocityOverride,
       // A goal_blocked dodge decision intentionally commands a controlled stop.
       // Treating that stop as failed server movement poisons both pathfinding and
@@ -3717,7 +3698,6 @@ export class Client extends EventEmitter {
     record.y = this.pos.y;
     move.records = [record]; // must send >= 1 record or the server drops us
     this.io.send(move);
-    this.dodgeJumpLimiter.markSent(now, { x: record.x, y: record.y });
   }
 
   /**
@@ -3758,19 +3738,10 @@ export class Client extends EventEmitter {
           ? Math.hypot(this.pos.x - serverPosition.x, this.pos.y - serverPosition.y)
           : Infinity;
         this.serverPos = serverPosition;
-        this.dodgeJumpLimiter.observeAuthoritative(now, serverPosition);
-        const jumpCorrected = this.dodgeJumpLimiter.consumeCorrectionRebase();
         const maximumExpectedDrift = this.maximumExpectedPositionDrift(p.tickTime);
-        if (!hadLocalPosition || jumpCorrected || drift > maximumExpectedDrift) {
+        if (!hadLocalPosition || drift > maximumExpectedDrift) {
           this.rebaseToAuthoritativePosition(serverPosition, now);
-          if (jumpCorrected) {
-          const jumpState = this.dodgeJumpLimiter.getState(this.time());
-          console.warn(
-            `${this.tag} dodge jump corrected by server; learned limit is now `
-              + `${jumpState.learnedMaxDistance.toFixed(2)} tiles with `
-              + `${Math.ceil(jumpState.backoffRemainingMs)}ms backoff`,
-          );
-          } else if (hadLocalPosition) {
+          if (hadLocalPosition) {
             console.warn(
               `${this.tag} movement desynced by ${drift.toFixed(2)} tiles; `
                 + `rebasing to server position before the next MOVE`,
@@ -4211,8 +4182,6 @@ export class Client extends EventEmitter {
       this.serverPos = { ...position };
       this.posKnown = true;
       const now = this.time();
-      this.dodgeJumpLimiter.observeAuthoritative(now, position);
-      this.dodgeJumpLimiter.consumeCorrectionRebase();
       this.autoDodge?.rebase(position, now);
     } else {
       const tracked = this.objects.get(p.objectId);
@@ -4431,9 +4400,6 @@ export class Client extends EventEmitter {
    */
   private handleFailure(p: FailurePacket): void {
     const failureClass = classifyFailure(p.errorDescription, p.errorId);
-    if (this.dodgeJumpLimiter.noteDisconnect(this.time())) {
-      console.warn(`${this.tag} reducing dodge-jump allowance after a failure near an unconfirmed jump`);
-    }
     console.error(
       `${this.tag} ❌ FAILURE ${p.errorId} (${this.describeFailure(p)}) [${failureClass}]: ${p.errorDescription}`,
     );

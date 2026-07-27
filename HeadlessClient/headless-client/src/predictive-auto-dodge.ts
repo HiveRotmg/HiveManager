@@ -15,14 +15,8 @@ import {
   type DodgePlanningResult,
   type DodgeReplanReason,
   type DodgeTrajectory,
-  type EmergencyJumpPlan,
   type TimedDodgeWaypoint,
 } from './dodge-trajectory-planner';
-import {
-  MAX_DODGE_JUMP_DISTANCE,
-  MIN_DODGE_JUMP_DISTANCE,
-  type DodgeJumpStatus,
-} from './dodge-jump-limiter';
 
 export type {
   DeterministicDodgePlannerMetrics,
@@ -34,10 +28,6 @@ export type {
 export interface AutoDodgeOptions {
   /** Penalize positive XML floor damage while selecting local trajectories. */
   safeWalk?: boolean;
-  /** Allow a limiter-gated emergency MOVE-position jump. Defaults to false. */
-  projectileJump?: boolean;
-  /** Maximum requested jump distance. Clamped to 0.01-1.5 tiles. */
-  maxJumpDistance?: number;
 }
 
 // `AutoDodgeAoeThreat` and `AutoDodgeEnvironment` used to exist here as empty
@@ -78,8 +68,6 @@ export interface AutoDodgeSnapshot {
   intentVelocity: { x: number; y: number };
   movementLeadMs: number;
   movementLocked?: boolean;
-  jumpAllowance?: number;
-  jumpStatus?: DodgeJumpStatus;
   projectiles: Iterable<CombatProjectileSnapshot>;
   aoes: readonly DodgePlanningAoe[];
   environment: DodgePlanningEnvironment;
@@ -95,10 +83,6 @@ export interface AutoDodgeState {
   path: Array<{ x: number; y: number }>;
   /** Full time-parameterized local plan followed by the movement controller. */
   trajectory: DodgeTrajectory | null;
-  jumpTarget: { x: number; y: number } | null;
-  jumpDistance: number;
-  jumpAllowance: number;
-  jumpStatus: DodgeJumpStatus | 'disabled';
   planRevision: number;
   planReused: boolean;
   /** Increments for every planner search, including searches that reuse a plan. */
@@ -164,7 +148,6 @@ const COMMAND_LOOKAHEAD_MS = 60;
 const PLAN_SCORE_ABSOLUTE_GAIN = 0.35;
 const PLAN_SCORE_RELATIVE_GAIN = 0.08;
 const VELOCITY_MATCH_TOLERANCE = 1e-6;
-const JUMP_REJECTION_SUPPRESSION_MS = 80;
 const EVASIVE_IMPACT_WINDOW_MS = 500;
 const EVASIVE_RETREAT_RESPONSE_MS = 80;
 const EVASIVE_INITIAL_RESPONSE_MS = 20;
@@ -178,8 +161,6 @@ export class PredictiveAutoDodgeController {
   private readonly planner: SpaceTimeDodgePlanner;
   private enabled = false;
   private safeWalk = true;
-  private projectileJump = false;
-  private maxJumpDistance = MAX_DODGE_JUMP_DISTANCE;
   private committed: CommittedPlan | undefined;
   private planRevision = 0;
   private lastPlanAt = -Infinity;
@@ -192,7 +173,6 @@ export class PredictiveAutoDodgeController {
   private pendingDangerUpdates = 0;
   private dangerRevision = 0;
   private urgentReplanPending = false;
-  private jumpSuppressedUntil = -Infinity;
   private lastCommandVelocity = { x: 0, y: 0 };
   private safetyState: DodgeSafetyState = 'normal';
   private retreatPenaltyScale = 1;
@@ -220,14 +200,6 @@ export class PredictiveAutoDodgeController {
   setEnabled(enabled: boolean, options: AutoDodgeOptions = {}): void {
     this.enabled = enabled;
     if (options.safeWalk !== undefined) this.safeWalk = options.safeWalk;
-    if (options.projectileJump !== undefined) this.projectileJump = options.projectileJump;
-    if (options.maxJumpDistance !== undefined) {
-      this.maxJumpDistance = clamp(
-        Number(options.maxJumpDistance),
-        MIN_DODGE_JUMP_DISTANCE,
-        MAX_DODGE_JUMP_DISTANCE,
-      );
-    }
     if (!enabled) this.reset();
     else this.state = { ...this.state, enabled: true };
   }
@@ -249,7 +221,6 @@ export class PredictiveAutoDodgeController {
     this.pendingDangerUpdates = 0;
     this.dangerRevision = 0;
     this.urgentReplanPending = false;
-    this.jumpSuppressedUntil = -Infinity;
     this.lastCommandVelocity = { x: 0, y: 0 };
     this.safetyState = 'normal';
     this.retreatPenaltyScale = 1;
@@ -311,19 +282,6 @@ export class PredictiveAutoDodgeController {
     };
   }
 
-  /** Records the limiter's authoritative decision about the latest proposed jump. */
-  resolveJumpAttempt(committed: boolean, now: number): void {
-    if (committed) {
-      if (this.committed) this.planner.recordTrajectoryInvalidation();
-      this.committed = undefined;
-      this.lastPlanAt = -Infinity;
-      this.urgentReplanPending = false;
-      this.lastCommandVelocity = { x: 0, y: 0 };
-      return;
-    }
-    this.jumpSuppressedUntil = now + JUMP_REJECTION_SUPPRESSION_MS;
-  }
-
   evaluate(snapshot: AutoDodgeSnapshot): AutoDodgeState {
     this.beginEvaluation();
     if (!this.enabled) {
@@ -358,7 +316,6 @@ export class PredictiveAutoDodgeController {
         path: [],
         trajectory: null,
         overrideActive: false,
-        jumpPlan: undefined,
         planReused: false,
         replanReason: null,
         threatCount: projectiles.length + snapshot.aoes.length,
@@ -379,7 +336,6 @@ export class PredictiveAutoDodgeController {
         path: [],
         trajectory: null,
         overrideActive: false,
-        jumpPlan: undefined,
         planReused: false,
         replanReason: null,
         threatCount: 0,
@@ -476,7 +432,6 @@ export class PredictiveAutoDodgeController {
     }
 
     let planReused = !!this.committed;
-    let jumpPlan: EmergencyJumpPlan | undefined;
     if (replanReason) {
       this.searchRevision++;
       this.searchPerformed = true;
@@ -548,19 +503,6 @@ export class PredictiveAutoDodgeController {
           && proposed.activeProjectileCount + snapshot.aoes.length > 0;
       }
 
-      const jumpAllowance = Math.min(
-        this.maxJumpDistance,
-        Math.max(0, snapshot.jumpAllowance ?? 0),
-      );
-      const jumpReady = snapshot.jumpStatus === 'ready'
-        && jumpAllowance >= MIN_DODGE_JUMP_DISTANCE
-        && snapshot.time >= this.jumpSuppressedUntil;
-      if (this.projectileJump
-        && jumpReady
-        && !proposed.reachesHorizon
-        && proposed.activeProjectileCount + snapshot.aoes.length > 0) {
-        jumpPlan = this.planner.findEmergencyJump(input, jumpAllowance);
-      }
     }
 
     const committed = this.committed;
@@ -572,31 +514,12 @@ export class PredictiveAutoDodgeController {
         path: [],
         trajectory: null,
         overrideActive: !!intent,
-        jumpPlan,
         planReused,
         replanReason,
         threatCount: projectiles.length + snapshot.aoes.length,
         earliestImpactMs: null,
         selectedCandidate: 0,
         decision: intent ? `${intent.mode}_blocked` : 'controlled_stop',
-      });
-    }
-
-    if (jumpPlan) {
-      this.lastCommandVelocity = { x: 0, y: 0 };
-      return this.finish(snapshot, goal, {
-        velocity: { x: 0, y: 0 },
-        target: { ...jumpPlan.target },
-        path: [{ ...jumpPlan.target }],
-        trajectory: cloneTrajectory(committed.result.trajectory),
-        overrideActive: true,
-        jumpPlan,
-        planReused,
-        replanReason,
-        threatCount: committed.result.activeProjectileCount + snapshot.aoes.length,
-        earliestImpactMs: committed.result.earliestIntentCollisionMs ?? 0,
-        selectedCandidate: committed.result.firstControl,
-        decision: 'danger_jump',
       });
     }
 
@@ -638,7 +561,6 @@ export class PredictiveAutoDodgeController {
       path,
       trajectory: cloneTrajectory(committed.result.trajectory),
       overrideActive,
-      jumpPlan: undefined,
       planReused,
       replanReason,
       threatCount: committed.result.activeProjectileCount + snapshot.aoes.length,
@@ -694,7 +616,6 @@ export class PredictiveAutoDodgeController {
       path: Array<{ x: number; y: number }>;
       trajectory: DodgeTrajectory | null;
       overrideActive: boolean;
-      jumpPlan: EmergencyJumpPlan | undefined;
       planReused: boolean;
       replanReason: DodgeReplanReason | null;
       threatCount: number;
@@ -703,10 +624,6 @@ export class PredictiveAutoDodgeController {
       decision: string;
     },
   ): AutoDodgeState {
-    const jumpAllowance = Math.min(
-      this.maxJumpDistance,
-      Math.max(0, snapshot.jumpAllowance ?? 0),
-    );
     const lookaheadChanged = !sameOptionalPoint(this.lastLookaheadTarget, result.target);
     if (lookaheadChanged) {
       this.lookaheadRevision++;
@@ -728,10 +645,6 @@ export class PredictiveAutoDodgeController {
       goal: goal ? { x: goal.x, y: goal.y } : null,
       path: result.path.map((point) => ({ ...point })),
       trajectory: result.trajectory ? cloneTrajectory(result.trajectory) : null,
-      jumpTarget: result.jumpPlan ? { ...result.jumpPlan.target } : null,
-      jumpDistance: result.jumpPlan?.distance ?? 0,
-      jumpAllowance,
-      jumpStatus: this.projectileJump ? snapshot.jumpStatus ?? 'ready' : 'disabled',
       planRevision: this.planRevision,
       planReused: result.planReused,
       searchRevision: this.searchRevision,
@@ -959,10 +872,6 @@ function emptyState(
     goal: null,
     path: [],
     trajectory: null,
-    jumpTarget: null,
-    jumpDistance: 0,
-    jumpAllowance: 0,
-    jumpStatus: 'disabled',
     planRevision: 0,
     planReused: false,
     searchRevision: 0,
@@ -1003,7 +912,6 @@ function cloneState(state: AutoDodgeState): AutoDodgeState {
     goal: state.goal ? { ...state.goal } : null,
     path: state.path.map((point) => ({ ...point })),
     trajectory: state.trajectory ? cloneTrajectory(state.trajectory) : null,
-    jumpTarget: state.jumpTarget ? { ...state.jumpTarget } : null,
     plannerMetrics: cloneMetrics(state.plannerMetrics),
   };
 }

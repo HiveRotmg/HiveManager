@@ -463,8 +463,6 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
     stopFollowing(client);
     return client.navigateTo({ x, y }, options.arriveThreshold, {
       safeWalk: options.safeWalk,
-      projectileJump: options.projectileJump,
-      maxJumpDistance: options.maxJumpDistance,
       goalId: options.goalId,
     });
   };
@@ -496,8 +494,6 @@ export function installHeadlessBridge(deps: BridgeDeps): void {
       maximumDistance: range.maximumDistance,
     }, {
       safeWalk: options.safeWalk,
-      projectileJump: options.projectileJump,
-      maxJumpDistance: options.maxJumpDistance,
       targetId: options.targetId,
       hardMinimumRange: range.hardMinimumRange,
       preferredMinimumRange: range.preferredMinimumRange,

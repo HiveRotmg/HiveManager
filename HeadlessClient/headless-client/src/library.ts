@@ -79,12 +79,6 @@ export {
 } from './dodge-collision-world';
 export type { LocalDodgeCollisionSnapshot } from './dodge-collision-world';
 export {
-  DodgeJumpLimiter,
-  MAX_DODGE_JUMP_DISTANCE,
-  MIN_DODGE_JUMP_DISTANCE,
-} from './dodge-jump-limiter';
-export type { DodgeJumpLimiterState, DodgeJumpStatus } from './dodge-jump-limiter';
-export {
   cloneDodgeMovementIntent,
   normalizeDodgeMovementIntent,
 } from './dodge-movement-intent';
@@ -112,7 +106,6 @@ export type {
   DodgeReplanReason,
   DodgeTrajectory,
   DodgeTrajectoryAssessment,
-  EmergencyJumpPlan,
   TimedDodgeWaypoint,
 } from './dodge-trajectory-planner';
 export { PredictiveAutoDodgeController, ThrownAoeTracker } from './predictive-auto-dodge';

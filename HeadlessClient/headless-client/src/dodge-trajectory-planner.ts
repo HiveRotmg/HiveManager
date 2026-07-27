@@ -174,12 +174,6 @@ export interface DodgeTrajectoryAssessment {
   firstUnsafeOffsetMs: number | null;
 }
 
-export interface EmergencyJumpPlan {
-  target: { x: number; y: number };
-  distance: number;
-  score: number;
-}
-
 const DEFAULT_TIME_LAYERS_MS = Object.freeze([
   0, 20, 40, 65, 95, 130, 175, 230, 300, 400, 550, 750, 1000,
 ]);
@@ -216,8 +210,6 @@ const STATIC_SAMPLE_MAX_MS = 25;
 const DISTANCE_EPSILON = 1e-9;
 const MAX_CONTROL_COUNT = 64;
 const STATES_PER_SPATIAL_BUCKET = 2;
-const JUMP_DISTANCE_STEP = 0.25;
-const JUMP_LANDING_HOLD_MS = 300;
 
 /**
  * Cost weights are intentionally centralized. Time-integrated weights are in
@@ -600,59 +592,6 @@ export class SpaceTimeDodgePlanner {
       remainingMs,
       firstUnsafeOffsetMs: null,
     };
-  }
-
-  findEmergencyJump(input: DodgePlanningInput, allowance: number): EmergencyJumpPlan | undefined {
-    if (!Number.isFinite(allowance) || allowance <= 0) return undefined;
-    const counters = emptyCounters();
-    const context = this.createContext(input, JUMP_LANDING_HOLD_MS, counters);
-    const startEnemy = context.collision.enemyDistance(input.position.x, input.position.y);
-    const goal = context.intent?.mode !== 'combat_range' ? goalScoringPoint(context) : undefined;
-    const startGoalDistance = goal ? distance(input.position, goal) : 0;
-    let best: EmergencyJumpPlan | undefined;
-
-    for (let direction = 0; direction < DEFAULT_DIRECTION_COUNT; direction++) {
-      const angle = direction * Math.PI * 2 / DEFAULT_DIRECTION_COUNT;
-      const directionX = Math.cos(angle);
-      const directionY = Math.sin(angle);
-      for (const jumpDistance of jumpDistances(allowance)) {
-        const target = {
-          x: input.position.x + directionX * jumpDistance,
-          y: input.position.y + directionY * jumpDistance,
-        };
-        if (!this.staticSegmentOpen(context, input.position, target, startEnemy)) continue;
-        const landingSafety = this.evaluateEdge(
-          context,
-          target,
-          target,
-          0,
-          JUMP_LANDING_HOLD_MS,
-          false,
-        );
-        if (!landingSafety) continue;
-        const goalProgress = goal
-          ? startGoalDistance - distance(target, goal)
-          : 0;
-        const enemyDistance = context.collision.enemyDistance(target.x, target.y);
-        const score = landingSafety.softCost
-          - goalProgress * 2
-          + (context.intent?.mode === 'combat_range'
-            ? combatRangePenalty(
-                context,
-                target,
-                JUMP_LANDING_HOLD_MS,
-                this.weights.terminalCombatTooClose,
-                this.weights.terminalCombatTooFar * context.retreatPenaltyScale,
-              )
-            : 0)
-          - Math.min(enemyDistance, ENEMY_SOFT_AVOID_RADIUS) * 0.05
-          - jumpDistance * 0.02;
-        if (!best || score < best.score - 1e-9) {
-          best = { target, distance: jumpDistance, score };
-        }
-      }
-    }
-    return best;
   }
 
   recordTrajectoryInvalidation(): void {
@@ -2295,16 +2234,6 @@ function angleBucket(x: number, y: number): number {
   const normalized = (Math.atan2(y, x) + Math.PI * 2) % (Math.PI * 2);
   return Math.round(normalized / (Math.PI * 2) * DEFAULT_DIRECTION_COUNT)
     % DEFAULT_DIRECTION_COUNT;
-}
-
-function jumpDistances(allowance: number): number[] {
-  const maximum = Math.max(0.01, Math.min(1.5, allowance));
-  const distances = [maximum];
-  for (let distance = maximum - JUMP_DISTANCE_STEP; distance > 0.01; distance -= JUMP_DISTANCE_STEP) {
-    distances.push(distance);
-  }
-  if (maximum > 0.01 + 1e-9) distances.push(0.01);
-  return distances;
 }
 
 function normalizeTimeLayers(values: readonly number[]): readonly number[] {
